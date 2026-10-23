@@ -47,8 +47,8 @@ static uint32_t new_signaled_event(void) {
     return r;
 }
 
-// Logged the first time each: BOTW asks ICommonStateGetter 50 every frame (formatting and writing the line was ~1% of
-// the main thread).
+// Logged the first time each: BOTW asked ICommonStateGetter 50 (now answered) every frame, and formatting and writing
+// the line was ~1% of the main thread.
 static void unhandled(const char *iface, uint32_t cmd) {
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
     static struct { const char *iface; uint32_t cmd; } seen[64];
@@ -83,11 +83,13 @@ static void common_state_getter(Service *s, IpcReq *req, IpcResp *resp) {
     case 8: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;   // GetBootMode
     case 9: OUT(uint8_t, 0) = 1; resp_size(resp, 1); break;   // GetCurrentFocusState: in focus
     case 13: case 61: resp->copy_handles[resp->ncopy++] = new_event(); break;
+    case 50: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // IsVrModeEnabled: no (asked every frame)
     case 60: {  // GetDefaultDisplayResolution
         int w = getenv("SAVAGEWIND_DISPLAY_W") ? atoi(getenv("SAVAGEWIND_DISPLAY_W")) : 1920;
         LOG("[am] GetDefaultDisplayResolution -> %dx1080\n", w);
         OUT(int32_t, 0) = w; OUT(int32_t, 4) = 1080; resp_size(resp, 8); break;
     }
+    case 66: break;  // SetCpuBoostMode (1.9.0's SDK, at the loads): nothing to boost here
     default: UNHANDLED("ICommonStateGetter");
     }
 }

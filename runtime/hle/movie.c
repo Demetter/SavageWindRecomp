@@ -175,6 +175,7 @@ static bool g_skip_held;           // ex_fill: A / B held at the last look
 static double g_skip_pressed_at;    // when they were pressed (0 = not yet)
 
 static void ex_fill(Extractor *e) {
+    if (!e->fmt) return;  // (no file: SetDataSource failed)
     if (e->skippable && !e->eof) {
         // the game skips the opening with Plus (once a save exists); A and B do too (we press Plus for it)
         extern uint64_t input_buttons_now(void);
@@ -217,12 +218,17 @@ static void ex_open(Cpu *c, const char *path) {
     char host[1024];
     snprintf(host, sizeof host, "%s/%s", g_romfs_dir, rel ? rel : "");
     LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
+    // A second SetDataSource replaces the first file (avformat_open_input would take the open context as one to fill)
+    if (e->have_pkt) av_packet_unref(e->pkt), e->have_pkt = false;
+    if (e->fmt) avformat_close_input(&e->fmt);
+    e->eof = false, e->selected = 0;
     if (avformat_open_input(&e->fmt, host, NULL, NULL) < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
         LOG("[movie] cannot open %s\n", host);
+        avformat_close_input(&e->fmt);  // (find_stream_info failing left it open, with no e->pkt to read it with)
         c->x[0] = 1;
         return;
     }
-    e->pkt = av_packet_alloc();
+    if (!e->pkt) e->pkt = av_packet_alloc();
     e->ntracks = 0;
     // Link's Awakening's opening at launch could always be skipped (with no save yet the game forces it); no movie of
     // this game is made skippable yet
@@ -235,8 +241,8 @@ static void ex_open(Cpu *c, const char *path) {
     c->x[0] = 0;
 }
 
-// slot 2: SetDataSource(const char* path). Savage Wind's player (0x70012e95f0) opens its movies with this one,
-// right after the constructor, and fails the movie on a nonzero result.
+// slot 2: SetDataSource(const char* path). Savage Wind's player (1.8.2 0x70012e95f0, 1.9.0 0x70013fd750) opens its
+// movies with this one, right after the constructor, and fails the movie on a nonzero result.
 static void ex_set_data_source_path(Cpu *c) { ex_open(c, (const char *)(uintptr_t)c->x[1]); }
 // slot 15: SetDataSource(DataSource*, const char* path) (Link's Awakening)
 static void ex_set_data_source(Cpu *c) { ex_open(c, (const char *)(uintptr_t)c->x[2]); }
@@ -421,6 +427,8 @@ typedef struct {
     int width, height, stride, sample_rate, channels;
     struct SwsContext *sws;
     uint8_t *rgba;
+    struct SwsContext *sws_in;  // emit_frame: a frame of another size or format -> the configured NV12
+    int in_w, in_h, in_fmt;     // (the frames sws_in was made for)
     AVFrame *pending[NPENDING];
     int64_t pending_time[NPENDING];
     int npending;
@@ -596,6 +604,18 @@ static void dec_get_input_buffer(Cpu *c) {
     c->x[0] = 0;
 }
 
+// A decoded 8-bit 4:2:0 frame (w x h) into an output slot: Y rows stride apart, U and V interleaved into NV12 from
+// uv_off. An odd size keeps the chroma of its last column / row, as the frame's planes do.
+static void nv12_from_yuv420p(uint8_t *o, int stride, int uv_off, uint8_t *const data[], const int linesize[], int w,
+                              int h) {
+    for (int y = 0; y < h; y++) memcpy(o + (size_t)y * stride, data[0] + y * linesize[0], w);
+    for (int y = 0; y < (h + 1) / 2; y++) {
+        uint8_t *uv = o + uv_off + (size_t)y * stride;
+        const uint8_t *u = data[1] + y * linesize[1], *v = data[2] + y * linesize[2];
+        for (int x = 0; x < (w + 1) / 2; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+    }
+}
+
 // Copy a decoded frame into an output slot; caller holds the lock.
 static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
     int slot = -1;
@@ -607,13 +627,24 @@ static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
         size = 0;
     } else if (d->video) {
         int h = d->height, w = d->width, uv_off = d->stride * ((h + 15) & ~15);
-        for (int y = 0; y < h; y++) memcpy(o + y * d->stride, f->data[0] + y * f->linesize[0], w);
-        for (int y = 0; y < h / 2; y++) {  // interleave U and V into NV12
-            uint8_t *uv = o + uv_off + y * d->stride;
-            const uint8_t *u = f->data[1] + y * f->linesize[1], *v = f->data[2] + y * f->linesize[2];
-            for (int x = 0; x < w / 2; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+        if (f->width == w && f->height == h && (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P)) {
+            nv12_from_yuv420p(o, d->stride, uv_off, f->data, f->linesize, w, h);
+        } else {
+            // A frame of another size (VP9 can change it mid-stream) or format: copying it as configured would read
+            // past its planes. Scaled to the configured size instead, which the game sized its buffers and textures for.
+            if (!d->sws_in || d->in_w != f->width || d->in_h != f->height || d->in_fmt != f->format) {
+                LOG("[movie] %dx%d frame (format %d) scaled to %dx%d\n", f->width, f->height, f->format, w, h);
+                sws_freeContext(d->sws_in);
+                d->sws_in = sws_getContext(f->width, f->height, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_NV12,
+                                           SWS_BILINEAR, NULL, NULL, NULL);
+                d->in_w = f->width, d->in_h = f->height, d->in_fmt = f->format;
+            }
+            uint8_t *dst[2] = {o, o + uv_off};
+            int dst_stride[2] = {d->stride, d->stride};
+            if (d->sws_in)
+                sws_scale(d->sws_in, (const uint8_t *const *)f->data, f->linesize, 0, f->height, dst, dst_stride);
         }
-        size = (uint32_t)(uv_off + d->stride * (h / 2));
+        size = (uint32_t)(uv_off + d->stride * ((h + 1) / 2));
     } else {
         // planar float -> interleaved s16
         int ch = f->ch_layout.nb_channels, n = f->nb_samples;
@@ -711,6 +742,19 @@ static void dec_acquire_output(Cpu *c) {
     c->x[0] = 0;
 }
 
+// An output slot's frame (rows stride apart, UV from the 16-row aligned offset) packed tight: Y w*h at 0, then h / 2
+// UV rows, both planes at a stride of the width (so w*h*3/2 bytes hold it, odd sizes too). The bytes written, or 0
+// when cap is too small.
+static uint64_t nv12_pack(uint8_t *dst, uint64_t cap, const uint8_t *src, int stride, int w, int h) {
+    if (w <= 0 || h <= 0) return 0;
+    uint64_t uw = (uint64_t)w, need = uw * h + uw * (h / 2);
+    if (need > cap) return 0;
+    const uint8_t *uv = src + (size_t)stride * ((h + 15) & ~15);
+    for (int y = 0; y < h; y++) memcpy(dst + uw * y, src + (size_t)stride * y, uw);
+    for (int y = 0; y < h / 2; y++) memcpy(dst + uw * h + uw * y, uv + (size_t)stride * y, uw);
+    return need;
+}
+
 static void dec_get_output_buffer(Cpu *c) {
     Decoder *d = self_state(c);
     n_get_out++;
@@ -733,16 +777,23 @@ static void dec_get_output_buffer(Cpu *c) {
         c->x[0] = 0;
         return;
     }
-    if (d->video && b->base && b->capacity >= (uint64_t)d->width * d->height * 3 / 2) {
-        // Savage Wind hands its own buffer (SetDataAndCapacity, 0x70012eaa98) and copies it into its Y and UV
-        // textures itself (0x70012ea664): NV12 packed tight, Y w*h at 0 and UV right after it.
-        int w = d->width, h = d->height;
-        uint8_t *dst = (uint8_t *)(uintptr_t)b->base, *src = d->out_mem[i];
-        const uint8_t *uv = src + d->stride * ((h + 15) & ~15);
-        for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, src + (size_t)y * d->stride, w);
-        for (int y = 0; y < h / 2; y++) memcpy(dst + (size_t)w * h + (size_t)y * (w / 2 * 2), uv + (size_t)y * d->stride, w / 2 * 2);
+    // Savage Wind hands its own buffer (SetDataAndCapacity: 1.8.2 0x70012eaa98, 1.9.0 0x70013fec20) and shows it as its
+    // Y and UV textures (1.8.2 0x70012ea664, 1.9.0 0x70013fe7c4): NV12 packed tight, written here. Not when the Buffer
+    // holds one of our slots (the path below leaves it there): packing into it would overwrite a frame the game may
+    // still hold.
+    bool game_buf = d->video && b->base;
+    for (int k = 0; k < NOUT && game_buf; k++) game_buf = b->base != (uint64_t)(uintptr_t)d->out_mem[k];
+    if (game_buf) {
+        // the end of the stream (size 0) and a buffer too small for the frame write nothing; the buffer stays the game's
+        uint64_t n = 0;
+        if (d->out_size[i]) {
+            n = nv12_pack((uint8_t *)(uintptr_t)b->base, b->capacity, d->out_mem[i], d->stride, d->width, d->height);
+            static int n_small;
+            if (!n && n_small++ < 4)
+                LOG("[movie] output buffer of %llu bytes, too small for %dx%d\n", b->capacity, d->width, d->height);
+        }
         b->offset = 0;
-        b->size = w * h + (w / 2) * (h / 2) * 2;
+        b->size = (int32_t)n;
         c->x[0] = 0;
         return;
     }
@@ -779,6 +830,7 @@ static void dec_dtor(Cpu *c) {
     av_frame_free(&d->frame);
     av_packet_free(&d->pkt);
     if (d->sws) sws_freeContext(d->sws), d->sws = NULL;
+    if (d->sws_in) sws_freeContext(d->sws_in), d->sws_in = NULL;
     free(d->rgba), d->rgba = NULL;
     pthread_mutex_unlock(&d->lock);
     movie_track(1, d, false);  // (d itself stays: the game's object may still point at it)
