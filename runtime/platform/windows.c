@@ -67,13 +67,24 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// MEM_WRITE_WATCH: the Vulkan backend keeps a copy of the guest heap in video memory and refreshes only the pages the
+// game wrote (plat_written_pages), so draws don't fetch every vertex and index over PCIe (runtime/nvn/vulkan/exec.c,
+// "the heap's copy in video memory").
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
-    void *p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE, PAGE_READWRITE);
+    void *p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE);
     if (p != (void *)(uintptr_t)lo) return false;
     g_lo = lo;
     g_hi = hi;
     AddVectoredExceptionHandler(1, vectored_handler);
     return true;
+}
+
+size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) {
+    ULONG_PTR n = max;
+    ULONG gran;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, size, (void **)pages, &n, &gran) != 0)
+        return SIZE_MAX;
+    return n >= max ? max : (size_t)n;  // (a full array may have left pages out: they're reset all the same)
 }
 
 // Decommit everything: the range stays reserved, and pages come back zeroed when committed again (lazily).

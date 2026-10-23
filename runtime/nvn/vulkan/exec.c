@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "../../kernel.h"
+#include "../../platform.h"
 #include "shaders.h"
 #include "vk.h"
 #include "../renderer.h"
@@ -29,6 +30,9 @@ static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since
 static uint8_t pass_feedback;        // the color targets (bits) the current pass began with a feedback loop enabled
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
+static uint64_t stat_vram_bytes, stat_vram_ns, stat_vram_query_ns, stat_vram_wait_ns;  // (the heap's copy in video memory, below)
+static int vram_state;  // the heap's copy in video memory: 0 not tried yet, 1 on, -1 off
+static bool vram_collect(bool wait);
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
@@ -278,6 +282,7 @@ void vk_gpuprof_report(void) {
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
     vk_end_pass();
+    vram_collect(true);  // (the heap copy's pages for this list go in its first submission)
     Sub *s = sub();
     if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
     VkCommandBufferSubmitInfo cbs[2];
@@ -717,6 +722,11 @@ const char *renderer_stats(void) {
                  (unsigned long long)stat_gcopy_miss, stat_gcopy_bytes / 1048576.0);
         n = strlen(stats_text);
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
+        n = strlen(stats_text);
+        if (vram_state > 0)
+            snprintf(stats_text + n, sizeof stats_text - n, ", heap copy %.1f MB (sync %.0f ms, written pages %.0f ms on their thread, waited %.0f ms)",
+                     stat_vram_bytes / 1048576.0, stat_vram_ns / 1e6, stat_vram_query_ns / 1e6, stat_vram_wait_ns / 1e6);
+        stat_vram_bytes = stat_vram_ns = stat_vram_query_ns = stat_vram_wait_ns = 0;
         stat_build_waits = 0;
         stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = 0;
         stat_gw_waits = stat_gw_holds = 0;
@@ -1088,7 +1098,8 @@ static void begin_pass(void) {
     // the piece instead cost more: the GPU is ~13 ms behind the translation at that point of BOTW's frame.)
     static int no_hold = -1;  // (debugging) SAVAGEWIND_VK_NO_HOLD=1: pieces go on after such a shader too
     if (no_hold < 0) no_hold = getenv("SAVAGEWIND_VK_NO_HOLD") != NULL;
-    if (submit_draws > 0 && chunk_draws >= (uint32_t)submit_draws && (!chunk_hold || no_hold))
+    // (and not before the heap copy's pages for this list are known: the draws go on recording meanwhile)
+    if (submit_draws > 0 && chunk_draws >= (uint32_t)submit_draws && (!chunk_hold || no_hold) && vram_collect(false))
         vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
     st.rt_dirty = false;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)  // (before the pass's command buffer is taken: a flush ends it)
@@ -2990,6 +3001,191 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     return true;
 }
 
+// ---- the heap's copy in video memory
+// On a discrete GPU the imported heap is system memory, so every draw fetched its vertices and indices over PCIe:
+// BOTW's two G-buffer passes (~2,300 draws each at 1600x900) took 3.6-3.9 ms of GPU each on an RTX 5090, ~1.6 us a
+// draw, and the depth-only shadow passes (896x896) as much per draw - 90% of the frame's 8 ms. Vertex and index fetches
+// now read a copy of the heap in device-local memory. Before each list (the game wrote its data and submitted, as
+// before the console's GPU reads it) the 4K pages the CPU wrote since the last list (plat_written_pages: Windows' write
+// watch) are copied over, in the submission's upload buffer; CopyBufferToBuffer (a CPU copy inside a list) refreshes
+// its range then and there. What shaders store to (the gw set) is read from the heap itself, as before, and a storing
+// shader whose stores aren't known (a held list) turns the copy off until the next list copies everything again.
+// Off on integrated GPUs (the heap is already in the GPU's memory), where the OS can't tell written pages, or with
+// SAVAGEWIND_VK_NO_HEAP_COPY=1.
+static bool gw_overlaps(uint64_t lo, uint64_t hi);
+static VkBuffer vram_buf;
+static VmaAllocation vram_mem;
+static uint64_t vram_size;
+static bool vram_full;          // the next sync copies the whole heap (a new copy, or the written pages weren't all listed)
+static bool vram_skip;          // this list reads the heap itself (a storing shader with unknown stores)
+static uint64_t *vram_pages;
+static size_t vram_pages_max;
+
+static void vram_free(void) {
+    if (!vram_buf) return;
+    vk_wait_seq(submit_seq);  // (submitted work may still read it)
+    vmaDestroyBuffer(g_vk.vma, vram_buf, vram_mem);
+    vram_buf = VK_NULL_HANDLE;
+    vram_mem = NULL;
+    vram_size = 0;
+}
+
+// Copies [heap offset, size) regions from the heap into the copy, in this submission's upload buffer (it ends with a
+// full barrier before the main buffer). The barrier first: earlier submissions may still fetch from those pages.
+static void vram_copy(const VkBufferCopy *rg, uint32_t n) {
+    if (!n) return;
+    VkCommandBuffer cb = vk_upload_cmd();
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
+                           .srcAccessMask = 0,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    vkCmdCopyBuffer(cb, gmem_buf, vram_buf, n, rg);
+    for (uint32_t i = 0; i < n; i++) stat_vram_bytes += rg[i].size;
+}
+
+// Which pages changed is asked of Windows once per list for the whole heap, on a thread of its own: a GetWriteWatch call
+// costs ~0.15 ms whatever its size and ~2 ms over the 3 GB heap (measured on a Ryzen 7 7800X3D), so the submission
+// thread starts translating the list while the query runs and only takes its pages when the list's first submission
+// goes to the GPU (vram_collect): the chunk submissions before that wait (draws keep recording) unless the list ends.
+static pthread_mutex_t vq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vq_cv = PTHREAD_COND_INITIALIZER;
+static bool vq_request, vq_done, vq_thread_on;
+static size_t vq_n;        // the query's result: pages listed in vram_pages (or SIZE_MAX / vram_pages_max)
+static bool vram_pending;  // this list's query was asked for and its pages aren't in the copy yet
+
+static void *vq_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&vq_lock);
+    for (;;) {
+        while (!vq_request) pthread_cond_wait(&vq_cv, &vq_lock);
+        vq_request = false;
+        pthread_mutex_unlock(&vq_lock);
+        uint64_t t0 = SDL_GetTicksNS();
+        size_t n = plat_written_pages(HEAP_BASE, vram_size, vram_pages, vram_pages_max);
+        uint64_t dt = SDL_GetTicksNS() - t0;
+        pthread_mutex_lock(&vq_lock);
+        stat_vram_query_ns += dt;
+        vq_n = n;
+        vq_done = true;
+        pthread_cond_broadcast(&vq_cv);
+    }
+    return NULL;
+}
+
+// The list's written pages, when its query is done (wait: block until it is), into the copy.
+static bool vram_collect(bool wait) {
+    if (!vram_pending) return true;
+    pthread_mutex_lock(&vq_lock);
+    if (!vq_done && !wait) { pthread_mutex_unlock(&vq_lock); return false; }
+    uint64_t t0 = SDL_GetTicksNS();
+    while (!vq_done) pthread_cond_wait(&vq_cv, &vq_lock);
+    stat_vram_wait_ns += SDL_GetTicksNS() - t0;
+    size_t n = vq_n;
+    vq_done = false;
+    pthread_mutex_unlock(&vq_lock);
+    vram_pending = false;
+    if (n == SIZE_MAX) {  // (the first query saw the OS report pages: not expected to stop)
+        vram_full = true;
+        return true;
+    }
+    if (n >= vram_pages_max) {
+        vram_copy(&(VkBufferCopy){0, 0, vram_size}, 1);
+        return true;
+    }
+    enum { MAXRG = 512 };
+    VkBufferCopy rg[MAXRG];
+    uint32_t nr = 0;
+    for (size_t i = 0; i < n; i++) {  // (ascending: runs of pages become one region)
+        uint64_t off = vram_pages[i] - HEAP_BASE;
+        if (nr && rg[nr - 1].srcOffset + rg[nr - 1].size == off) { rg[nr - 1].size += 0x1000; continue; }
+        if (nr == MAXRG) { vram_copy(rg, nr); nr = 0; }
+        rg[nr++] = (VkBufferCopy){off, off, 0x1000};
+    }
+    vram_copy(rg, nr);
+    return true;
+}
+
+// Before a list is translated: asks for the pages written since the last list (or copies the whole heap).
+static void vram_sync(void) {
+    vram_skip = false;
+    if (vram_state < 0 || !gmem_buf) return;
+    if (!vram_state) {
+        if (getenv("SAVAGEWIND_VK_NO_HEAP_COPY") || g_vk.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            vram_state = -1;
+            LOG("[vk] vertex and index fetches read the guest heap in place (%s)\n",
+                getenv("SAVAGEWIND_VK_NO_HEAP_COPY") ? "SAVAGEWIND_VK_NO_HEAP_COPY" : "integrated GPU: it's already its memory");
+            return;
+        }
+        vram_state = 1;
+    }
+    vram_collect(true);  // (a list that ended before its first submission)
+    if (vram_size != gmem_size) {  // the first sync, or the heap was imported again (it grew): a new copy, all of it
+        vram_free();
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = gmem_size,
+                                 .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &vram_buf, &vram_mem, NULL) != VK_SUCCESS) {
+            vram_buf = VK_NULL_HANDLE;
+            vram_state = -1;
+            LOG("[vk] no video memory for a copy of the guest heap (%llu MB): vertices and indices read in place\n",
+                (unsigned long long)(gmem_size >> 20));
+            return;
+        }
+        vram_size = gmem_size;
+        vram_full = true;
+        free(vram_pages);
+        vram_pages_max = gmem_size >> 12;
+        vram_pages = malloc(vram_pages_max * sizeof *vram_pages);
+        LOG("[vk] guest heap copied to video memory for vertex and index fetches: %llu MB\n", (unsigned long long)(gmem_size >> 20));
+    }
+    uint64_t t0 = SDL_GetTicksNS();
+    if (vram_full) {  // every page looked at (and reset), all of it copied, on this thread
+        size_t n = plat_written_pages(HEAP_BASE, gmem_size, vram_pages, vram_pages_max);
+        stat_vram_query_ns += SDL_GetTicksNS() - t0;
+        if (n == SIZE_MAX) {
+            LOG("[vk] the OS doesn't report written pages: vertices and indices read the guest heap in place\n");
+            vram_free();
+            vram_state = -1;
+            return;
+        }
+        vram_copy(&(VkBufferCopy){0, 0, gmem_size}, 1);
+        vram_full = false;
+        return;
+    }
+    if (!vq_thread_on) {
+        pthread_t t;
+        vq_thread_on = pthread_create(&t, NULL, vq_thread, NULL) == 0;
+        if (!vq_thread_on) { vram_full = true; return; }
+        pthread_detach(t);
+    }
+    pthread_mutex_lock(&vq_lock);
+    vq_request = true;
+    pthread_cond_broadcast(&vq_cv);
+    pthread_mutex_unlock(&vq_lock);
+    vram_pending = true;
+    stat_vram_ns += SDL_GetTicksNS() - t0;
+}
+
+// A CPU write into the heap inside a list (CopyBufferToBuffer): its pages into the copy before what follows reads them.
+static void vram_written(uint64_t addr, uint64_t size) {
+    if (vram_state <= 0 || !vram_buf || !size || addr < HEAP_BASE || addr + size > HEAP_BASE + vram_size) return;
+    uint64_t lo = (addr - HEAP_BASE) & ~0xFFFull, hi = (addr - HEAP_BASE + size + 0xFFF) & ~0xFFFull;
+    if (hi > vram_size) hi = vram_size;
+    vram_copy(&(VkBufferCopy){lo, lo, hi - lo}, 1);
+}
+
+// Vertex and index data: from the copy in video memory when there is one and no shader stores there, else in place.
+static bool guest_fetch(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (!guest_direct(addr, size, buf, off)) return false;
+    if (vram_state > 0 && vram_buf && !vram_skip && *off + size <= vram_size && !gw_overlaps(addr, addr + size)) {
+        *buf = vram_buf;
+    }
+    return true;
+}
+
 // ---- shaders that store to global memory, and the CPU's copies of guest memory
 // A shader with STG writes guest memory (the imported heap) on the GPU, while this thread goes on copying guest memory
 // for later draws and dispatches (constant buffers; vertices and indices outside the heap). Run on the GPU while the
@@ -3060,7 +3256,11 @@ static void gw_note(int stage) {  // a shader of this stage that stores to globa
         ok = gw_add(r.addr, r.addr + r.size);
         n++;
     }
-    if (!ok || !n) { chunk_hold = true; stat_gw_holds++; }
+    if (!ok || !n) {
+        chunk_hold = true;
+        stat_gw_holds++;
+        vram_skip = vram_full = true;  // (stores we can't place: the rest of the list reads the heap, the next copies it all)
+    }
 }
 
 // A constant buffer bound in place (in the set, in the heap, aligned for a uniform buffer descriptor), or false.
@@ -3126,6 +3326,8 @@ void vk_exec_reset(void) {
     key_gen++;
     g_cs_n = 0;
     gcopy_gen++;
+    vram_free();
+    vram_full = vram_skip = false;
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -4494,7 +4696,7 @@ have_pipe:
             uint32_t isz = itype == 1 ? 2 : 4;
             itype_vk = itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
             icount = count;
-            if (iaddr % isz == 0 && guest_direct(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
+            if (iaddr % isz == 0 && guest_fetch(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
             } else {
                 ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
@@ -4535,7 +4737,7 @@ have_pipe:
             Range v = st.vbuf[s];
             VkBuffer dbuf;
             VkDeviceSize doff;
-            if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
+            if (v.addr && v.size && guest_fetch(v.addr, v.size, &dbuf, &doff)) {
                 if (dc.vbuf[s] != dbuf || dc.voff[s] != doff) {
                     vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
                     dc.vbuf[s] = dbuf; dc.voff[s] = doff;
@@ -5863,6 +6065,7 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             kernel_watch_write("CopyBufferToBuffer", r->x[1], r->x[2]);
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
+            vram_written(r->x[1], r->x[2]);
             guest_copy_flush();
             break;
         default: break;
@@ -5878,6 +6081,7 @@ void backend_execute(uint64_t handle) {
     PROF_T0();
     in_execute = true;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
+    vram_sync();
     exec_list(handle, 0);
     in_execute = false;
     PROF_ADD(prof_exec);

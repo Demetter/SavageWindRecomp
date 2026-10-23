@@ -23,6 +23,10 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi);
 void plat_commit(uint64_t addr, uint64_t size);
 // In-place reboot: every page of [lo, hi) back to zero (and unbacked), the window still claimed.
 bool plat_reset_guest(uint64_t lo, uint64_t hi);
+// The 4K pages of [addr, addr+size) inside the guest window written since the last call (the first call: since the
+// reservation), into pages[] (at most max); the count (max when there may have been more: then take the whole range
+// as written), or SIZE_MAX where the OS can't tell. Only the CPU's writes count, not a GPU's.
+size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max);
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)

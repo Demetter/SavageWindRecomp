@@ -28,6 +28,9 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     return mach_vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED) == KERN_SUCCESS;
 }
 
+// (no page write tracking here: the Vulkan backend's heap copy in video memory stays off and draws read the heap)
+size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) { return SIZE_MAX; }
+
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     mach_vm_address_t a = lo;
