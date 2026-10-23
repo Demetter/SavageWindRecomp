@@ -85,6 +85,7 @@ void vk_dyn_forget(void) { dyn_epoch++; }
 // (begin_pass): while it stays, a draw takes the last draw's program and pipeline without building and comparing the
 // keys (~1.4 KB a draw). SAVAGEWIND_VK_NO_KEY_GEN=1: keys every draw.
 static uint64_t key_gen = 1;
+static uint64_t sbuf_gen = 1;  // bumped when storage buffers are bound (cbuf_info's driver constants)
 static uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
 static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign state: nothing known
     if (dc.epoch == dyn_epoch) return;
@@ -668,6 +669,7 @@ static struct {
     uint32_t restart_index;
     bool depth_clamp;
     bool raster_discard;  // nvnCommandBufferSetRasterizerDiscard
+    bool render_off;      // nvnCommandBufferSetRenderEnable(false): draws discarded until it's on again
     uint64_t copy_row_stride, copy_image_stride;
 } st;
 
@@ -777,6 +779,7 @@ const char *renderer_stats(void) {
 
 static void st_defaults(void) {
     memset(&st, 0, sizeof st);
+    sbuf_gen++;
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
         st.scissor[i][2] = 16384; st.scissor[i][3] = 16384;
@@ -2888,6 +2891,27 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
+    if (k == 0 && stage != 5) {
+        // A graphics stage's driver constants are its storage buffers' addresses: the same from draw to draw until
+        // the game binds others. Built and compared (2 KB zeroed, filled, memcmp'd: both stages of every draw) only
+        // when they or the submission change.
+        static struct { uint64_t gen, seq, size; VkDescriptorBufferInfo bi; } memo[5];
+        uint64_t size = si->cbuf_size[0] > 0x800 ? 0x800 : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        uint64_t seq = vk_pending_seq();
+        if (stage >= 0 && stage < 5 && memo[stage].gen == sbuf_gen && memo[stage].seq == seq && memo[stage].size == size)
+            return memo[stage].bi;
+        uint32_t drv[0x800 / 4] = {0};
+        uint32_t base = 0x110 + 0x100 * (stage == 1 ? 4 : 0);
+        for (int i = 0; i < 16; i++) {
+            uint32_t *e = &drv[(base + 16 * i) / 4];
+            e[0] = (uint32_t)st.sbuf[stage][i].addr;
+            e[1] = (uint32_t)(st.sbuf[stage][i].addr >> 32);
+            e[2] = (uint32_t)st.sbuf[stage][i].size;
+        }
+        VkDescriptorBufferInfo bi = ubo_span(copy_dedupe(stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        if (stage >= 0 && stage < 5) { memo[stage].gen = sbuf_gen; memo[stage].seq = seq; memo[stage].size = size; memo[stage].bi = bi; }
+        return bi;
+    }
     if (k == 0) {
         uint32_t drv[0x800 / 4] = {0};
         if (stage == 5) {
@@ -3509,8 +3533,6 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     VkDescriptorImageInfo ii[MAX_BIND];
     int n = 0;
     int sg = stage == 1 ? 1 : 0;
-    float rs[65][4] = {{1, 1, 0, 0}};
-    if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
         if (b->set != set) continue;
@@ -3552,8 +3574,18 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == 18) {
-            for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
-            bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
+            // (a table per stage group kept between calls: only the rows this shader reads are written, the rows a
+            // previous shader with more textures left are cleared - zeroing all 1040 bytes ran for every draw)
+            static float rsb[2][65][4] = {{{1, 1, 0, 0}}, {{1, 1, 0, 0}}};
+            static int rsn[2];
+            float (*rs)[4] = rsb[sg];
+            int nt = si->ntex < 64 ? si->ntex : 64;
+            if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
+            else { rs[0][0] = 1; rs[0][1] = 1; rs[0][2] = 0; rs[0][3] = 0; }
+            for (int t = 0; t < nt; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; rs[1 + t][2] = 0; rs[1 + t][3] = 0; }
+            if (rsn[sg] > nt) memset(rs[1 + nt], 0, (size_t)(rsn[sg] - nt) * 16);
+            rsn[sg] = nt;
+            bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rsb[0], 256), sizeof rsb[0]);
         } else {
             float zero[8] = {0};
             bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
@@ -4314,7 +4346,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pm.gen = key_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
     }
     if (pr && atomic_load(&pr->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pr->state);
-    if (st.raster_discard && pr && !(pr->vi && pr->vi->writes_gmem) && !(pr->fi && pr->fi->writes_gmem)) {
+    if ((st.raster_discard || st.render_off) && pr && !(pr->vi && pr->vi->writes_gmem) && !(pr->fi && pr->fi->writes_gmem)) {
         stat_discarded++;  // (rasterizer off: nothing to draw)
         return;
     }
@@ -5914,6 +5946,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
                 memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+            sbuf_gen++;  // (the driver constants' memo: cbuf_info)
             break;
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
@@ -5998,6 +6031,16 @@ static void exec_list(uint64_t handle, int depth) {
             static bool logged;
             if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetDepthClamp on (depth clamp %s)\n", g_vk.depth_clamp ? "supported" : "not supported"); }
             st.depth_clamp = r->x[0] != 0 && !off;
+            break;
+        }
+        case CMD_SET_RENDER_ENABLE: {
+            // The game's own switch for leaving draws out: it was recorded and never applied, so what the game
+            // turned off was drawn. SAVAGEWIND_NO_RENDER_ENABLE=1: ignored again (A/B).
+            static int off = -1;
+            if (off < 0) off = getenv("SAVAGEWIND_NO_RENDER_ENABLE") != NULL;
+            static bool logged;
+            if (!r->x[0] && !logged) { logged = true; LOG("[nvn] SetRenderEnable off: its draws are skipped\n"); }
+            st.render_off = !r->x[0] && !off;
             break;
         }
         case CMD_SET_RASTERIZER_DISCARD: {
