@@ -3,6 +3,7 @@
 // BOTW's open world, at ~20 calls a draw and ~5,000 draws a frame. vkd_load (after vkCreateDevice) takes each
 // function's device-level entry point from vkGetDeviceProcAddr, and vk.h's names below call those; a function the
 // device doesn't give keeps the loader's. vkd.c, which defines them, sees the loader's names (VKD_NO_REDIRECT).
+// The recording calls go through vkq.h's versions, which defer them to the recording thread when it's on.
 #pragma once
 #include <vulkan/vulkan.h>
 
@@ -25,54 +26,55 @@ VKD_FUNCS(VKD_DECLARE)
 void vkd_load(VkDevice dev);
 
 #ifndef VKD_NO_REDIRECT
+#include "vkq.h"  // (command recording: deferred to the recording thread while a list is translated)
 #define vkAllocateDescriptorSets vkd_AllocateDescriptorSets
-#define vkBeginCommandBuffer vkd_BeginCommandBuffer
-#define vkCmdBeginQuery vkd_CmdBeginQuery
-#define vkCmdBeginRendering vkd_CmdBeginRendering
-#define vkCmdBindDescriptorSets vkd_CmdBindDescriptorSets
-#define vkCmdBindIndexBuffer vkd_CmdBindIndexBuffer
-#define vkCmdBindPipeline vkd_CmdBindPipeline
-#define vkCmdBindVertexBuffers vkd_CmdBindVertexBuffers
-#define vkCmdBlitImage vkd_CmdBlitImage
-#define vkCmdClearAttachments vkd_CmdClearAttachments
-#define vkCmdClearColorImage vkd_CmdClearColorImage
-#define vkCmdClearDepthStencilImage vkd_CmdClearDepthStencilImage
-#define vkCmdCopyBuffer vkd_CmdCopyBuffer
-#define vkCmdCopyBufferToImage vkd_CmdCopyBufferToImage
-#define vkCmdCopyImage vkd_CmdCopyImage
-#define vkCmdCopyImageToBuffer vkd_CmdCopyImageToBuffer
-#define vkCmdDispatch vkd_CmdDispatch
-#define vkCmdDraw vkd_CmdDraw
-#define vkCmdDrawIndexed vkd_CmdDrawIndexed
-#define vkCmdEndQuery vkd_CmdEndQuery
-#define vkCmdEndRendering vkd_CmdEndRendering
-#define vkCmdPipelineBarrier2 vkd_CmdPipelineBarrier2
-#define vkCmdPushConstants vkd_CmdPushConstants
-#define vkCmdResetQueryPool vkd_CmdResetQueryPool
-#define vkCmdResolveImage vkd_CmdResolveImage
-#define vkCmdSetBlendConstants vkd_CmdSetBlendConstants
-#define vkCmdSetCullMode vkd_CmdSetCullMode
-#define vkCmdSetDepthBias vkd_CmdSetDepthBias
-#define vkCmdSetDepthBiasEnable vkd_CmdSetDepthBiasEnable
-#define vkCmdSetDepthCompareOp vkd_CmdSetDepthCompareOp
-#define vkCmdSetDepthTestEnable vkd_CmdSetDepthTestEnable
-#define vkCmdSetDepthWriteEnable vkd_CmdSetDepthWriteEnable
-#define vkCmdSetFrontFace vkd_CmdSetFrontFace
-#define vkCmdSetLineWidth vkd_CmdSetLineWidth
-#define vkCmdSetPrimitiveRestartEnable vkd_CmdSetPrimitiveRestartEnable
-#define vkCmdSetPrimitiveTopology vkd_CmdSetPrimitiveTopology
-#define vkCmdSetScissor vkd_CmdSetScissor
-#define vkCmdSetStencilCompareMask vkd_CmdSetStencilCompareMask
-#define vkCmdSetStencilOp vkd_CmdSetStencilOp
-#define vkCmdSetStencilReference vkd_CmdSetStencilReference
-#define vkCmdSetStencilTestEnable vkd_CmdSetStencilTestEnable
-#define vkCmdSetStencilWriteMask vkd_CmdSetStencilWriteMask
-#define vkCmdSetViewport vkd_CmdSetViewport
-#define vkCmdWriteTimestamp2 vkd_CmdWriteTimestamp2
-#define vkEndCommandBuffer vkd_EndCommandBuffer
+#define vkBeginCommandBuffer vkq_BeginCommandBuffer
+#define vkCmdBeginQuery vkq_CmdBeginQuery
+#define vkCmdBeginRendering vkq_CmdBeginRendering
+#define vkCmdBindDescriptorSets vkq_CmdBindDescriptorSets
+#define vkCmdBindIndexBuffer vkq_CmdBindIndexBuffer
+#define vkCmdBindPipeline vkq_CmdBindPipeline
+#define vkCmdBindVertexBuffers vkq_CmdBindVertexBuffers
+#define vkCmdBlitImage vkq_CmdBlitImage
+#define vkCmdClearAttachments vkq_CmdClearAttachments
+#define vkCmdClearColorImage vkq_CmdClearColorImage
+#define vkCmdClearDepthStencilImage vkq_CmdClearDepthStencilImage
+#define vkCmdCopyBuffer vkq_CmdCopyBuffer
+#define vkCmdCopyBufferToImage vkq_CmdCopyBufferToImage
+#define vkCmdCopyImage vkq_CmdCopyImage
+#define vkCmdCopyImageToBuffer vkq_CmdCopyImageToBuffer
+#define vkCmdDispatch vkq_CmdDispatch
+#define vkCmdDraw vkq_CmdDraw
+#define vkCmdDrawIndexed vkq_CmdDrawIndexed
+#define vkCmdEndQuery vkq_CmdEndQuery
+#define vkCmdEndRendering vkq_CmdEndRendering
+#define vkCmdPipelineBarrier2 vkq_CmdPipelineBarrier2
+#define vkCmdPushConstants vkq_CmdPushConstants
+#define vkCmdResetQueryPool vkq_CmdResetQueryPool
+#define vkCmdResolveImage vkq_CmdResolveImage
+#define vkCmdSetBlendConstants vkq_CmdSetBlendConstants
+#define vkCmdSetCullMode vkq_CmdSetCullMode
+#define vkCmdSetDepthBias vkq_CmdSetDepthBias
+#define vkCmdSetDepthBiasEnable vkq_CmdSetDepthBiasEnable
+#define vkCmdSetDepthCompareOp vkq_CmdSetDepthCompareOp
+#define vkCmdSetDepthTestEnable vkq_CmdSetDepthTestEnable
+#define vkCmdSetDepthWriteEnable vkq_CmdSetDepthWriteEnable
+#define vkCmdSetFrontFace vkq_CmdSetFrontFace
+#define vkCmdSetLineWidth vkq_CmdSetLineWidth
+#define vkCmdSetPrimitiveRestartEnable vkq_CmdSetPrimitiveRestartEnable
+#define vkCmdSetPrimitiveTopology vkq_CmdSetPrimitiveTopology
+#define vkCmdSetScissor vkq_CmdSetScissor
+#define vkCmdSetStencilCompareMask vkq_CmdSetStencilCompareMask
+#define vkCmdSetStencilOp vkq_CmdSetStencilOp
+#define vkCmdSetStencilReference vkq_CmdSetStencilReference
+#define vkCmdSetStencilTestEnable vkq_CmdSetStencilTestEnable
+#define vkCmdSetStencilWriteMask vkq_CmdSetStencilWriteMask
+#define vkCmdSetViewport vkq_CmdSetViewport
+#define vkCmdWriteTimestamp2 vkq_CmdWriteTimestamp2
+#define vkEndCommandBuffer vkq_EndCommandBuffer
 #define vkGetSemaphoreCounterValue vkd_GetSemaphoreCounterValue
-#define vkQueueSubmit2 vkd_QueueSubmit2
+#define vkQueueSubmit2 vkq_QueueSubmit2
 #define vkResetDescriptorPool vkd_ResetDescriptorPool
 #define vkUpdateDescriptorSets vkd_UpdateDescriptorSets
-#define vkWaitSemaphores vkd_WaitSemaphores
+#define vkWaitSemaphores vkq_WaitSemaphores
 #endif

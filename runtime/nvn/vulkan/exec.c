@@ -179,6 +179,7 @@ static Sub *sub(void) {
 static void begin_cb(VkCommandBuffer *cb, bool *begun) {
     if (*begun) return;
     if (!*cb) {
+        if (vkq_on) vkq_drain();  // (the pool is the recording thread's while it records: once per buffer)
         VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g_vk.pool,
                                           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, cb));
@@ -6099,6 +6100,7 @@ void backend_execute(uint64_t handle) {
     PROF_T0();
     in_execute = true;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
+    vkq_defer_begin();  // (its Vulkan commands recorded on the recording thread meanwhile: vkq.h)
     vram_sync();
     exec_list(handle, 0);
     in_execute = false;
@@ -6108,5 +6110,6 @@ void backend_execute(uint64_t handle) {
     if (sync_submit < 0) sync_submit = getenv("SAVAGEWIND_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else renderer_submit();
+    vkq_defer_end();  // (all of the list recorded and submitted)
     gpu_unlock();
 }
