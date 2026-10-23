@@ -31,13 +31,13 @@ for f in "$SRC"/*.cpp "$OUT/obj/astcenccli_platform_dependents.cpp"; do
     pids+=($!)
 done
 for p in "${pids[@]}"; do wait "$p"; done
-LIB=$(ls "$OUT"/obj/astcenc_*.o)
+LIB=("$OUT"/obj/astcenc_*.o)  # (an array: the checkout path may have spaces)
 [ -f "$OUT/astcenc$EXE" ] || clang++ "$OUT"/obj/*.o -o "$OUT/astcenc$EXE"
 
 clang++ -std=c++17 -O2 $DEFS -I"$SRC" -c "$ROOT/tools/test_astc_ref.cpp" -o "$OUT/test_astc_ref.o"
 clang -std=c11 -O2 -Wall -Wextra -c "$ROOT/runtime/nvn/astc.c" -o "$OUT/astc.o"
 clang -std=c11 -O2 -Wall -c "$ROOT/tools/test_astc.c" -o "$OUT/test_astc.o"
-clang++ "$OUT/test_astc.o" "$OUT/astc.o" "$OUT/test_astc_ref.o" $LIB -o "$OUT/test_astc$EXE"
+clang++ "$OUT/test_astc.o" "$OUT/astc.o" "$OUT/test_astc_ref.o" "${LIB[@]}" -o "$OUT/test_astc$EXE"
 T="$OUT/test_astc$EXE"
 A="$OUT/astcenc$EXE"
 [ "$N" = build ] && exit 0  # tools/test_astc.sh build: just build (then run build/astc_test/test_astc blk ...)

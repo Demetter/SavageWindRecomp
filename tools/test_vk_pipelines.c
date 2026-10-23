@@ -19,6 +19,19 @@ void rt_fatal_trace(void) { abort(); }
 ShaderInfo *old_maxwell_translate(const uint8_t *c, size_t m, int s, const ShaderKey *k) { (void)c, (void)m, (void)s, (void)k; return NULL; }
 void old_maxwell_free(ShaderInfo *s) { (void)s; }
 uint64_t old_maxwell_gmem_base, old_maxwell_gmem_size;
+// (device.c, smaa_data.c and the platform layer, which shaders.c and shader_archive.c call for the caches and the
+// SMAA passes: the test uses neither)
+const char smaa_hlsl_src[] = "";
+void vk_device_fault_report(void) { fprintf(stderr, "device lost\n"); }
+bool vk_replace_file(const char *tmp, const char *path) { remove(path); return rename(tmp, path) == 0; }
+bool plat_remove_tree(const char *dir) { (void)dir; return false; }
+#ifdef _WIN32
+#include <io.h>
+ssize_t pread(int fd, void *buf, size_t n, off_t off) {
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _read(fd, buf, (unsigned)n);
+}
+#endif
 
 static long g_messages;
 static VKAPI_ATTR VkBool32 VKAPI_CALL on_message(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT t,
@@ -54,10 +67,12 @@ static void init_device(void) {
     VkPhysicalDevice pd[8];
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
     g_vk.phys = pd[0];
+    // as device.c: the discrete GPU, or SAVAGEWIND_GPU=<index> (e.g. an integrated AMD next to an NVIDIA card)
+    int want = getenv("SAVAGEWIND_GPU") ? atoi(getenv("SAVAGEWIND_GPU")) : -1;
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { g_vk.phys = pd[i]; break; }
+        if (want >= 0 ? (int)i == want : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { g_vk.phys = pd[i]; break; }
     }
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
     fprintf(stderr, "device: %s\n", g_vk.props.deviceName);
