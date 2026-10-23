@@ -132,11 +132,15 @@ GuestFn dispatch_lookup(uint64_t addr) {
     return NULL;
 }
 
-// Small direct-mapped cache in front of the binary search
-#define DCACHE 4096
+// Direct-mapped cache in front of the binary search. Indexed by a mix of the address's low and high bits: function
+// entries are mostly 16-byte aligned, and (pc >> 2) alone left three slots in four empty (misses went to a binary
+// search over ~180,000 functions); 16384 entries (256 KB a thread) hold BOTW's virtual-call working set.
+#define DCACHE 16384
 static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
+static inline unsigned dcache_index(uint64_t pc) { return (unsigned)((pc >> 2) ^ (pc >> 16)) & (DCACHE - 1); }
 
-static GuestFn dispatch_slow(Cpu *c) {
+// (out of line: inlined, its prologue - five pushes and a frame - ran on every indirect call, cache hits included)
+__attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
         rt_unwind_point();  // (HLE calls aren't cached below, so every one passes here: a reboot's safe point)
@@ -155,7 +159,7 @@ static GuestFn dispatch_slow(Cpu *c) {
         const char *s = loader_symbol_at(c->x[30], &off);
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);
     }
-    unsigned h = (unsigned)(pc >> 2) & (DCACHE - 1);
+    unsigned h = dcache_index(pc);
     dcache[h].addr = pc;
     dcache[h].fn = f;
     return f;
@@ -165,7 +169,7 @@ static GuestFn dispatch_slow(Cpu *c) {
 void rt_dispatch(Cpu *c) {
     KThread *t = c->thread;  // (a better thread waiting for this one's core gets it: kernel.c kernel_preempt)
     if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held] < t->prio, 0)) kernel_preempt(t);
-    unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
+    unsigned h = dcache_index(c->pc);
     GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
     __attribute__((musttail)) return f(c);
 }
