@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan.h>
+#include "vkd.h"  // (the hot calls straight to the driver)
 #if __has_include(<vma/vk_mem_alloc.h>)
 #include <vma/vk_mem_alloc.h>
 #else
