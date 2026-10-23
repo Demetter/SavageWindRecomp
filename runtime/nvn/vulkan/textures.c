@@ -184,7 +184,21 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
     if ((t->target == 1 || t->target == 4) && t->samples <= 1 && (t->flags & 8) && renderer_format_is_depth(t->format) &&
         t->width == t->height && t->width >= 512)
         return RS_SHADOW;
-    if ((t->target != 1 && t->target != 4) || t->samples > 1 || !(t->flags & 9) || t->width < 32 || t->height < 16) return RS_NONE;
+    if ((t->target != 1 && t->target != 4) || t->samples > 1 || t->width < 32 || t->height < 16) return RS_NONE;
+    if (!(t->flags & 9)) {
+        // (SAVAGEWIND_SCALE_FRACTIONS=1, experimental: exact fractions of the 3D scene without the compressible or
+        // display flags (1600x900 / 2^k, rounded either way) follow it too. BOTW's 400x225 R8 one is its sun's shadow
+        // mask, stretched 9.6 times over a 4K scene (the fringe along Link's outline), but scaled, the shader that
+        // reads it no longer finds the light: the grass and the rocks go dark. Its reads need the scale first.)
+        static int off = -1;
+        if (off < 0) off = getenv("SAVAGEWIND_SCALE_FRACTIONS") == NULL;
+        bool frac = false;
+        for (int k = 1; k <= 4 && !off; k++)
+            if ((t->width == 1600u >> k || t->width == (1600u + (1u << k) - 1) >> k) &&
+                (t->height == 900u >> k || t->height == (900u + (1u << k) - 1) >> k))
+                frac = true;
+        return frac ? RS_SCENE : RS_NONE;
+    }
     float a = (float)t->width / (float)t->height;
     if (a < 1.74f || a > 1.81f) return RS_NONE;
     if (t->flags & 1) return RS_OUT;  // NVN_TEXTURE_FLAGS_DISPLAY: the images the game presents

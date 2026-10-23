@@ -94,6 +94,7 @@ typedef struct TexBackend {
     bool feedback_seen;      // a draw sampled it while writing it: its passes begin with the feedback loop enabled
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     bool scalable, presented;
+    bool target_logged;          // (SAVAGEWIND_LOG_TARGETS: listed once)
     uint8_t rs_group;            // RS_*: which output scale its allocation follows (textures.c)
     uint32_t guest_w;            // (RS_SHADOW: the guest width its scale is worked out from)
     uint64_t touched_frame, frame_cleared;

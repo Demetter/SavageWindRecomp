@@ -1143,6 +1143,20 @@ static void begin_pass(void) {
                 if (all[k]->width == all[i]->width && all[k]->height == all[i]->height) vk_make_scalable_like(all[k], all[i]);
             break;
         }
+        // SAVAGEWIND_LOG_TARGETS=1: each render target the first time it is drawn into: the game's size and flags,
+        // the scale group it got (0 none, 1 output, 2 scene, 3 shadow) and the size of its image (resolution bugs)
+        static int logt = -1;
+        if (logt < 0) logt = getenv("SAVAGEWIND_LOG_TARGETS") != NULL;
+        for (int i = 0; i < n && logt; i++) {
+            TexBackend *b = (TexBackend *)all[i]->backend;  // (as it is: a diagnostic doesn't create or upload)
+            if (!b || b->target_logged) continue;
+            b->target_logged = true;
+            LOG("[target] #%llu %ux%ux%u fmt %#x flags %#x target %u samples %u -> group %u, image %ux%u (x%.2f x%.2f)%s\n",
+                (unsigned long long)all[i]->debug_id, all[i]->width, all[i]->height, all[i]->depth, all[i]->format,
+                all[i]->flags, all[i]->target, all[i]->samples, b->rs_group, b->width, b->height,
+                all[i]->width ? (double)b->width / all[i]->width : 0, all[i]->height ? (double)b->height / all[i]->height : 0,
+                all[i] == st.rt.depth ? " depth" : "");
+        }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     VkAttachmentFeedbackLoopInfoEXT ca_fb[8];
