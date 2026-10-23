@@ -47,13 +47,15 @@ $CC -O2 -Wall -c runtime/nvn/maxwell/translate.c -o "$OUT/new.o"
 if [ "${GLSL:-1}" = 1 ]; then
   # shaderc is libshaderc_shared.so (MSYS2, Arch, from source) or libshaderc.so (Debian / Ubuntu, Homebrew); SPIRV-Tools
   # is shared where shipped, static C++ code behind its C API on Debian / Ubuntu (-lstdc++). Each probed with the call
-  # the test makes, shared names first.
+  # the test makes, shared names first (linked into $OUT: on Windows clang writes -o /dev/null as nul.exe in the
+  # current folder).
   SHADERC=-lshaderc_shared
   echo 'extern void *shaderc_compiler_initialize(void); int main(void){return shaderc_compiler_initialize()!=0;}' |
-    $CC -x c - $SHADERC -o /dev/null 2>/dev/null || SHADERC=-lshaderc
+    $CC -x c - $SHADERC -o "$OUT/probe" 2>/dev/null || SHADERC=-lshaderc
   SPIRV=-lSPIRV-Tools-shared
   echo 'extern void *spvContextCreate(int); int main(void){return spvContextCreate(0)!=0;}' |
-    $CC -x c - $SPIRV -o /dev/null 2>/dev/null || SPIRV="-lSPIRV-Tools -lstdc++"
+    $CC -x c - $SPIRV -o "$OUT/probe" 2>/dev/null || SPIRV="-lSPIRV-Tools -lstdc++"
+  rm -f "$OUT/probe" "$OUT/probe.exe"
   $CC -O2 -Wall -DWITH_GLSL tools/test_translate.c "$OUT/new.o" "$OUT/old.o" -o "$OUT/test_translate" $SHADERC $SPIRV
 else
   $CC -O2 -Wall tools/test_translate.c "$OUT/new.o" "$OUT/old.o" -o "$OUT/test_translate"
