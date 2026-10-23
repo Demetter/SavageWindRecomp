@@ -410,7 +410,9 @@ class Module:
         raise Unsupported(k)
 
     def emit_function(self, entry, end, labels, tables, hle):
-        out = [f'void {fname(entry)}(Cpu *c) {{']
+        # restrict: guest stores (through may_alias pointers into the guest window) can't reach the Cpu struct (host
+        # memory), so the registers stay in host registers across them instead of being reloaded after each store
+        out = [f'void {fname(entry)}(Cpu *restrict c) {{']
         if entry in hle:
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')

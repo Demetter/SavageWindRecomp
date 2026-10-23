@@ -36,7 +36,7 @@ MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
 CC       := clang $(MINFLAG) $(CROSS)
 CXX      := clang++ $(MINFLAG) $(CROSS)
 IMGUI    := third_party/imgui
-GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
+GENFLAGS := -O2 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 # FPCR.FZ is the thread's MXCSR DAZ / FTZ on x86-64 (simd.h, rt_fpcr_write): denormals can read as zero at run time, so
 # the compiler mustn't turn the integer denormal checks (simd_fp.h: flush, vfz) into float compares
 GENFLAGS += -fdenormal-fp-math=dynamic
