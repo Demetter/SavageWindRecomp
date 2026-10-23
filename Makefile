@@ -37,6 +37,9 @@ CC       := clang $(MINFLAG) $(CROSS)
 CXX      := clang++ $(MINFLAG) $(CROSS)
 IMGUI    := third_party/imgui
 GENFLAGS := -O2 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
+# The start screen's zig cc reads -O<n> as its own optimize mode and adds debug info and frame pointers: these give
+# it what clang builds here with GENFLAGS, in less time (runtime/gamebuild.c; PR #43)
+GENFLAGS_ZIG := -Xclang $(filter -O%,$(GENFLAGS)) -g0 -fomit-frame-pointer
 # FPCR.FZ is the thread's MXCSR DAZ / FTZ on x86-64 (simd.h, rt_fpcr_write): denormals can read as zero at run time, so
 # the compiler mustn't turn the integer denormal checks (simd_fp.h: flush, vfz) into float compares
 GENFLAGS += -fdenormal-fp-math=dynamic
@@ -117,7 +120,7 @@ GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
 GAMELIB_SRCS += tools/layout.py tools/game_sites.py
-GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 
 # TRANSLATOR_ID / SPIRV_ID: what translated shaders and their SPIR-V are made from (the Maxwell translator, the
 # GLSL -> SPIR-V step). The shader caches (cache/xlate, cache/spirv, the pipeline cache and list) are kept while these
@@ -147,6 +150,7 @@ $(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"'
 # the start screen's build of it (runtime/gamebuild.c) uses the same flags
 $(B)/rt/gamebuild.o: $(GAMELIB_SRCS) Makefile
 $(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_CFLAGS='"$(strip $(filter-out -Iruntime,$(GENFLAGS)))"' \
+                                -DGAMELIB_ZIGFLAGS='"$(GENFLAGS_ZIG)"' \
                                 -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
 
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)

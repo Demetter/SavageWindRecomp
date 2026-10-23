@@ -411,16 +411,42 @@ class Module:
         raise Unsupported(k)
 
     def emit_function(self, entry, end, labels, tables, hle):
-        # restrict: guest stores (through may_alias pointers into the guest window) can't reach the Cpu struct (host
-        # memory), so the registers stay in host registers across them instead of being reloaded after each store
-        out = [f'void {fname(entry)}(Cpu *restrict c) {{']
         if entry in hle:
-            out.append(f'    {sanitize(hle[entry])}(c);')
-            out.append('}')
-            return out
-        out.append(f'    FN_ENTER({hx(entry)});')
-        batch = []
+            self._refs = set()
+            return [f'void {fname(entry)}(Cpu *restrict c) {{', f'    {sanitize(hle[entry])}(c);', '}']
+        # Jump tables are emulated (jump_table), so their cases are known; one whose emulation missed some still
+        # reaches the right instruction through the all-instruction fallback: a label on every instruction and a
+        # switch over all of them. With an unresolved table ('all') that is the function's normal path. Otherwise
+        # it lives in a cold copy of the function (<name>_r), entered on a miss only: in the function itself it
+        # split every instruction into its own block and made LLVM's register coalescer take minutes per function
+        # (PR #43). A function that calls the guest setjmp keeps it inside: the copy, reached by a tail call, would
+        # leave the C frame the host setjmp was taken in.
         refs = set()
+        if not tables or 'all' in tables.values() or self.calls_setjmp(entry, end):
+            out = self._emit_body(entry, end, labels, tables, refs, 'plain')
+        else:
+            out = [f'static void {fname(entry)}_r(Cpu *c);']
+            out += self._emit_body(entry, end, labels, tables, refs, 'fast')
+            out += self._emit_body(entry, end, labels, tables, refs, 'resume')
+        self._refs = refs
+        return out
+
+    def calls_setjmp(self, entry, end):
+        return any(self.lift(a).kind == 'bl' and self.lift(a).target in self.setjmps for a in range(entry, end, 4))
+
+    def _emit_body(self, entry, end, labels, tables, refs, mode):
+        """One C function for entry..end. mode: 'plain' (the all-instruction fallback inside when it has tables),
+        'fast' (a table miss goes on in <name>_r) or 'resume' (<name>_r: from c->pc, through that fallback)."""
+        if mode == 'resume':
+            # (optnone: optimized, its switch made the copy as slow to build as the function used to be, and it is
+            # never run in practice. Unoptimized, its frame can reach ~250 KB: guest threads have 256 MB host stacks)
+            out = [f'__attribute__((cold, noinline, optnone)) static void {fname(entry)}_r(Cpu *c) {{', '    goto L_dispatch;']
+        else:
+            # restrict: guest stores (through may_alias pointers into the guest window) can't reach the Cpu struct
+            # (host memory), so the registers stay in host registers across them instead of being reloaded after
+            # each store
+            out = [f'void {fname(entry)}(Cpu *restrict c) {{', f'    FN_ENTER({hx(entry)});']
+        batch = []
 
         def flush():
             if batch:
@@ -435,11 +461,10 @@ class Module:
             refs.add(t)
             return f'__attribute__((musttail)) return {fname(t)}(c);'
 
-        # Functions with jump tables also get the all-instruction fallback: a table whose emulation
-        # missed some cases then still reaches the right instruction instead of aborting.
-        all_labels = bool(tables)
+        all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
         if all_labels:
             labels = set(range(entry, end, 4))
+        miss = f'__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast' else 'goto L_dispatch;'
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
@@ -491,7 +516,7 @@ class Module:
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
+                    out.append(f'    c->pc = {ins.target}; {miss}')
                     continue
                 out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
             elif k == 'ret':
@@ -506,7 +531,6 @@ class Module:
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             out.append('    __attribute__((musttail)) return rt_dispatch(c);')
         out.append('}')
-        self._refs = refs
         return out
 
 
