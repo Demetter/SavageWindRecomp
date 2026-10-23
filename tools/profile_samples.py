@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Self and inclusive time per function from build/samples.txt (runtime/sampler.c, SAVAGEWIND_SAMPLE).
 
-Usage: profile_samples.py [samples.txt] [--top N] [--thread HANDLE] [--busy]
+Usage: profile_samples.py [samples.txt] [--top N] [--thread HANDLE] [--busy] [--exclude FUNCTION]...
 
 Addresses in the game library become f_<guest address> (its exported symbols, from `nm build/swgame.dll`), those in
 the runtime the runtime's functions (`nm build/savagewind.exe`). --busy leaves out samples whose top frames are a
@@ -62,6 +62,8 @@ def main():
     ap.add_argument('--top', type=int, default=40)
     ap.add_argument('--thread', type=lambda v: int(v, 0))
     ap.add_argument('--busy', action='store_true')
+    ap.add_argument('--exclude', action='append', default=[], metavar='FUNCTION',
+                    help='leave out the samples with this function on the stack (e.g. the cost of a debug log)')
     a = ap.parse_args()
     bases, threads, samples = {}, {}, []
     for line in open(a.samples):
@@ -94,6 +96,8 @@ def main():
         kind = 'core' if any(n == CORE_WAIT for n in names) else 'wait' if any(n in WAITS for n in names) else 'busy'
         kinds[kind] += 1
         if a.busy and kind != 'busy':
+            continue
+        if a.exclude and any(n in a.exclude for n in names):
             continue
         total += 1
         per_thread[th] += 1
