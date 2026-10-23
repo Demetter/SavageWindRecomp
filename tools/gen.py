@@ -56,8 +56,9 @@ def setjmp_call(t, ret):
     """A call to the guest setjmp. The recompiled code can't resume in the middle of a function, where the guest
     longjmp returns to, so the call gets a host setjmp in the C function of the caller (runtime/hle/setjmp.c):
     the guest longjmp (HLE) restores the registers the guest setjmp saved and jumps back here with x0 set."""
+    # (the barrier: after the guest longjmp the registers are in *c, not in what restrict let the compiler keep)
     return (f'{{ jmp_buf *hb_ = rt_setjmp_slot(c, c->x[0]); '
-            f'if (!setjmp(*hb_)) {{ c->x[30] = {hx(ret)}; {fname(t)}(c); }} }}')
+            f'if (!setjmp(*hb_)) {{ c->x[30] = {hx(ret)}; {fname(t)}(c); }} __asm__ volatile("" ::: "memory"); }}')
 
 
 def sanitize(sym):
