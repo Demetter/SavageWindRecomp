@@ -36,8 +36,6 @@ static int vram_state;  // the heap's copy in video memory: 0 not tried yet, 1 o
 static bool vram_collect(bool wait);
 static int nlw;  // (the heap copy's ranges written in place during the list, below)
 static uint64_t lw_lo, lw_hi;
-static int nlw;  // (the heap copy's ranges written in place during the list, below)
-static uint64_t lw_lo, lw_hi;
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
@@ -644,7 +642,10 @@ typedef struct {
 
 typedef struct { uint64_t addr, size; } Range;
 
-static struct {
+// The state the command records set (render targets, bindings, fixed function), read by every draw. Per translating
+// thread: every thread starts on st_main, the submission thread's; a thread translating a batch of a list (stage 3 of
+// the parallel translation) points st_tls at its own copy, taken where its batch starts. `st` is the calling thread's.
+typedef struct XState {
     RtState rt;
     bool rt_dirty;
     NvnProgram *program;
@@ -671,7 +672,10 @@ static struct {
     bool raster_discard;  // nvnCommandBufferSetRasterizerDiscard
     bool render_off;      // nvnCommandBufferSetRenderEnable(false): draws discarded until it's on again
     uint64_t copy_row_stride, copy_image_stride;
-} st;
+} XState;
+static XState st_main;
+static __thread XState *st_tls = &st_main;
+#define st (*st_tls)
 
 uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
@@ -2252,11 +2256,11 @@ static void stage_layouts(StageBuild *b, int stage) {
 // alpha to coverage), into cache; lookup: only if cache has it (no compile)
 static VkPipeline gpl_shader_lib(VkShaderModule m, int stage, VkPipelineLayout layout, int variant, VkPipelineCache cache,
                                  bool lookup) {
-    VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+    VkPipelineShaderStageCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                           .stage = stage == STAGE_VERTEX ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT,
                                           .module = m, .pName = "main"};
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    VkGraphicsPipelineCreateInfo pi = {.pNext = &ri, .stageCount = 1, .pStages = &st, .layout = layout,
+    VkGraphicsPipelineCreateInfo pi = {.pNext = &ri, .stageCount = 1, .pStages = &sci, .layout = layout,
                                        .flags = lookup ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0};
     VkPipeline p;
     if (stage == STAGE_VERTEX) {
@@ -2348,11 +2352,11 @@ static VkPipeline gpl_state_lib(const PipeState *s, bool output) {
         uint32_t na = 0, nb = 0, nd = 0;
         for (int i = 0; i < 32; i++)
             if (k.attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k.attr_bind[i], k.attr_fmt[i], k.attr_off[i]};
-        for (uint32_t st = 0; st < 17; st++) {
-            if (!(k.used_streams & (1u << st))) continue;
-            bool inst = k.divisor[st] != 0;
-            vb[nb++] = (VkVertexInputBindingDescription){st, k.stride[st], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
-            if (inst && k.divisor[st] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){st, k.divisor[st]};
+        for (uint32_t sn = 0; sn < 17; sn++) {
+            if (!(k.used_streams & (1u << sn))) continue;
+            bool inst = k.divisor[sn] != 0;
+            vb[nb++] = (VkVertexInputBindingDescription){sn, k.stride[sn], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+            if (inst && k.divisor[sn] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){sn, k.divisor[sn]};
         }
         VkPipelineVertexInputDivisorStateCreateInfoEXT dvi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
                                                               .vertexBindingDivisorCount = nd, .pVertexBindingDivisors = vd};
