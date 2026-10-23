@@ -20,6 +20,7 @@
 
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+static uint64_t stat_discarded;  // draws with the rasterizer off, skipped
 static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
 static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
 static uint64_t stat_feedback_live;  // depth attachments sampled as they are (read-only feedback, no copy)
@@ -661,6 +662,7 @@ static struct {
     bool prim_restart;
     uint32_t restart_index;
     bool depth_clamp;
+    bool raster_discard;  // nvnCommandBufferSetRasterizerDiscard
     uint64_t copy_row_stride, copy_image_stride;
 } st;
 
@@ -706,8 +708,9 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d (warm %d), fbcopy %llu (+%llu live), upload %.1fMB",
-             (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
+             "%llu draws, %llu skipped, %llu discarded, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d (warm %d), fbcopy %llu (+%llu live), upload %.1fMB",
+             (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_discarded,
+             (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_warm, 0), (unsigned long long)stat_feedback_copies, (unsigned long long)stat_feedback_live,
              (double)stat_upload_bytes / 1048576.0);
@@ -763,7 +766,7 @@ const char *renderer_stats(void) {
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
     }
-    stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
+    stat_draws = stat_skipped = stat_discarded = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     return stats_text;
 }
 
@@ -4266,6 +4269,10 @@ static void draw_(CmdRec *r, bool indexed) {
         pm.gen = key_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
     }
     if (pr && atomic_load(&pr->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pr->state);
+    if (st.raster_discard && pr && !(pr->vi && pr->vi->writes_gmem) && !(pr->fi && pr->fi->writes_gmem)) {
+        stat_discarded++;  // (rasterizer off: nothing to draw)
+        return;
+    }
     if (!pr || atomic_load(&pr->state) != 1) {
         if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
             vk_trace_event(st.rt.color[0], 2, NULL, 0, "draw skipped: program %s", pr ? "not compiled yet" : "missing");
@@ -5946,6 +5953,17 @@ static void exec_list(uint64_t handle, int depth) {
             static bool logged;
             if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetDepthClamp on (depth clamp %s)\n", g_vk.depth_clamp ? "supported" : "not supported"); }
             st.depth_clamp = r->x[0] != 0 && !off;
+            break;
+        }
+        case CMD_SET_RASTERIZER_DISCARD: {
+            // Draws with the rasterizer off produce no pixels (no transform feedback here: the game binds none); they
+            // were drawn as ordinary geometry while this was ignored. Skipped in draw_ unless their shaders store to
+            // memory. SAVAGEWIND_NO_RASTER_DISCARD=1: ignored again (A/B).
+            static int off = -1;
+            if (off < 0) off = getenv("SAVAGEWIND_NO_RASTER_DISCARD") != NULL;
+            static bool logged;
+            if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetRasterizerDiscard on: its draws are skipped\n"); }
+            st.raster_discard = r->x[0] != 0 && !off;
             break;
         }
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
