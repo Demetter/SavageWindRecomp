@@ -307,10 +307,8 @@ bool launcher_config_key_held(void);  // (macOS: Option held while the app opens
 
 int main(int argc, char **argv) {
     plat_init();
-#ifdef _WIN32
-    setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
-#else
-    setvbuf(stderr, NULL, _IOLBF, 0);
+#ifndef _WIN32
+    setvbuf(stderr, NULL, _IOLBF, 0);  // (Windows: buffered and written by a thread of its own, plat_init)
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("SAVAGEWIND_NO_LAUNCHER") || getenv("SAVAGEWIND_INPUT");  // tests boot straight in

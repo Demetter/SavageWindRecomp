@@ -158,7 +158,6 @@ static void log_to_file_without_console(void) {
     snprintf(g_log_path, sizeof g_log_path, "%ssavagewind.log", exe);
     bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL;
     if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
-    setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));
     _putenv("SAVAGEWIND_LOG_APPEND=1");
 }
@@ -206,8 +205,35 @@ void plat_fatal_notice(void) {
     MessageBoxA(NULL, text, "Savage Wind", MB_ICONERROR | MB_OK);
 }
 
+// The log is buffered and written out by a thread of its own four times a second. Unbuffered (as it was), the CRT
+// writes each piece of a formatted line apart: every LOG was dozens of WriteFile calls on the thread that logged - the
+// game's threads, the submission thread - and a log line a frame made ~6,000 tiny writes a second (and cost the
+// submission thread milliseconds a frame). What ends the process flushes first (rt_fatal_trace, plat_terminate,
+// plat_exec; exit() does by itself).
+static DWORD WINAPI log_flusher(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(250);
+        fflush(stderr);
+    }
+    return 0;
+}
+
+static void log_buffered(void) {
+    static char buf[1 << 16];
+    setvbuf(stderr, buf, _IOFBF, sizeof buf);
+    HANDLE t = CreateThread(NULL, 0, log_flusher, NULL, 0, NULL);
+    if (t) {
+        SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(t);
+    } else {
+        setvbuf(stderr, NULL, _IONBF, 0);  // (no thread to write it out: as before)
+    }
+}
+
 void plat_init(void) {
     log_to_file_without_console();
+    log_buffered();
     require_cpu();
     _fmode = _O_BINARY;  // fopen/open default to binary (the runtime's "r"/"w" files are binary or LF text)
     _setmode(_fileno(stdout), _O_BINARY);
@@ -416,4 +442,7 @@ bool plat_remove_tree(const char *dir) {
 }
 
 // End the process at once, skipping DLL teardown (from an atexit handler, after flushing). Exit status 0.
-void plat_terminate(void) { TerminateProcess(GetCurrentProcess(), 0); }
+void plat_terminate(void) {
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 0);
+}
