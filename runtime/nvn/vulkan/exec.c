@@ -34,6 +34,10 @@ static uint64_t stat_upload_bytes;
 static uint64_t stat_vram_bytes, stat_vram_ns, stat_vram_query_ns, stat_vram_wait_ns;  // (the heap's copy in video memory, below)
 static int vram_state;  // the heap's copy in video memory: 0 not tried yet, 1 on, -1 off
 static bool vram_collect(bool wait);
+static int nlw;  // (the heap copy's ranges written in place during the list, below)
+static uint64_t lw_lo, lw_hi;
+static int nlw;  // (the heap copy's ranges written in place during the list, below)
+static uint64_t lw_lo, lw_hi;
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
@@ -3114,6 +3118,9 @@ static bool vram_collect(bool wait) {
 // Before a list is translated: asks for the pages written since the last list (or copies the whole heap).
 static void vram_sync(void) {
     vram_skip = false;
+    nlw = 0;  // (a new list: what the last one wrote in place is in the pages copied below)
+    lw_lo = ~0ull;
+    lw_hi = 0;
     if (vram_state < 0 || !gmem_buf) return;
     if (!vram_state) {
         if (getenv("SAVAGEWIND_VK_NO_HEAP_COPY") || g_vk.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
@@ -3173,18 +3180,55 @@ static void vram_sync(void) {
     stat_vram_ns += SDL_GetTicksNS() - t0;
 }
 
-// A CPU write into the heap inside a list (CopyBufferToBuffer): its pages into the copy before what follows reads them.
-static void vram_written(uint64_t addr, uint64_t size) {
-    if (vram_state <= 0 || !vram_buf || !size || addr < HEAP_BASE || addr + size > HEAP_BASE + vram_size) return;
-    uint64_t lo = (addr - HEAP_BASE) & ~0xFFFull, hi = (addr - HEAP_BASE + size + 0xFFF) & ~0xFFFull;
-    if (hi > vram_size) hi = vram_size;
-    vram_copy(&(VkBufferCopy){lo, lo, hi - lo}, 1);
+// What the translation itself writes into the heap during a list (UpdateUniformBuffer, CopyBufferToBuffer: CPU
+// writes in command order). The GPU reads such memory once the list is translated, so a draw sees the last value
+// written - as it did before the copy, which holds what the pages had when the list began. Draws whose vertices or
+// indices lie there read the heap itself, as before; the next list copies the pages over. Sorted, disjoint (lw).
+#define LW_MAX 4096
+static struct { uint64_t lo, hi; } lw[LW_MAX];
+static int nlw;
+static uint64_t lw_lo = ~0ull, lw_hi;
+
+static int lw_find(uint64_t lo) {  // the first range ending after lo
+    int a = 0, b = nlw;
+    while (a < b) { int m = (a + b) / 2; if (lw[m].hi <= lo) a = m + 1; else b = m; }
+    return a;
+}
+
+static void vram_list_written(uint64_t lo, uint64_t hi) {
+    if (vram_state <= 0 || !vram_buf || hi <= lo) return;
+    int i = lw_find(lo);
+    if (i < nlw && lw[i].lo <= lo && hi <= lw[i].hi) return;
+    if (i > 0 && lw[i - 1].hi == lo) i--;
+    int j = i;
+    while (j < nlw && lw[j].lo <= hi) j++;  // [i, j): overlapping or touching
+    if (j == i && nlw == LW_MAX) { vram_skip = true; return; }  // (full: the rest of the list reads the heap)
+    if (j > i) {
+        if (lw[i].lo < lo) lo = lw[i].lo;
+        if (lw[j - 1].hi > hi) hi = lw[j - 1].hi;
+        memmove(&lw[i + 1], &lw[j], (size_t)(nlw - j) * sizeof lw[0]);
+        nlw -= j - i - 1;
+    } else {
+        memmove(&lw[i + 1], &lw[i], (size_t)(nlw - i) * sizeof lw[0]);
+        nlw++;
+    }
+    lw[i].lo = lo;
+    lw[i].hi = hi;
+    if (lo < lw_lo) lw_lo = lo;
+    if (hi > lw_hi) lw_hi = hi;
+}
+
+static bool lw_overlaps(uint64_t lo, uint64_t hi) {
+    if (!nlw || hi <= lw_lo || lo >= lw_hi) return false;
+    int i = lw_find(lo);
+    return i < nlw && lw[i].lo < hi;
 }
 
 // Vertex and index data: from the copy in video memory when there is one and no shader stores there, else in place.
 static bool guest_fetch(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     if (!guest_direct(addr, size, buf, off)) return false;
-    if (vram_state > 0 && vram_buf && !vram_skip && *off + size <= vram_size && !gw_overlaps(addr, addr + size)) {
+    if (vram_state > 0 && vram_buf && !vram_skip && *off + size <= vram_size && !gw_overlaps(addr, addr + size) &&
+        !lw_overlaps(addr, addr + size)) {
         *buf = vram_buf;
     }
     return true;
@@ -6024,6 +6068,7 @@ static void exec_list(uint64_t handle, int depth) {
             if (!memcmp((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3])) { stat_uub_same++; break; }
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
             uub_note(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (the shared copies over it are stale now)
+            vram_list_written(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (and the heap copy: draws read it in place)
             break;
         case CMD_BARRIER:
             if (logfb > 0 && !fbskip) LOG("[feedback] barrier %#llx after %u draws\n", (unsigned long long)r->x[0], fb_draws);
@@ -6084,7 +6129,7 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             kernel_watch_write("CopyBufferToBuffer", r->x[1], r->x[2]);
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
-            vram_written(r->x[1], r->x[2]);
+            vram_list_written(r->x[1], r->x[1] + r->x[2]);
             guest_copy_flush();
             break;
         default: break;
