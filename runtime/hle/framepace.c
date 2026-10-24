@@ -35,7 +35,8 @@
 //   SAVAGEWIND_FRAMEPACE=0         the game's own pacing and clock (its 30 / 20 fps, as before)
 //   SAVAGEWIND_MOVIE_FPS=<n>       frame rate while a movie plays (default: the chosen one, the pictures paced by
 //                                  their time; with SAVAGEWIND_MOVIE_PACE=0 the movie's own; 0: the chosen one)
-//   SAVAGEWIND_MENU_FPS=<n>        frame rate in the menus (default 0: the chosen one; 30: the console's)
+//   SAVAGEWIND_MENU_FPS=<n>        frame rate in the menus (default 0: the chosen one, or 30 in game code without the
+//                                  GUI speed patch; 30: the console's)
 //   SAVAGEWIND_EVENT_FPS=<n>       frame rate in the events (default 0: the chosen one; 30: the console's)
 //   SAVAGEWIND_LOG_FRAMEPACE=<n>   every n clock updates: target, frame length, VFR ratio and interval
 //   SAVAGEWIND_NO_CONTROLLER_STEP=1  the controllers count presented frames (as the game does)
@@ -45,6 +46,7 @@
 #include <string.h>
 
 #include "../game_sites.h"
+#include "../gamelib.h"
 #include "../hle.h"
 #include "../settings.h"
 #include "../framepace.h"
@@ -85,12 +87,22 @@ static bool in_event(void) {
     return evt && *(uint64_t *)(uintptr_t)(evt + 0x1d2b8);
 }
 
+// The menus follow the chosen frame rate only in game code generated with the GUI speed patch (tools/patches.py
+// _gui_speed, site gui_speed): older game code keeps the game's own GUI speed, too fast above 60 fps, so its menus
+// stay at 30.
+static bool gui_speed_patched(void) {
+    const GameLibTables *t = gamelib_tables();
+    for (uint32_t k = 0; t && k < *t->nsites; k++)
+        if (!strcmp(t->sites[k].name, "gui_speed")) return true;
+    return false;
+}
+
 int framepace_target(void) {
     static int forced = -2, movie = -2, menu = -2, event = -2;
     if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);
     extern bool movie_paced(void);
     if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", movie_paced() ? 0 : -1);  // (-1: the movie's own frame rate)
-    if (menu == -2) menu = env_int("SAVAGEWIND_MENU_FPS", 0);
+    if (menu == -2) menu = env_int("SAVAGEWIND_MENU_FPS", gui_speed_patched() ? 0 : 30);
     if (event == -2) event = env_int("SAVAGEWIND_EVENT_FPS", 0);
     int fps = forced >= 0 ? forced : g_settings.fps_limit;
     if (fps < 0) fps = FPS_DEFAULT;
