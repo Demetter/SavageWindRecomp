@@ -283,6 +283,47 @@ void vk_gpuprof_report(void) {
     gp_n = 0;
 }
 
+// ---- SAVAGEWIND_FRAME_LOG=3: the GPU's side of each list of 100 draws or more, "[gtl]": when its pieces were submitted
+// and when the GPU finished each, in ms from the start of its translation (a thread waits for every submission).
+static int gtl_on = -1;
+static uint64_t gtl_sub_t[256], gtl_done_t[256];  // by submission number & 255: submitted (by the translation) / done
+typedef struct { uint64_t first, last, x0, x1, draws; } GtlList;
+static GtlList gtl_lists[64];
+static _Atomic unsigned gtl_put, gtl_get;
+static void *gtl_thread(void *arg) {
+    (void)arg;
+    uint64_t v = vk_completed_seq();
+    for (;;) {
+        uint64_t want = v + 1;
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                                  .pValues = &want};
+        if (vkWaitSemaphores(g_vk.dev, &wi, 100000000ull) != VK_SUCCESS) continue;
+        uint64_t now = plat_now_ns(), cur = vk_completed_seq();
+        for (uint64_t q = want; q <= cur; q++) gtl_done_t[q & 255] = now;
+        v = cur;
+        while (atomic_load(&gtl_get) != atomic_load(&gtl_put)) {
+            GtlList *l = &gtl_lists[atomic_load(&gtl_get) & 63];
+            if (l->last > v) break;
+            char line[512];
+            int n = snprintf(line, sizeof line, "[gtl] %llu draws: exec %.2f ms, done +%.2f (%.2f after exec), pieces:",
+                             (unsigned long long)l->draws, (l->x1 - l->x0) / 1e6, (gtl_done_t[l->last & 255] - l->x0) / 1e6,
+                             ((double)gtl_done_t[l->last & 255] - (double)l->x1) / 1e6);
+            for (uint64_t q = l->first; q <= l->last && n < (int)sizeof line - 40; q++)
+                n += snprintf(line + n, sizeof line - n, " %.2f>%.2f", (gtl_sub_t[q & 255] - l->x0) / 1e6, (gtl_done_t[q & 255] - l->x0) / 1e6);
+            LOG("%s\n", line);
+            atomic_fetch_add(&gtl_get, 1);
+        }
+    }
+    return NULL;
+}
+static void gtl_list(uint64_t first, uint64_t last, uint64_t x0, uint64_t draws) {
+    if (last < first || draws < 100) return;
+    unsigned put = atomic_load(&gtl_put);
+    if (put - atomic_load(&gtl_get) >= 64) return;
+    gtl_lists[put & 63] = (GtlList){first, last, x0, plat_now_ns(), draws};
+    atomic_store(&gtl_put, put + 1);
+}
+
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
@@ -321,6 +362,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
     pthread_mutex_unlock(&seq_lock);
+    if (gtl_on > 0) gtl_sub_t[submit_seq & 255] = plat_now_ns();
     cur_sub = (cur_sub + 1) % SUBS;
     stat_flushes++;
     cum_submits++;
@@ -6204,6 +6246,13 @@ void backend_execute(uint64_t handle) {
     gpu_lock();
     if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS")) LOG("[submit] %llx\n", (unsigned long long)handle);
     PROF_T0();
+    if (gtl_on < 0) {
+        gtl_on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) == 3;
+        pthread_t t;
+        if (gtl_on && pthread_create(&t, NULL, gtl_thread, NULL) == 0) pthread_detach(t);
+        else gtl_on = 0;
+    }
+    uint64_t gtl_x0 = gtl_on ? plat_now_ns() : 0, gtl_first = submit_seq + 1, gtl_draws = cum_draws;
     in_execute = true;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
     vkq_defer_begin();  // (its Vulkan commands recorded on the recording thread meanwhile: vkq.h)
@@ -6217,5 +6266,6 @@ void backend_execute(uint64_t handle) {
     if (sync_submit) renderer_flush();
     else renderer_submit();
     vkq_defer_end();  // (all of the list recorded and submitted)
+    if (gtl_on) gtl_list(gtl_first, submit_seq, gtl_x0, cum_draws - gtl_draws);
     gpu_unlock();
 }
