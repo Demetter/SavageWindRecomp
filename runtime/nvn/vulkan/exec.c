@@ -34,6 +34,7 @@ static int pass_nfbl;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 static uint64_t stat_vram_bytes, stat_vram_ns, stat_vram_query_ns, stat_vram_wait_ns;  // (the heap's copy in video memory, below)
+static uint64_t stat_vg_inplace;  // fetches that read the heap in place (its pages not current in the copy)
 static int vram_state;  // the heap's copy in video memory: 0 not tried yet, 1 on, -1 off
 static bool vram_collect(bool wait);
 static int nlw;  // (the heap copy's ranges written in place during the list, below)
@@ -782,9 +783,10 @@ const char *renderer_stats(void) {
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
         n = strlen(stats_text);
         if (vram_state > 0)
-            snprintf(stats_text + n, sizeof stats_text - n, ", heap copy %.1f MB (sync %.0f ms, written pages %.0f ms on their thread, waited %.0f ms)",
-                     stat_vram_bytes / 1048576.0, stat_vram_ns / 1e6, stat_vram_query_ns / 1e6, stat_vram_wait_ns / 1e6);
-        stat_vram_bytes = stat_vram_ns = stat_vram_query_ns = stat_vram_wait_ns = 0;
+            snprintf(stats_text + n, sizeof stats_text - n, ", heap copy %.1f MB (sync %.0f ms, written pages %.0f ms on their thread, waited %.0f ms, %llu fetches in place)",
+                     stat_vram_bytes / 1048576.0, stat_vram_ns / 1e6, stat_vram_query_ns / 1e6, stat_vram_wait_ns / 1e6,
+                     (unsigned long long)stat_vg_inplace);
+        stat_vram_bytes = stat_vram_ns = stat_vram_query_ns = stat_vram_wait_ns = stat_vg_inplace = 0;
         stat_build_waits = 0;
         stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = 0;
         stat_gw_waits = stat_gw_holds = 0;
@@ -3238,6 +3240,92 @@ static bool vram_full;          // the next sync copies the whole heap (a new co
 static bool vram_skip;          // this list reads the heap itself (a storing shader with unknown stores)
 static uint64_t *vram_pages;
 static size_t vram_pages_max;
+// Only the pages vertex and index fetches read are copied (vg). The game writes ~20 MB of the heap a frame (its own
+// objects, the command lists, uniforms), and copying all of it in each list's first submission held that submission
+// ~3 ms on the GPU (measured, SAVAGEWIND_FRAME_LOG=3) and the frame's end with it: the game waits for that end. vok:
+// the geometry pages the copy holds as they are. A fetch from pages not known as geometry yet, or written since they
+// were copied, reads the heap in place this once, and its pages go into the next list's copy (vg_next).
+static uint64_t *vg_bits, *vok_bits, *vpend_bits;  // a bit per heap page: geometry / current in the copy / in vg_next
+static uint32_t *vg_next;                          // page numbers for the next copy
+static size_t vg_nnext, vg_npages;
+
+static void vg_reset(uint64_t size) {
+    free(vg_bits), free(vok_bits), free(vpend_bits), free(vg_next);
+    vg_npages = (size_t)(size >> 12);
+    size_t words = (vg_npages + 63) / 64;
+    vg_bits = calloc(words, 8), vok_bits = calloc(words, 8), vpend_bits = calloc(words, 8);
+    vg_next = malloc(vg_npages * sizeof *vg_next);
+    vg_nnext = 0;
+}
+
+// Whether the copy holds [lo, hi) (heap addresses) as it is now. If not, its pages become geometry, copied with the
+// next list's.
+static bool vg_current(uint64_t lo, uint64_t hi) {
+    size_t p = (size_t)((lo - HEAP_BASE) >> 12), last = (size_t)((hi - 1 - HEAP_BASE) >> 12);
+    bool ok = true;
+    while (p <= last) {
+        size_t w = p >> 6, end = (w << 6) + 63 < last ? (w << 6) + 63 : last;
+        uint64_t m = (~0ull << (p & 63)) & (~0ull >> (63 - (end & 63)));
+        uint64_t miss = m & ~vok_bits[w];
+        if (miss) {
+            ok = false;
+            vg_bits[w] |= m;
+            uint64_t add = miss & ~vpend_bits[w];
+            vpend_bits[w] |= add;
+            for (; add; add &= add - 1) vg_next[vg_nnext++] = (uint32_t)((w << 6) + (size_t)__builtin_ctzll(add));
+        }
+        p = end + 1;
+    }
+    if (!ok) stat_vg_inplace++;
+    return ok;
+}
+
+static void vram_copy(const VkBufferCopy *rg, uint32_t n);
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+// This list's copy: the written pages (dirty, ascending heap addresses) that hold geometry, and the pages fetched in
+// place since the last copy. Written pages that hold none are no longer current.
+static void vg_copy(const uint64_t *dirty, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        size_t p = (size_t)((dirty[i] - HEAP_BASE) >> 12);
+        if (p >= vg_npages) continue;
+        uint64_t b = 1ull << (p & 63);
+        if (!(vg_bits[p >> 6] & b)) { vok_bits[p >> 6] &= ~b; continue; }
+        if (!(vpend_bits[p >> 6] & b)) vpend_bits[p >> 6] |= b, vg_next[vg_nnext++] = (uint32_t)p;
+    }
+    if (!vg_nnext) return;
+    qsort(vg_next, vg_nnext, sizeof *vg_next, cmp_u32);
+    enum { MAXRG = 512 };
+    VkBufferCopy rg[MAXRG];
+    uint32_t nr = 0;
+    for (size_t i = 0; i < vg_nnext; i++) {
+        uint32_t p = vg_next[i];
+        vok_bits[p >> 6] |= 1ull << (p & 63);
+        vpend_bits[p >> 6] &= ~(1ull << (p & 63));
+        uint64_t off = (uint64_t)p << 12;
+        if (nr && rg[nr - 1].srcOffset + rg[nr - 1].size == off) { rg[nr - 1].size += 0x1000; continue; }
+        if (nr == MAXRG) { vram_copy(rg, nr); nr = 0; }
+        rg[nr++] = (VkBufferCopy){off, off, 0x1000};
+    }
+    vram_copy(rg, nr);
+    vg_nnext = 0;
+}
+
+// Every geometry page copied (the written pages weren't all listed, or a storing shader's stores weren't known); the
+// rest no longer current.
+static void vg_copy_all(void) {
+    size_t words = (vg_npages + 63) / 64;
+    vg_nnext = 0;
+    for (size_t w = 0; w < words; w++) {
+        vok_bits[w] = 0;
+        vpend_bits[w] = vg_bits[w];
+        for (uint64_t m = vg_bits[w]; m; m &= m - 1) vg_next[vg_nnext++] = (uint32_t)((w << 6) + (size_t)__builtin_ctzll(m));
+    }
+    vg_copy(NULL, 0);
+}
 
 static void vram_free(void) {
     if (!vram_buf) return;
@@ -3308,20 +3396,8 @@ static bool vram_collect(bool wait) {
         vram_full = true;
         return true;
     }
-    if (n >= vram_pages_max) {
-        vram_copy(&(VkBufferCopy){0, 0, vram_size}, 1);
-        return true;
-    }
-    enum { MAXRG = 512 };
-    VkBufferCopy rg[MAXRG];
-    uint32_t nr = 0;
-    for (size_t i = 0; i < n; i++) {  // (ascending: runs of pages become one region)
-        uint64_t off = vram_pages[i] - HEAP_BASE;
-        if (nr && rg[nr - 1].srcOffset + rg[nr - 1].size == off) { rg[nr - 1].size += 0x1000; continue; }
-        if (nr == MAXRG) { vram_copy(rg, nr); nr = 0; }
-        rg[nr++] = (VkBufferCopy){off, off, 0x1000};
-    }
-    vram_copy(rg, nr);
+    if (n >= vram_pages_max) vg_copy_all();
+    else vg_copy(vram_pages, n);  // (ascending)
     return true;
 }
 
@@ -3360,10 +3436,11 @@ static void vram_sync(void) {
         free(vram_pages);
         vram_pages_max = gmem_size >> 12;
         vram_pages = malloc(vram_pages_max * sizeof *vram_pages);
+        vg_reset(gmem_size);
         LOG("[vk] guest heap copied to video memory for vertex and index fetches: %llu MB\n", (unsigned long long)(gmem_size >> 20));
     }
     uint64_t t0 = SDL_GetTicksNS();
-    if (vram_full) {  // every page looked at (and reset), all of it copied, on this thread
+    if (vram_full) {  // every page looked at (and reset), all the geometry copied, on this thread
         size_t n = plat_written_pages(HEAP_BASE, gmem_size, vram_pages, vram_pages_max);
         stat_vram_query_ns += SDL_GetTicksNS() - t0;
         if (n == SIZE_MAX) {
@@ -3372,7 +3449,7 @@ static void vram_sync(void) {
             vram_state = -1;
             return;
         }
-        vram_copy(&(VkBufferCopy){0, 0, gmem_size}, 1);
+        vg_copy_all();
         vram_full = false;
         return;
     }
@@ -3438,7 +3515,7 @@ static bool lw_overlaps(uint64_t lo, uint64_t hi) {
 static bool guest_fetch(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     if (!guest_direct(addr, size, buf, off)) return false;
     if (vram_state > 0 && vram_buf && !vram_skip && *off + size <= vram_size && !gw_overlaps(addr, addr + size) &&
-        !lw_overlaps(addr, addr + size)) {
+        !lw_overlaps(addr, addr + size) && vg_current(addr, addr + size)) {
         *buf = vram_buf;
     }
     return true;
