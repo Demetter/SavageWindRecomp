@@ -77,6 +77,12 @@ static void *sampler_main(void *arg) {
                         ctx.Rsp += 8;
                         continue;
                     }
+                    {   // a frame register (UNWIND_INFO FrameRegister: CONTEXT's Rax.. order) outside the stack: stop there
+                        const uint8_t *ui = (const uint8_t *)(uintptr_t)(base + f->UnwindData);
+                        int freg = ui[3] & 0xF;
+                        DWORD64 fv = freg ? (&ctx.Rax)[freg] : slo;
+                        if (fv < slo || fv >= shi) { d++; break; }
+                    }
                     void *hd = NULL;
                     DWORD64 fr = 0;
                     RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &hd, &fr, NULL);

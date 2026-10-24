@@ -22,6 +22,8 @@ Paths come from the environment or from tools/ghidra/gq.local.json (git-ignored)
   SW_GHIDRA_PROJECT    directory holding <name>.gpr (default: ../ghidra next to the repository)
   SW_GHIDRA_NAME       project name (default botw_1.8.2)
   SW_GHIDRA_PROGRAM    program inside the project (default main)
+  SW_GHIDRA_SCRIPTS    where SWQuery.java is (default: here; Windows' analyzeHeadless.bat breaks on a path with
+                       parentheses: a copy elsewhere)
 """
 import json
 import os
@@ -74,7 +76,7 @@ def main():
             f.write('\n'.join([result, cmd] + args) + '\n')
         launcher = os.path.join(ghidra, 'support', 'analyzeHeadless' + ('.bat' if os.name == 'nt' else ''))
         proc = subprocess.run([launcher, project, name, '-process', program, '-noanalysis', '-readOnly',
-                               '-scriptPath', HERE, '-postScript', 'SWQuery.java', request],
+                               '-scriptPath', setting('SW_GHIDRA_SCRIPTS', HERE), '-postScript', 'SWQuery.java', request],
                               env=env, capture_output=True, text=True, errors='replace')
         if os.path.exists(result):
             sys.stdout.write(open(result, encoding='utf-8').read())

@@ -33,8 +33,10 @@ static _Alignas(64) _Atomic int sleeping, waiting;
 static int state;  // 0 not started, 1 on, -1 off (SAVAGEWIND_VK_NO_DEFER, or no thread)
 static _Atomic int failed;  // a deferred submission failed: the producer reports it at the next drain
 
+void kernel_sample_host_thread(void);
 static void *recorder(void *arg) {
     (void)arg;
+    kernel_sample_host_thread();  // (SAVAGEWIND_SAMPLE profiles it as a host thread)
     for (;;) {
         uint64_t r = atomic_load_explicit(&rpos, memory_order_relaxed);
         uint64_t w = atomic_load_explicit(&wpos, memory_order_acquire);
@@ -133,6 +135,15 @@ void vkq_defer_end(void) {
     if (!vkq_on) return;
     vkq_drain();
     vkq_on = false;
+}
+
+// ---- an entry of the caller's own: fn(arg) on the recording thread, in order with the commands around it (exec.c: a
+// draw's descriptor sets, which a worker thread builds meanwhile). size bytes of arg are copied into the entry.
+bool vkq_custom(void (*fn)(void *), const void *arg, size_t size) {
+    if (!vkq_on) return false;
+    void *a = push((ReplayFn)fn, size);
+    memcpy(a, arg, size);
+    return true;
 }
 
 // ---- argument blocks: what follows a struct in its entry

@@ -13,6 +13,9 @@ extern __thread bool vkq_on;  // this thread's Vulkan commands go to the recordi
 void vkq_defer_begin(void);   // (the submission thread, at the start of a list)
 void vkq_defer_end(void);     // all of it recorded and submitted: direct calls are safe again
 void vkq_drain(void);         // everything deferred so far recorded and submitted (deferring goes on)
+// fn(arg) on the recording thread, after the commands deferred before it (size bytes of arg copied); false: not
+// deferring (the caller runs it itself)
+bool vkq_custom(void (*fn)(void *), const void *arg, size_t size);
 
 // The deferring versions of vkd.h's functions (the driver's own when vkq_on is false)
 VKAPI_ATTR VkResult VKAPI_CALL vkq_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi);
