@@ -409,10 +409,11 @@ void renderer_sync(void) {
 // the GPU reads (constants into the ring, textures into images, vertices into the heap copy), so the work after a
 // frame's last piece that touches guest memory - its lighting, post-processing and upscale, ~1.4 ms of GPU at 4K -
 // concerns no memory of the game's. Waiting for it held the game's main thread ~0.8 ms a frame for nothing.
-// SAVAGEWIND_VK_EARLY_FENCE=0: a fence is everything submitted before it, as before.
+// Off by default (SAVAGEWIND_VK_EARLY_FENCE=1 turns it on): on the Great Plateau it changed nothing, the game's main
+// thread bounds the frame there; a fence is everything submitted before it.
 static int early_fence(void) {
     static int on = -1;
-    if (on < 0) on = !getenv("SAVAGEWIND_VK_EARLY_FENCE") || atoi(getenv("SAVAGEWIND_VK_EARLY_FENCE")) != 0;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_EARLY_FENCE") && atoi(getenv("SAVAGEWIND_VK_EARLY_FENCE")) != 0;
     return on;
 }
 static void fx_mark(void) { sub()->fx = true; }
