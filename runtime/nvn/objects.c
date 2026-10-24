@@ -192,7 +192,7 @@ static bool async_exec(void) {
 uint64_t g_fs_vfr, g_fs_sync0, g_fs_sync1, g_fs_submit, g_fs_x0, g_fs_x1, g_fs_pace;
 static int frame_split(void) {
     static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) == 2;
+    if (on < 0) on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) >= 2;
     return on;
 }
 static void frame_split_log(void) {

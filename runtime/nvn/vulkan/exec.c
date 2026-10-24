@@ -3314,6 +3314,42 @@ static void vg_copy(const uint64_t *dirty, size_t n) {
     vg_nnext = 0;
 }
 
+// (SAVAGEWIND_FRAME_LOG=2, every 600 lists) How the geometry lies in the heap: its runs of pages with gaps under G
+// pages merged, their pages, and how many of this list's written pages fall inside them, for G from 1 page to 128 MB.
+static void vg_layout_log(const uint64_t *dirty, size_t n) {
+    static int on = -1;
+    static unsigned k;
+    if (on < 0) on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) >= 2;
+    if (!on || k++ % 600) return;
+    static const size_t gaps[] = {1, 16, 256, 4096, 32768};
+    size_t total = 0;
+    for (size_t p = 0; p < vg_npages; p++) total += (vg_bits[p >> 6] >> (p & 63)) & 1;
+    char line[600];
+    int len = snprintf(line, sizeof line, "[vg] %zu geometry pages (%zu MB), %zu written pages this list;", total, total >> 8, n);
+    for (int g = 0; g < 5; g++) {
+        size_t runs = 0, pages = 0, lo = 0, hi = 0, inside = 0, d = 0;
+        bool open = false;
+        for (size_t p = 0; p <= vg_npages; p++) {
+            bool v = p < vg_npages && ((vg_bits[p >> 6] >> (p & 63)) & 1);
+            if (v) {
+                if (open && p - hi > gaps[g]) {
+                    runs++, pages += hi + 1 - lo;
+                    for (; d < n && (size_t)((dirty[d] - HEAP_BASE) >> 12) <= hi; d++) inside += (size_t)((dirty[d] - HEAP_BASE) >> 12) >= lo;
+                    open = false;
+                }
+                if (!open) lo = p, open = true;
+                hi = p;
+            }
+        }
+        if (open) {
+            runs++, pages += hi + 1 - lo;
+            for (; d < n && (size_t)((dirty[d] - HEAP_BASE) >> 12) <= hi; d++) inside += (size_t)((dirty[d] - HEAP_BASE) >> 12) >= lo;
+        }
+        len += snprintf(line + len, sizeof line - len, " gap<%zuK: %zu runs, %zu MB, %zu written inside;", gaps[g] * 4, runs, pages >> 8, inside);
+    }
+    LOG("%s\n", line);
+}
+
 // Every geometry page copied (the written pages weren't all listed, or a storing shader's stores weren't known); the
 // rest no longer current.
 static void vg_copy_all(void) {
@@ -3397,7 +3433,7 @@ static bool vram_collect(bool wait) {
         return true;
     }
     if (n >= vram_pages_max) vg_copy_all();
-    else vg_copy(vram_pages, n);  // (ascending)
+    else vg_layout_log(vram_pages, n), vg_copy(vram_pages, n);  // (ascending)
     return true;
 }
 
@@ -3453,6 +3489,9 @@ static void vram_sync(void) {
         vram_full = false;
         return;
     }
+    static int no_query = -1;  // (measurement) SAVAGEWIND_VK_WW_SKIP=1: no written-pages query after the first copy
+    if (no_query < 0) no_query = getenv("SAVAGEWIND_VK_WW_SKIP") != NULL;
+    if (no_query) { vg_copy(NULL, 0); return; }
     if (!vq_thread_on) {
         pthread_t t;
         vq_thread_on = pthread_create(&t, NULL, vq_thread, NULL) == 0;
@@ -5091,6 +5130,22 @@ have_pipe:
             VkBuffer dbuf;
             VkDeviceSize doff;
             if (v.addr && v.size && guest_fetch(v.addr, v.size, &dbuf, &doff)) {
+                static int vgchk = -1;  // (debugging) SAVAGEWIND_VK_VG_CHECK=1: draws whose fetches reach past their stream's range
+                if (vgchk < 0) vgchk = getenv("SAVAGEWIND_VK_VG_CHECK") != NULL;
+                uint32_t dv = pipe_memo.k.s.divisor[s];
+                if (vgchk && pipe_memo.k.s.stride[s] && (dv || !use_index || scan_src)) {
+                    uint32_t mx = 0;
+                    if (dv) mx = (base_inst + inst + dv - 1) / dv - 1;
+                    else if (!use_index) mx = first + count - 1;
+                    else if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > mx && q[i] != (uint16_t)scan_restart) mx = q[i]; }
+                    else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > mx && q[i] != scan_restart) mx = q[i]; }
+                    uint64_t reach = ((uint64_t)(int64_t)(dv || !use_index ? 0 : base_vertex) + mx + 1) * pipe_memo.k.s.stride[s];
+                    static int nlog;
+                    if (reach > v.size && nlog++ < 40)
+                        LOG("[vgchk] stream %d (divisor %u%s) reads %llu bytes past its range (%llx+%llu, stride %u, max index %u, base %d, fs %016llx, %s)\n", s, dv, use_index ? "" : ", no indices",
+                            (unsigned long long)(reach - v.size), (unsigned long long)v.addr, (unsigned long long)v.size,
+                            pipe_memo.k.s.stride[s], mx, base_vertex, (unsigned long long)g_cur_fs_hash, dbuf == vram_buf ? "copy" : "heap");
+                }
                 if (dc.vbuf[s] != dbuf || dc.voff[s] != doff) {
                     vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
                     dc.vbuf[s] = dbuf; dc.voff[s] = doff;
@@ -6456,7 +6511,7 @@ void backend_execute(uint64_t handle) {
     if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS")) LOG("[submit] %llx\n", (unsigned long long)handle);
     PROF_T0();
     if (gtl_on < 0) {
-        gtl_on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) == 3;
+        gtl_on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) >= 2;
         pthread_t t;
         if (gtl_on && pthread_create(&t, NULL, gtl_thread, NULL) == 0) pthread_detach(t);
         else gtl_on = 0;
