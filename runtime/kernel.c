@@ -839,6 +839,8 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
         c->x[1], c->x[2], pc);
 }
 
+void backend_heap_set(uint64_t size);  // renderer: the game set its heap's size (runtime/nvn)
+
 static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     uint64_t *x = c->x;
     switch (imm) {
@@ -846,6 +848,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         uint64_t size = x[1];
         if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
         heap_size = size;
+        backend_heap_set(size);  // (the renderer may back the heap with GPU memory: Linux, exec.c)
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
         x[0] = R_OK;

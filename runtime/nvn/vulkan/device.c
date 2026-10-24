@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "../../framepace.h"
+#include "../../imageload.h"
 #include "../../paths.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
@@ -57,7 +58,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
-    const char *ext[16];
+    const char *ext[24];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
     bool validate = getenv("SAVAGEWIND_VK_VALIDATION") != NULL;
@@ -183,7 +184,7 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[16];
+    const char *ext[24];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     bool addr_report = g_addr_report_hi && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
@@ -195,15 +196,48 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+#ifdef __linux__
+    // the guest heap as GPU memory mapped at the heap's addresses (exec.c backend_heap_set)
+    g_vk.dmabuf = has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    if (g_vk.dmabuf) {
+        ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    }
+    {
+        VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.radv = drv.driverID == VK_DRIVER_ID_MESA_RADV;
+    }
+#endif
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
-    // Color targets a draw samples while it writes them (exec.c resolve_feedback): a feedback loop in GENERAL layout
-    // with a barrier inside the pass between such draws, instead of a copy of the target before each one.
-    // SAVAGEWIND_VK_NO_FEEDBACK_LOOP=1: copies, as before.
+    // Point lists drawn with vertex shaders that write no point size (the game has them): without maintenance5 the
+    // size is undefined, and on RADV with graphics pipeline libraries the GPU hung within the first frames (Steam Deck).
+    // With it the size is 1.0, as on the Switch.
+    bool m5 = false;
+    if (has_ext(ep, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        VkPhysicalDeviceMaintenance5FeaturesKHR m5_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &m5_have};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+        m5 = m5_have.maintenance5;
+    }
+    if (m5) ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+    LOG("[vk] maintenance5 %s\n", m5 ? "on (unwritten point size is 1.0)" : "not supported");
+    // Color targets a draw samples while it writes them (exec.c resolve_feedback): a feedback loop with a barrier
+    // inside the pass between such draws, instead of a copy of the target before each one. With
+    // VK_KHR_unified_image_layouts the target stays in GENERAL layout. Without it (RADV, AMD's Windows driver; Vulkan
+    // headers before 1.4.321) it is in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the passes that loop (g_vk.feedback_layout,
+    // exec.c begin_pass): on the Steam Deck the copies were half of the GPU's frame. SAVAGEWIND_VK_NO_FEEDBACK_LOOP=1:
+    // copies, as before; SAVAGEWIND_VK_FEEDBACK_LAYOUT=1: the layout path where unified layouts exist too (testing).
     bool fbl = !getenv("SAVAGEWIND_VK_NO_FEEDBACK_LOOP") && has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
-               has_ext(ep, ne, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME) &&
                has_ext(ep, ne, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+#ifdef VK_KHR_unified_image_layouts
+    bool uil = fbl && !getenv("SAVAGEWIND_VK_FEEDBACK_LAYOUT") && has_ext(ep, ne, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+#else
+    bool uil = false;
+#endif
     // Pipelines linked from shaders compiled apart from the fixed state (exec.c, graphics pipeline libraries), when
     // the driver links them fast. SAVAGEWIND_VK_NO_GPL=1: whole pipelines, as before.
     bool gpl = !getenv("SAVAGEWIND_VK_NO_GPL") && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
@@ -216,10 +250,13 @@ static void create_device(void) {
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &fbl_have};
+#ifdef VK_KHR_unified_image_layouts
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
                                                                .pNext = &fbl_have};
-    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr_have = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &uil_have};
+    if (uil) lr_have.pNext = &uil_have;
+#endif
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, .pNext = fbl ? &lr_have : NULL};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -237,24 +274,35 @@ static void create_device(void) {
         ext[n_ext++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
     }
     LOG("[vk] graphics pipeline libraries %s\n", g_vk.gpl ? "on (shaders compiled apart from the fixed state)" : "off");
-    g_vk.feedback_loop = fbl && fbl_have.attachmentFeedbackLoopLayout && uil_have.unifiedImageLayouts && lr_have.dynamicRenderingLocalRead;
+    g_vk.feedback_loop = fbl && fbl_have.attachmentFeedbackLoopLayout && lr_have.dynamicRenderingLocalRead;
+#ifdef VK_KHR_unified_image_layouts
+    uil = uil && uil_have.unifiedImageLayouts;
+#endif
+    g_vk.feedback_layout = g_vk.feedback_loop && !uil;
     if (g_vk.feedback_loop) {
         ext[n_ext++] = VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME;
-        ext[n_ext++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
         ext[n_ext++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+#ifdef VK_KHR_unified_image_layouts
+        if (uil) ext[n_ext++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
+#endif
     }
-    LOG("[vk] attachment feedback loops %s\n", g_vk.feedback_loop ? "on" : "off (target copies)");
+    LOG("[vk] attachment feedback loops %s\n", !g_vk.feedback_loop ? "off (target copies)"
+                                               : g_vk.feedback_layout ? "on (feedback loop layout)" : "on");
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
+                                                     .maintenance5 = VK_TRUE,
+                                                     .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
                                             .maintenance4 = VK_TRUE, .pipelineCreationCacheControl = VK_TRUE,
-                                            .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
+                                            .pNext = m5 ? (void *)&m5_on : g_vk.custom_border ? (void *)&cbc
+                                                                         : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
@@ -268,11 +316,14 @@ static void create_device(void) {
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl_on = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT, .attachmentFeedbackLoopLayout = VK_TRUE,
         .pNext = addr_report ? (void *)&abr : fault ? (void *)&ff : (void *)&f11};
-    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
-                                                             .unifiedImageLayouts = VK_TRUE, .pNext = &fbl_on};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr_on = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .dynamicRenderingLocalRead = VK_TRUE,
-        .pNext = &uil_on};
+        .pNext = &fbl_on};
+#ifdef VK_KHR_unified_image_layouts
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+                                                             .unifiedImageLayouts = VK_TRUE, .pNext = &fbl_on};
+    if (uil) lr_on.pNext = &uil_on;
+#endif
     void *chain = g_vk.feedback_loop ? (void *)&lr_on : addr_report ? (void *)&abr : fault ? (void *)&ff : (void *)&f11;
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_on = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, .graphicsPipelineLibrary = VK_TRUE,
@@ -1092,15 +1143,8 @@ void vk_frame_end(const char *shot_path) {
 
 // Saved opaque: render targets often keep data in alpha (BOTW's G-buffer), which image viewers turn into black.
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
-    uint8_t *px = malloc((size_t)w * h * 4);
-    if (!px) return;
-    memcpy(px, rgba, (size_t)w * h * 4);
-    for (size_t i = 3; i < (size_t)w * h * 4; i += 4) px[i] = 255;
-    SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, px, (int)w * 4);
-    if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
-    else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
-    SDL_DestroySurface(s);
-    free(px);
+    if (rt_save_png(path, rgba, (int)w, (int)h)) LOG("[vk] saved %s (%ux%u)\n", path, w, h);
+    else LOG("[vk] saving %s failed\n", path);
 }
 
 // ================================================================== game presentation (metal.m backend_present)
@@ -1424,8 +1468,12 @@ void ui_window_init(void) {
 
 SDL_Window *ui_window(void) { return window; }
 
-void backend_init(void) {
+void vk_wait_ready(void) {  // (a guest thread: the window and device are the main thread's, ui_run)
     while (!atomic_load(&ui_ready)) SDL_Delay(1);
+}
+
+void backend_init(void) {
+    vk_wait_ready();
     LOG("[vk] %s, swapchain %ux%u\n", g_vk.props.deviceName, g_vk.sc_extent.width, g_vk.sc_extent.height);
 }
 
@@ -1440,7 +1488,7 @@ void backend_reset(void) {
     vk_exec_reset();
     g_last_presented = NULL;
 }
-void backend_guest_memory_reset(void) {}  // (exec.c re-imports the heap on first use)
+void backend_guest_memory_reset(void) {}  // (exec.c: the next SetHeapSize maps the heap again, or it is imported on first use)
 void backend_clear_window(void) {
     static const float black[4] = {0, 0, 0, 1};
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);

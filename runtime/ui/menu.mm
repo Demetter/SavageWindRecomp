@@ -502,15 +502,15 @@ static void tab_display(void) {
         g_settings.fullscreen = fs;
         g_want_window_apply.store(true);
     }
-    {   // Window size (runtime/window_size.c): the sizes the display can show, grouped by shape
+    {   // Window size (runtime/window_size.c): the sizes the display can show, its own first, then grouped by shape
         WinSize list[WINSIZE_MAX];
-        static char names_buf[WINSIZE_MAX][32];
+        static char names_buf[WINSIZE_MAX][64];
         const char *names[WINSIZE_MAX];
         int n = winsize_list(list, g_settings.fullscreen), cur = 0, def = 0;
         WinSize e = winsize_effective(g_settings.fullscreen), d = winsize_default(g_settings.fullscreen);
         WinSize desk = winsize_desktop();
         for (int i = 0; i < n; i++) {
-            winsize_name(list[i], names_buf[i], sizeof names_buf[i]);
+            winsize_name(list[i], tr("native"), names_buf[i], sizeof names_buf[i]);
             names[i] = names_buf[i];
             if (list[i].w == e.w && list[i].h == e.h) cur = i;
             if (list[i].w == d.w && list[i].h == d.h) def = i;
@@ -519,7 +519,7 @@ static void tab_display(void) {
         snprintf(desc, sizeof desc, tr("The size of the game's window, or of the screen in fullscreen. Only the sizes your "
                                        "display can show, grouped by shape (the game itself stays 16:9, with bars on "
                                        "wider screens).\n\nYour display: %d x %d."), desk.w, desk.h);
-        if (opt_choice("Window size", &cur, names, n, def, desc, false)) {
+        if (opt_choice("Window size", &cur, names, n, def, desc)) {  // (past either end: the other one)
             g_settings.window_w = list[cur].w, g_settings.window_h = list[cur].h;
             g_want_window_apply.store(true);
         }

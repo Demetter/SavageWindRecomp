@@ -45,6 +45,7 @@ typedef struct {
     int fps_limit;       // frame rate, frames per second (FPS_CHOICES; 0: no limit)
     int vsync;           // VSYNC_*
     bool dpad_move;      // the d-pad (and arrow keys) also act as the left stick while it is at rest
+    float stick_deadzone[2];  // left, right stick: a controller's stick reads 0 within this much of full tilt (radial)
     bool mouse_camera;   // the mouse turns the camera (right stick); the cursor is held in the window while playing
     float mouse_sens;    // mouse camera speed, 1 = 100% (default MOUSE_SENS_DEFAULT)
     bool mouse_invert_y; // mouse up looks down
@@ -59,6 +60,7 @@ typedef struct {
     bool menu_tip_seen;  // the start screen's one-time "how to open the menu" note was shown (first PLAY ever)
 } Settings;
 
+#define STICK_DEADZONE_DEFAULT 0.10f  // (the Switch's own input service has one: the game expects 0 at rest)
 #define MOUSE_SENS_DEFAULT 3.0f  // (300% of the first default, 1; user, 2026-10-19)
 enum { MOTION_INVERT_UD = 1, MOTION_INVERT_LR = 2 };
 enum { ICONS_AUTO, ICONS_KEYBOARD, ICONS_XBOX, ICONS_PLAYSTATION, ICONS_NINTENDO, ICONS_COUNT };

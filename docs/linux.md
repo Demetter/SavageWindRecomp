@@ -31,11 +31,46 @@ Steam with Steam Input on, the game sees Steam's virtual Xbox controller.
 If the AppImage won't start with a FUSE error, install your distribution's `fuse3` package (the AppImage runtime
 needs `fusermount3`), or run it as `./Savage_Wind-....AppImage --appimage-extract-and-run`.
 
+### Steam Deck (first test, 2026-10-23)
+SteamOS 3.8, Mesa 26.2 RADV (VANGOGH). The setup works: copying the game files, generating and compiling the game
+code (~16 minutes on the Deck's 8 threads), precompiling the shaders (~7 minutes). Known problems:
+
+- (Fixed) The GPU hung within the first frames: black screen, and a process that only a restart of the Deck cleared.
+  The game draws point lists with vertex shaders that write no point size, which is undefined without
+  `VK_KHR_maintenance5`. The renderer enables it now, so that size is 1.0.
+- (Fixed) 15 fps in the open world. Two causes:
+  - RADV has no `VK_KHR_unified_image_layouts`, so the renderer copied each target a draw samples while drawing
+    into it, ~200 times a frame. Those targets now spend their passes in the `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL`
+    layout.
+  - amdgpu revisits every page of an imported host-memory buffer at each submission: ~4 ms a submit for the 3 GB
+    guest heap. The heap is now GPU memory, exported as a dma-buf and mapped at the heap's addresses
+    (`SAVAGEWIND_VK_HEAP_IMPORT=1`: the import, as before).
+
+  Measured standing on the Great Plateau after Continue: about 40 fps with the 60 fps cap, a steady 30 with the 30
+  fps cap.
+- Shadow resolutions above Console show graphical glitches on RADV.
+- Started in Desktop Mode, Steam's desktop controller layout also sends keys and mouse motion. Gaming Mode is untested.
+
 ## Building from source
-Ubuntu / Debian packages (other distributions: the same libraries under their names; SDL3 3.2 or newer):
+Ubuntu 25.04+ / Debian 13 packages (other distributions: the same libraries under their names; clang 18 or newer - the
+lifted FP/SIMD code needs `__builtin_elementwise_*` - and SDL3 3.2 or newer):
 
     sudo apt install clang lld make pkg-config python3-venv libsdl3-dev libavformat-dev libavcodec-dev \
-        libavutil-dev libswscale-dev libvulkan-dev libshaderc-dev libvulkan-memory-allocator-dev glslc vulkan-tools
+        libavutil-dev libswscale-dev libvulkan-dev libshaderc-dev glslc vulkan-tools
+
+Ubuntu 24.04 LTS and older, Debian 12 and openSUSE Leap have no SDL3 package (SDL3 arrived after their freeze):
+build SDL3 from source there, or use the AppImage. Vulkan headers older than 1.4.321 (Debian 13, Ubuntu 25.04, Fedora
+42 ship 1.4.304 - 1.4.313) build too: feedback loops then use the `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL` layout, as on
+drivers without `VK_KHR_unified_image_layouts`.
+
+`tools/linux/distro_build.sh` builds the app (start screen only, no game code) natively in each of Debian 13, Ubuntu
+25.04, Fedora 42, Arch and openSUSE Tumbleweed, in containers, with each distribution's own clang, SDL3, FFmpeg,
+shaderc and lld; CI runs the same script (`.github/workflows/linux-distros.yml`). That is the check for "does it build
+on my distribution": a container reproduces exactly what differs (package names, library sonames, header versions),
+where a virtual machine would only do it slower.
+
+(The Vulkan Memory Allocator header the renderer uses is bundled in `third_party/vma`, as are stb_image and
+stb_image_write in `third_party/stb`.)
 
 Then from the repo root:
 
@@ -50,8 +85,8 @@ everything (dev mode) instead of `~/.local/share/savagewind`.
 `ARCH` picks the target, separately from the OS: the generated code differs per arch (aarch64 runs the guest's
 FP/SIMD as inline asm, like Apple Silicon; x86-64 lowers it to C with `-march=x86-64-v3`, like Windows). `make gen`
 passes the matching `--simd`. A cross build (`ARCH=aarch64` on an x86-64 machine, `SYSROOT=<arm64 root filesystem>`)
-keeps its own `generated-aarch64/` and `build/aarch64/`. Distributions that name shaderc's library
-`libshaderc_shared.so` need `SHADERC=-lshaderc_shared`.
+keeps its own `generated-aarch64/` and `build/aarch64/`. The build detects whether shaderc is named
+`libshaderc.so` or `libshaderc_shared.so`; override it with `SHADERC=-l<name>` if neither is found.
 
 ## AppImages
 Needs podman, and for aarch64 QEMU user emulation with binfmt (`sudo apt install podman qemu-user qemu-user-binfmt`).
@@ -68,7 +103,7 @@ generator helper (`tools/linux/gen_helper.sh`, PyInstaller) is frozen in a conta
 QEMU).
 
 The AppImage holds `savagewind`, `swgen/`, `zig/`, the start screen font and the bundled libraries (SDL3,
-FFmpeg, shaderc). Not bundled: glibc, libstdc++, the Vulkan loader and the GPU drivers (always the system's). No game
+FFmpeg, shaderc). Not bundled: glibc, libstdc++, zlib, the Vulkan loader and the GPU drivers (always the system's). No game
 files or fonts.
 
 ## Differences from macOS / Windows

@@ -722,7 +722,23 @@ NVN(nvnTextureGetStorageClass) { RET(0); }
 NVN(nvnTextureGetRawStorageClass) { RET(0); }
 NVN(nvnTextureGetSparseTileLayout) { RET(0); }
 NVN(nvnTextureGetZCullStorageSize) { RET(0); }
-NVN(nvnTextureCompare) { RET(A(0) == A(1)); }
+// Whether two textures are the same texture for the hardware (shape, format, swizzle, storage): NVN compares the
+// objects' state, not their addresses. agl builds a texture's NVNtexture again whenever its data is set and keeps
+// the texture pool slot when the new one compares equal (its slot holder, 0x7000ec33f0 in 1.9.0). BOTW's cuttable
+// trees take that slot id once for the trunk material (0x7000f75dcc) and set the data again later on another
+// thread; comparing addresses gave each rebuild a new slot and freed the old one, which the trunks went on binding
+// after the allocator gave it to other textures (#16: an exposure step as the cut profile threw trees across the sky).
+NVN(nvnTextureCompare) {
+    const NvnTexture *a = nvn_texture_host(A(0)), *b = nvn_texture_host(A(1));
+    if (a == b) { RET(a || A(0) == A(1)); return; }  // (copies of one texture; or two objects never initialized)
+    if (!a || !b) { RET(0); return; }
+    RET(a->target == b->target && a->format == b->format && a->flags == b->flags && a->width == b->width &&
+        a->height == b->height && a->depth == b->depth && a->levels == b->levels && a->samples == b->samples &&
+        a->ds_mode == b->ds_mode && !memcmp(a->swizzle, b->swizzle, sizeof a->swizzle) && a->stride == b->stride &&
+        a->addr == b->addr && a->pool == b->pool && a->pool_offset == b->pool_offset &&
+        a->layout.layers == b->layout.layers && a->layout.block_height_log2 == b->layout.block_height_log2 &&
+        a->layout.block_depth_log2 == b->layout.block_depth_log2);
+}
 NVN(nvnTextureFlushTexels) { (void)c; }
 NVN(nvnTextureInvalidateTexels) { (void)c; }
 

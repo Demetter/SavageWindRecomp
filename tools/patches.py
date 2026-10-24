@@ -222,6 +222,18 @@ def _vfr_ratio(gen, a):
             f'  /* {a:#x}: ldr w8, [x19, #0x78] (VFR: interval ratio) */')
 
 
+# The menus' speed (runtime/hle/framepace.c rt_gui_speed): once a frame the game stores its integer interval x 0.5 as
+# the GUI speed (the float at +0xb20 of a UI object; 1.8.2 0x700116d0e8): 1 at 30 fps, 0.5 at 60 and never lower, so
+# the menus' cursor and animations ran faster above 60 fps. The runtime gives the frame's real length instead, as Cemu's
+# FPS++ does on the Wii U (v208 0x03415afc).
+
+def _gui_speed(gen, a):
+    assert _word(gen, a) == 0xbd0b2100, hex(_word(gen, a))  # str s0, [x8, #0xb20]
+    return ('{ extern float rt_gui_speed(float); union { uint32_t u; float f; } s = { .u = (uint32_t)VS32(0) }; '
+            's.f = rt_gui_speed(s.f); ST32(c->x[8] + 0xb20, s.u); }'
+            f'  /* {a:#x}: str s0, [x8, #0xb20] (GUI speed) */')
+
+
 # tools/game_sites.py site -> its patch
 PATCHES = {
     'pause_options_update': _pause_option_state,
@@ -241,6 +253,7 @@ PATCHES = {
     'msg_lookup': _title_msg,
     'frame_wait': _frame_wait,
     'vfr_ratio': _vfr_ratio,
+    'gui_speed': _gui_speed,
 }
 
 

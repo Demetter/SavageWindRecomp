@@ -507,6 +507,12 @@ Pendiente:
          3060); otra vez con todo hecho, ~5 s (el fichero no se reescribe si no hay nada nuevo). Disco: ~1,45 GB
          (librerías 834 MB, SPIR-V 448 MB, traducciones 137 MB, caché de pipelines 17 MB). Memoria: con
          `vk_precompiled.bin` cargado el proceso usa ~0,9 GB más (en el mundo: 5,5 GB de working set frente a 4,6).
+       - Memoria al precompilar (2026-10-23): RADV llega a ~1,3 GB por shader en los fragment shaders más grandes
+         (41 KB de código Maxwell), y un hilo por núcleo sobre los grandes a la vez pasaba de 9,5 GB en un portátil de
+         14 GB (Radeon 660M, 12 hilos; con 7 GB el kernel la mataba). Las librerías comparten un presupuesto (un cuarto
+         de la RAM; `SAVAGEWIND_PRECOMPILE_MEM_MB=<n>`): cada una reserva lo estimado por su tamaño (16 MB + 1 MB por
+         cada 32 bytes de código), y un hilo coge la más grande que quepa o, si no, la más pequeña. glibc se quedaba lo
+         que el driver libera en la arena de cada hilo: `malloc_trim` tras las grandes.
        Paseo con guion (el de arriba, del primer frame del mundo al final), con `SAVAGEWIND_VK_SPIRV_SALT=<n>`, que
        cambia una palabra de la cabecera de cada SPIR-V para que la caché del driver no acierte nada (lo nunca visto
        sin borrar esa caché): sin precompilar, 24,3 s de compilaciones en el hilo de render, 68 frames de más de
@@ -1011,6 +1017,36 @@ Pendiente:
      sola vez a su capa de los arrays de altura, normales y materiales, y una copia descartada dejaba el material 0
      (hierba) para siempre: bandas verdes en la arena fuera de la Ciudad Gerudo en ~3 de 4 corridas. Las esperas
      son de la carga; la línea `[vk] t=` las cuenta como `build waits N`.
+   - Control de flujo estructurado en el GLSL (2026-10-23): un shader con saltos se traducía como una máquina de
+     estados (`for (guard) switch (pc)`, con pilas para SSY / PBK / PCNT), y el driver tarda mucho más en compilar
+     eso: en una muestra de shaders del juego, los que la usaban eran el 94 % del tiempo del driver y costaban ~2 veces
+     más por KB de código Maxwell. Ahora los saltos que anidan se escriben como if / else y do / while
+     (`structure_flow` en `translate.c`):
+     - `@P BRA L; <a>; L:` → `if (!P) { <a> }`, y con un salto incondicional al final de `<a>`, if / else (un SYNC a
+       la unión de su SSY cuenta igual);
+     - un BRA hacia atrás → `do { } while (P)`, con el mismo tope de iteraciones que tenía la máquina de estados;
+     - EXIT → `exited = true`, y lo que sigue, solo `if (!exited)`;
+     - un salto a donde va a parar el rango que lo contiene (la unión de un if / else de fuera) cierra el rango.
+     Lo demás (bucles con PBK / BRK / PCNT / CONT, BRX, salir de un do / while) sigue con la máquina de estados: 5 de
+     286 shaders en una muestra de 1 de cada 50. `SAVAGEWIND_XLATE_NO_STRUCTURE=1` la usa siempre.
+     Muestra de 1 de cada 50 shaders del juego (Radeon 660M, RADV, 4 hilos): compilación del driver 42,9 → 14,6 s de
+     CPU, reloj 12,5 → 5,5 s. El MSL no cambia (`tools/test_translate.sh`: 0 diferencias en 20.000 programas); el GLSL
+     de la prueba compila y valida igual que antes (mismos fallos, del #38), y `tools/test_vk_pipelines` crea los
+     pipelines sin mensajes de la capa de validación. En el juego, con las cachés calientes y
+     `SAVAGEWIND_MAX_INTERVAL=2`, las capturas de los frames deterministas (200, 400, 600, 1600 desde una partida
+     nueva) son idénticas píxel a píxel a las de la máquina de estados, y las demás difieren lo mismo que dos corridas
+     de la máquina de estados entre sí.
+   - GLSL más barato para el driver (2026-10-23): el GLSL traducido llamaba a un ayudante del preludio por cada
+     instrucción (`as_f(r3)`, `as_u(fma(...))`): una llamada a función que glslang deja en el SPIR-V y que el driver
+     integra una a una (880.000 `as_f` en 1.500 shaders del juego). Ahora:
+     - `uintBitsToFloat` cuando el argumento es un registro, una palabra de cbuf o un literal uint, y
+       `floatBitsToUint` en los resultados float (`fresult`).
+     - El preludio entra con lo que el shader llama (`glsl_with_prelude`): glslang analizaba sus 32 funciones en cada
+       shader, ~2 ms.
+     - El SPIR-V sale sin nombres de depuración (`strip_names`, `OpName` y compañía): un 16 % menos de fichero.
+     Muestra de 1 de cada 10 shaders del juego (Radeon 660M, RADV, 6 hilos, con el control de flujo estructurado de
+     #48): compilación del driver 83,8 → 28,8 s de CPU y reloj 19,8 → 10,2 s. El MSL no cambia
+     (`tools/test_translate.sh` contra el commit anterior: 0 diferencias en 20.000 programas).
    - Herramientas de diagnóstico:
      - `SAVAGEWIND_THREAD_DUMP_AT=<s>,<s>`: estado, núcleo y cadena de llamadas de cada hilo; para los que
        esperan un mutex, también su palabra (el handle del dueño).

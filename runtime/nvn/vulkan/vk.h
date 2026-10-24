@@ -41,8 +41,11 @@ typedef struct {
     bool feat_aniso;  // samplerAnisotropy (Video > Anisotropic filtering)
     bool depth_clamp;          // depthClamp feature (nvnCommandBufferSetDepthClamp: shadow maps keep occluders before the near plane)
     bool occlusion_precise;    // occlusionQueryPrecise: SAMPLES_PASSED counts samples, not just "any"
-    bool feedback_loop;        // attachment feedback loops in GENERAL layout + barriers inside dynamic rendering (exec.c)
+    bool feedback_loop;        // attachment feedback loops + barriers inside dynamic rendering (exec.c)
+    bool feedback_layout;      // ... in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL layout (no VK_KHR_unified_image_layouts: GENERAL otherwise)
     bool gpl;                  // graphics pipeline libraries with fast linking (exec.c)
+    bool dmabuf;               // memory exported as dma-bufs (Linux: the guest heap, exec.c backend_heap_set)
+    bool radv;                 // the driver is Mesa's RADV
     bool present_wait;         // VK_KHR_present_id + present_wait on (SAVAGEWIND_LOG_PRESENT: when frames are shown)
     // window
     VkSurfaceKHR surface;
@@ -63,6 +66,7 @@ VkCommandBuffer vk_upload_cmd(void);  // upload command buffer of the pending su
 uint64_t vk_pending_seq(void);        // number the pending submission will get
 uint64_t vk_completed_seq(void);
 void vk_wait_seq(uint64_t seq);
+void vk_wait_ready(void);  // until the main thread has made the window and device (device.c)
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
@@ -92,6 +96,7 @@ typedef struct TexBackend {
     bool slices_renderable;  // 3D image made 2D-array compatible: its slices are render targets
     bool feedback_ok;        // made with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT (sampled while it is rendered to)
     bool feedback_seen;      // a draw sampled it while writing it: its passes begin with the feedback loop enabled
+    bool in_feedback_layout; // in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL now (g_vk.feedback_layout: a pass that loops, exec.c)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     bool scalable, presented;
     bool target_logged;          // (SAVAGEWIND_LOG_TARGETS: listed once)
