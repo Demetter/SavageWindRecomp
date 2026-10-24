@@ -86,6 +86,7 @@ void vk_dyn_forget(void) { dyn_epoch++; }
 // (begin_pass): while it stays, a draw takes the last draw's program and pipeline without building and comparing the
 // keys (~1.4 KB a draw). SAVAGEWIND_VK_NO_KEY_GEN=1: keys every draw.
 static uint64_t key_gen = 1;
+static uint64_t prog_gen = 1;  // what the program key reads (program, vertex attributes, render targets) changed
 static uint64_t sbuf_gen = 1;  // bumped when storage buffers are bound (cbuf_info's driver constants)
 static uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
 static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign state: nothing known
@@ -1330,7 +1331,17 @@ static void begin_pass(void) {
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     vkCmdBeginRendering(cb, &ri);
     in_pass = true;
-    key_gen++;  // (the pass's formats are in the pipeline key)
+    {   // the pass's formats are in the pipeline key: a new key only when they differ from the last pass's
+        static struct { VkFormat c[8], d, s; uint32_t n, samples; } last;
+        bool same = last.n == pass_ncolor && last.d == pass_depth && last.s == pass_stencil && last.samples == pass_samples &&
+                    !memcmp(last.c, pass_color, sizeof last.c[0] * (pass_ncolor < 8 ? pass_ncolor : 8));
+        if (!same) {
+            last.n = pass_ncolor, last.d = pass_depth, last.s = pass_stencil, last.samples = pass_samples;
+            memcpy(last.c, pass_color, sizeof last.c[0] * (pass_ncolor < 8 ? pass_ncolor : 8));
+            key_gen++;
+        }
+        prog_gen++;  // (render targets can change without a SetRenderTargets: a clear's own)
+    }
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -2952,6 +2963,25 @@ static void resolve_feedback(Prog *pr) {
 }
 
 // ================================================================== resource binding
+// Read-only zeros for what a draw reads but the game left unbound: a constant buffer (64 KB of zeros; which: 0) or a
+// vertex attribute without a stream ({0, 0, 0, 1}; which: 1). They were copied into the ring on every draw, at a new
+// offset each time, so the descriptor sets and vertex bindings that held them never matched the last draw's.
+static VkSpan zero_span(int which) {
+    static VkBuffer buf;
+    if (!buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 0x10000 + 256,
+                                 .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        VmaAllocation mem;
+        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info));
+        memset(info.pMappedData, 0, 0x10000 + 256);
+        ((float *)((uint8_t *)info.pMappedData + 0x10000))[3] = 1.0f;
+    }
+    return (VkSpan){buf, which ? 0x10000 : 0, NULL};
+}
+
 static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     uint64_t max = g_vk.props.limits.maxUniformBufferRange;
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
@@ -3004,7 +3034,6 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
-    static const uint8_t zeros[0x10000];
     if (k == 0 && stage != 5) {
         // A graphics stage's driver constants are its storage buffers' addresses: the same from draw to draw until
         // the game binds others. Built and compared (2 KB zeroed, filled, memcmp'd: both stages of every draw) only
@@ -3058,7 +3087,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
-    if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
+    if (!r.addr) return ubo_span(zero_span(0), size);
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
@@ -3697,7 +3726,7 @@ void vk_exec_reset(void) {
     memset(pipe_tab, 0, sizeof pipe_tab);
     memset(&prog_memo, 0, sizeof prog_memo);
     memset(&pipe_memo, 0, sizeof pipe_memo);
-    key_gen++;
+    key_gen++, prog_gen++;
     g_cs_n = 0;
     gcopy_gen++;
     vram_free();
@@ -4641,7 +4670,7 @@ static void draw_(CmdRec *r, bool indexed) {
     uint32_t origin = nvn_window_origin(), dmode = nvn_depth_mode();
     Prog *pr;
     bool vkey_flip = origin == 0;
-    if (!no_key_gen && pm.pr && pm.gen == key_gen && pm.np == st.program && pm.origin == origin && pm.dmode == dmode) {
+    if (!no_key_gen && pm.pr && pm.gen == prog_gen && pm.np == st.program && pm.origin == origin && pm.dmode == dmode) {
         pr = pm.pr;
     } else {
         ShaderKey vkey = {0}, fkey = {0};
@@ -4651,7 +4680,7 @@ static void draw_(CmdRec *r, bool indexed) {
         for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
         for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
         pr = get_program(st.program, &vkey, &fkey);
-        pm.gen = key_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
+        pm.gen = prog_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
     }
     if (pr && atomic_load(&pr->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pr->state);
     if ((st.raster_discard || st.render_off) && pr && !(pr->vi && pr->vi->writes_gmem) && !(pr->fi && pr->fi->writes_gmem)) {
@@ -5123,8 +5152,7 @@ have_pipe:
         if (!(pipe_memo.k.s.used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
-            static const float zero[4] = {0, 0, 0, 1};
-            sp = vk_transient_copy(zero, 16, 16);
+            sp = zero_span(1);
         } else {
             Range v = st.vbuf[s];
             VkBuffer dbuf;
@@ -5164,7 +5192,7 @@ have_pipe:
             else if (pipe_memo.k.s.divisor[s]) need = ((uint64_t)base_inst + inst + pipe_memo.k.s.divisor[s] - 1) / pipe_memo.k.s.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
-            if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
+            if (!v.addr) sp = zero_span(0);
             else sp = guest_copy(v.addr, need ? need : 16);
         }
         VkDeviceSize off = sp.off;
@@ -6213,14 +6241,10 @@ static void exec_list(uint64_t handle, int depth) {
             LOG("[op] %u depth %d: %llx %llx %llx %llx %llx\n", r->op, depth, (unsigned long long)r->x[0], (unsigned long long)r->x[1],
                 (unsigned long long)r->x[2], (unsigned long long)r->x[3], (unsigned long long)r->x[4]);
         if (lst_on) { lst_op(depth, r); lst_depth = depth; }
-        switch (r->op) {  // (key_gen: what the program and pipeline keys read)
-        case CMD_BIND_PROGRAM: case CMD_BIND_BLEND: case CMD_BIND_CHANNEL_MASK: case CMD_BIND_COLOR: case CMD_BIND_MULTISAMPLE:
-        case CMD_BIND_POLYGON: case CMD_BIND_VERTEX_ATTRIB: case CMD_BIND_VERTEX_STREAM: case CMD_SET_RENDER_TARGETS:
-        case CMD_SET_DEPTH_CLAMP:
-            key_gen++;
-            break;
-        default: break;
-        }
+        // key_gen / prog_gen: what the pipeline and program keys read. The state records bump them only when they change
+        // a value (BOTW repeats the same binds across its ~2,800 calls a frame, and every bump rebuilt and hashed the
+        // pipeline key at the next draw); a program or render-target bind always does (the objects can change in place).
+        if (r->op == CMD_BIND_PROGRAM || r->op == CMD_SET_RENDER_TARGETS) key_gen++, prog_gen++;
         switch (r->op) {
         case CMD_END:
             if (lst_on) lst_end(depth);
@@ -6237,20 +6261,22 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
-        case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
-        case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
-        case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;
+        case CMD_BIND_BLEND: { uint8_t *b = x; if (memcmp(st.blend[b[0] & 7], b, 8)) memcpy(st.blend[b[0] & 7], b, 8), key_gen++; break; }
+        case CMD_BIND_CHANNEL_MASK: if (memcmp(&st.channel_mask, x, 4)) memcpy(&st.channel_mask, x, 4), key_gen++; break;
+        case CMD_BIND_COLOR: if (memcmp(st.color_state, x, 4)) memcpy(st.color_state, x, 4), key_gen++; break;
         case CMD_BIND_DEPTH_STENCIL: memcpy(st.ds, x, 8); break;
-        case CMD_BIND_MULTISAMPLE: memcpy(st.ms, x, 0x18); break;
-        case CMD_BIND_POLYGON: memcpy(st.poly, x, 4); break;
-        case CMD_BIND_VERTEX_ATTRIB:
-            st.nattrib = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            memcpy(st.attrib, x, st.nattrib * 4);
+        case CMD_BIND_MULTISAMPLE: if (memcmp(st.ms, x, 0x18)) memcpy(st.ms, x, 0x18), key_gen++; break;
+        case CMD_BIND_POLYGON: if (memcmp(st.poly, x, 4)) memcpy(st.poly, x, 4), key_gen++; break;
+        case CMD_BIND_VERTEX_ATTRIB: {
+            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            if (n != st.nattrib || memcmp(st.attrib, x, n * 4)) st.nattrib = n, memcpy(st.attrib, x, n * 4), key_gen++, prog_gen++;
             break;
-        case CMD_BIND_VERTEX_STREAM:
-            st.nstream = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            memcpy(st.stream, x, st.nstream * 8);
+        }
+        case CMD_BIND_VERTEX_STREAM: {
+            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            if (n != st.nstream || memcmp(st.stream, x, n * 8)) st.nstream = n, memcpy(st.stream, x, n * 8), key_gen++;
             break;
+        }
         case CMD_BIND_VERTEX_BUFFERS:
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
             break;
@@ -6354,7 +6380,8 @@ static void exec_list(uint64_t handle, int depth) {
             if (off < 0) off = getenv("SAVAGEWIND_NO_DEPTH_CLAMP") != NULL;
             static bool logged;
             if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetDepthClamp on (depth clamp %s)\n", g_vk.depth_clamp ? "supported" : "not supported"); }
-            st.depth_clamp = r->x[0] != 0 && !off;
+            bool dcl = r->x[0] != 0 && !off;
+            if (dcl != st.depth_clamp) st.depth_clamp = dcl, key_gen++;
             break;
         }
         case CMD_SET_RENDER_ENABLE: {

@@ -21,11 +21,15 @@ typedef struct { ReplayFn fn; uint32_t size, pad; } Hdr;  // size: the whole ent
 #define RING_SIZE (64u << 20)
 
 static uint8_t *ring;
-static _Atomic uint64_t wpos, rpos;  // bytes written / replayed since the start (never wrap)
-static uint64_t wlocal;              // (producer: written, not yet published)
+// bytes written / replayed since the start (never wrap). Each on a cache line of its own: the two threads write them
+// ~20 times a draw, and on one line every write took the line from the other core.
+static _Alignas(64) _Atomic uint64_t wpos;
+static _Alignas(64) _Atomic uint64_t rpos;
+static _Alignas(64) uint64_t wlocal;  // (producer: written, not yet published)
+static uint64_t rcache;               // (producer: rpos as last read; read again only when the ring looks full)
 static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv_work = PTHREAD_COND_INITIALIZER, cv_idle = PTHREAD_COND_INITIALIZER;
-static _Atomic int sleeping, waiting;
+static _Alignas(64) _Atomic int sleeping, waiting;
 static int state;  // 0 not started, 1 on, -1 off (SAVAGEWIND_VK_NO_DEFER, or no thread)
 static _Atomic int failed;  // a deferred submission failed: the producer reports it at the next drain
 
@@ -74,13 +78,17 @@ static void publish(void) {
     if (atomic_load(&sleeping)) { pthread_mutex_lock(&m); pthread_cond_signal(&cv_work); pthread_mutex_unlock(&m); }
 }
 
-// An entry of `args` bytes for fn, its argument block returned (16-aligned). Publishes the entries before it first.
+// An entry of `args` bytes for fn, its argument block returned (16-aligned). The entries before it (filled by now)
+// are published in batches of 2 KB (about two draws): publishing each took a cache line from the recorder every call.
+// Submissions and drains publish at once.
 static void *push(ReplayFn fn, size_t args) {
-    if (atomic_load_explicit(&wpos, memory_order_relaxed) != wlocal) publish();  // (the entries before: filled by now)
+    if (wlocal - atomic_load_explicit(&wpos, memory_order_relaxed) >= 2048) publish();
     uint32_t size = (uint32_t)((sizeof(Hdr) + args + 15) & ~(size_t)15);
     uint64_t off = wlocal % RING_SIZE;
     uint32_t pad = off + size > RING_SIZE ? (uint32_t)(RING_SIZE - off) : 0;  // (an entry never wraps)
-    while (wlocal + pad + size - atomic_load_explicit(&rpos, memory_order_acquire) > RING_SIZE) {
+    while (wlocal + pad + size - rcache > RING_SIZE) {
+        rcache = atomic_load_explicit(&rpos, memory_order_acquire);
+        if (wlocal + pad + size - rcache <= RING_SIZE) break;
         publish();
         _mm_pause();
     }
@@ -380,19 +388,34 @@ VKAPI_ATTR void VKAPI_CALL vkq_CmdClearAttachments(VkCommandBuffer cb, uint32_t 
 }
 
 // ---- calls with structs that point to more (no pNext chains: one would be recorded in place, after a drain)
-typedef struct { VkCommandBuffer cb; VkRenderingInfo ri; uint32_t has_depth, has_stencil; } A_CmdBeginRendering;
+// A colour attachment may chain one VkAttachmentFeedbackLoopInfoEXT (exec.c begin_pass, BOTW's G-buffer passes every
+// frame): kept as a bit per attachment and chained again at replay, so those passes don't drain the ring.
+typedef struct { VkCommandBuffer cb; VkRenderingInfo ri; uint32_t has_depth, has_stencil, feedback; } A_CmdBeginRendering;
 static void R_CmdBeginRendering(void *p) {
     A_CmdBeginRendering *a = p;
     VkRenderingAttachmentInfo *at = (VkRenderingAttachmentInfo *)AFTER(a);
     uint32_t n = a->ri.colorAttachmentCount;
+    VkAttachmentFeedbackLoopInfoEXT fb[8];
+    for (uint32_t i = 0; i < n && i < 8; i++) {
+        at[i].pNext = NULL;
+        if (!(a->feedback & (1u << i))) continue;
+        fb[i] = (VkAttachmentFeedbackLoopInfoEXT){.sType = VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT, .feedbackLoopEnable = VK_TRUE};
+        at[i].pNext = &fb[i];
+    }
     a->ri.pColorAttachments = n ? at : NULL;
     a->ri.pDepthAttachment = a->has_depth ? &at[n] : NULL;
     a->ri.pStencilAttachment = a->has_stencil ? &at[n + 1] : NULL;
     vkd_CmdBeginRendering(a->cb, &a->ri);
 }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
-    bool chained = ri->pNext != NULL;
-    for (uint32_t i = 0; i < ri->colorAttachmentCount && !chained; i++) chained = ri->pColorAttachments[i].pNext != NULL;
+    bool chained = ri->pNext != NULL || ri->colorAttachmentCount > 8;
+    uint32_t feedback = 0;
+    for (uint32_t i = 0; i < ri->colorAttachmentCount && !chained; i++) {
+        const VkAttachmentFeedbackLoopInfoEXT *f = ri->pColorAttachments[i].pNext;
+        if (!f) continue;
+        if (f->sType == VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT && !f->pNext) { if (f->feedbackLoopEnable) feedback |= 1u << i; }
+        else chained = true;
+    }
     if (!vkq_on || chained) { if (vkq_on) vkq_drain(); vkd_CmdBeginRendering(cb, ri); return; }
     uint32_t n = ri->colorAttachmentCount;
     A_CmdBeginRendering *a = push(R_CmdBeginRendering, sizeof *a + ARR(VkRenderingAttachmentInfo, n + 2));
@@ -402,6 +425,7 @@ VKAPI_ATTR void VKAPI_CALL vkq_CmdBeginRendering(VkCommandBuffer cb, const VkRen
     if (n) memcpy(at, ri->pColorAttachments, (size_t)n * sizeof *at);
     a->has_depth = ri->pDepthAttachment != NULL;
     a->has_stencil = ri->pStencilAttachment != NULL;
+    a->feedback = feedback;
     if (a->has_depth) at[n] = *ri->pDepthAttachment;
     if (a->has_stencil) at[n + 1] = *ri->pStencilAttachment;
 }
