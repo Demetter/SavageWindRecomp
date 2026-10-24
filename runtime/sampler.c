@@ -16,6 +16,21 @@
 #define MAX_THREADS 128
 #define MAX_DEPTH 48
 
+// The thread's stack (its TEB: NT_TIB StackBase, and DeallocationStack at +0x1478 on x64), so the unwinder stops at a
+// frame whose stack pointer lies outside it: RtlVirtualUnwind read through a bad one and crashed the game.
+typedef struct { LONG ExitStatus; PVOID TebBaseAddress; ULONG_PTR ClientId[2]; ULONG_PTR AffinityMask; LONG Priority, BasePriority; } TBI;
+static bool thread_stack(HANDLE h, uint64_t *lo, uint64_t *hi) {
+    typedef LONG(NTAPI * Q)(HANDLE, int, PVOID, ULONG, PULONG);
+    static Q q;
+    if (!q) q = (Q)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    TBI tbi;
+    if (!q || q(h, 0, &tbi, sizeof tbi, NULL) != 0 || !tbi.TebBaseAddress) return false;
+    const uint8_t *teb = tbi.TebBaseAddress;
+    *hi = *(const uint64_t *)(teb + 8);
+    *lo = *(const uint64_t *)(teb + 0x1478);
+    return *hi > *lo;
+}
+
 static void *sampler_main(void *arg) {
     double start = 0, secs = 0, us = 1000;
     sscanf((const char *)arg, "%lf:%lf:%lf", &start, &secs, &us);
@@ -44,6 +59,8 @@ static void *sampler_main(void *arg) {
             CONTEXT ctx;
             memset(&ctx, 0, sizeof ctx);
             ctx.ContextFlags = CONTEXT_FULL;
+            uint64_t slo = 0, shi = ~0ull;
+            if (!thread_stack(h, &slo, &shi)) slo = 0, shi = ~0ull;
             if (GetThreadContext(h, &ctx)) {
                 size_t at = used;
                 buf[used++] = handle[i];
@@ -51,6 +68,7 @@ static void *sampler_main(void *arg) {
                 int d = 0;
                 for (; d < MAX_DEPTH && ctx.Rip; d++) {
                     buf[used++] = ctx.Rip;
+                    if (ctx.Rsp < slo || ctx.Rsp + 8 > shi) { d++; break; }
                     DWORD64 base = 0;
                     PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
                     if (!f) {  // a leaf without unwind data: the return address is on top of the stack
@@ -62,6 +80,7 @@ static void *sampler_main(void *arg) {
                     void *hd = NULL;
                     DWORD64 fr = 0;
                     RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &hd, &fr, NULL);
+                    if (ctx.Rsp < slo || ctx.Rsp >= shi) { d++; break; }
                 }
                 buf[at + 1] = (uint64_t)d;
                 nsamples++;

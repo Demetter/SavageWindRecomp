@@ -3912,37 +3912,54 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
 static SetEnt *setc;
 
+// The last set of each layout (most draws repeat the previous draw's bindings for a stage: same material, same
+// constants): compared whole before the two hashes are worked out (two dependent multiply chains over every word).
+#define SETL_TAB 64
+typedef struct { VkDescriptorSetLayout layout; uint64_t seq; uint32_t n; VkDescriptorSet set; uint64_t v[MAX_BIND][4]; } SetLast;
+static SetLast *setl;
+
 static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_VK_NO_SET_CACHE") != NULL;
     stat_sets++;
     SetEnt *e = NULL;
+    SetLast *l = NULL;
     uint64_t seq = vk_pending_seq() + (setc_gen << 40), h = 0, h2 = 0;
-    if (!off) {
-        h = (uint64_t)(uintptr_t)layout;
-        h2 = h ^ 0x6A09E667F3BCC909ull;
+    if (!off && n <= MAX_BIND) {
+        uint64_t v[MAX_BIND][4];
         for (int i = 0; i < n; i++) {
-            uint64_t v[4];
-            v[0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
+            v[i][0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
             if (w[i].pImageInfo) {
-                v[1] = (uint64_t)(uintptr_t)w[i].pImageInfo->sampler;
-                v[2] = (uint64_t)(uintptr_t)w[i].pImageInfo->imageView;
-                v[3] = w[i].pImageInfo->imageLayout;
+                v[i][1] = (uint64_t)(uintptr_t)w[i].pImageInfo->sampler;
+                v[i][2] = (uint64_t)(uintptr_t)w[i].pImageInfo->imageView;
+                v[i][3] = w[i].pImageInfo->imageLayout;
             } else {
-                v[1] = (uint64_t)(uintptr_t)w[i].pBufferInfo->buffer;
-                v[2] = w[i].pBufferInfo->offset;
-                v[3] = w[i].pBufferInfo->range;
-            }
-            for (int k = 0; k < 4; k++) {
-                h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-                h2 = (h2 ^ v[k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
+                v[i][1] = (uint64_t)(uintptr_t)w[i].pBufferInfo->buffer;
+                v[i][2] = w[i].pBufferInfo->offset;
+                v[i][3] = w[i].pBufferInfo->range;
             }
         }
+        if (!setl) setl = calloc(SETL_TAB, sizeof *setl);
+        l = &setl[((uintptr_t)layout >> 4) & (SETL_TAB - 1)];
+        if (l->layout == layout && l->seq == seq && l->n == (uint32_t)n && l->set && !memcmp(l->v, v, (size_t)n * sizeof v[0])) {
+            stat_sets_reused++;
+            return l->set;
+        }
+        l->layout = layout, l->seq = seq, l->n = (uint32_t)n, l->set = VK_NULL_HANDLE;
+        memcpy(l->v, v, (size_t)n * sizeof v[0]);
+        h = (uint64_t)(uintptr_t)layout;
+        h2 = h ^ 0x6A09E667F3BCC909ull;
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < 4; k++) {
+                h = (h ^ v[i][k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+                h2 = (h2 ^ v[i][k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
+            }
         h ^= h >> 32;
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);
         e = &setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
         if (e->seq == seq && e->hash == h && e->hash2 == h2 && e->layout == layout && e->n == (uint32_t)n) {
             stat_sets_reused++;
+            l->set = e->set;
             return e->set;
         }
     }
@@ -3953,6 +3970,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
         e->hash = h; e->hash2 = h2; e->layout = layout; e->set = ds; e->n = (uint32_t)n;
     }
+    if (l) l->set = ds;
     return ds;
 }
 

@@ -578,7 +578,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     if (expired_at != renderer_present_count()) {
         expired_at = renderer_present_count();
         vk_collect_dead();
-        zombies_expire();
+        if (!(expired_at & 15)) zombies_expire();  // (every 16th frame: the list runs to thousands; one goes at most 15 frames late)
         idle_expire();
     }
     b = t->addr ? keyed_find(t) : NULL;
@@ -743,7 +743,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
     uint64_t h = hash_full(mem, total);
     b->full_frame = frame;
-    b->sample_hash = fnv_sample(mem, total);
+    if (!b->dynamic) b->sample_hash = fnv_sample(mem, total);  // (a dynamic texture is hashed whole every frame: no sample needed)
     if (b->uploaded && h == b->data_hash) return;
     if (b->uploaded && h != b->data_hash && !written) b->dynamic = true;
     b->data_hash = h;
