@@ -65,7 +65,13 @@ static void handle_close(uint32_t h) {
 // Threads blocked in WaitSynchronization; object signals wake only these (caller holds g_klock).
 static KThread *g_syncwaiters;
 
-static void wake(KThread *t) { pthread_cond_signal(&t->cond); }
+static int prof_svc = -1;
+static void wake(KThread *t) {
+    if (prof_svc > 0) t->woken_ns = plat_now_ns();
+    pthread_cond_signal(&t->cond);
+}
+// (SAVAGEWIND_PROF_SVC) wakes per thread: count, signal -> its condition wait returned, -> its core taken again
+static _Atomic uint64_t wake_n[32], wake_cv_ns[32], wake_core_ns[32];
 
 void kernel_signal(KObject *o) {
     // caller holds g_klock
@@ -260,10 +266,16 @@ static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
     } else {
         r = pthread_cond_timedwait(cv, &g_klock, ts) == 0;
     }
+    uint64_t tw = prof_svc > 0 && t && t->woken_ns ? plat_now_ns() : 0;
     if (held) {
         pthread_mutex_unlock(&g_klock);
         core_acquire(t);
         pthread_mutex_lock(&g_klock);
+    }
+    if (tw) {
+        unsigned i = (unsigned)(t->id & 31);
+        wake_n[i]++, wake_cv_ns[i] += tw - t->woken_ns, wake_core_ns[i] += plat_now_ns() - tw;
+        t->woken_ns = 0;
     }
     return r;
 }
@@ -782,7 +794,6 @@ static int trace_svc = -1;
 static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc);
 
 static _Atomic uint64_t svc_wait_ns[32][0x80], svc_calls[32][0x80];
-static int prof_svc = -1;
 
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
@@ -826,6 +837,11 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
                         LOG(" %02x:%llu/%llums", i, (unsigned long long)svc_calls[t][i], (unsigned long long)(svc_wait_ns[t][i] / 1000000));
                         svc_calls[t][i] = 0; svc_wait_ns[t][i] = 0;
                     }
+                if (any && wake_n[t]) {
+                    LOG(" | wakes %llu: signal->running %.1f us + core %.1f us avg", (unsigned long long)wake_n[t],
+                        wake_cv_ns[t] / 1e3 / wake_n[t], wake_core_ns[t] / 1e3 / wake_n[t]);
+                    wake_n[t] = wake_cv_ns[t] = wake_core_ns[t] = 0;
+                }
                 if (any) LOG("\n");
             }
         }

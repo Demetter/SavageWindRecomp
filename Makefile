@@ -36,7 +36,7 @@ MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
 CC       := clang $(MINFLAG) $(CROSS)
 CXX      := clang++ $(MINFLAG) $(CROSS)
 IMGUI    := third_party/imgui
-GENFLAGS := -O2 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
+GENFLAGS := -O2 -fstrict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 # The start screen's zig cc reads -O<n> as its own optimize mode and adds debug info and frame pointers: these give
 # it what clang builds here with GENFLAGS, in less time (runtime/gamebuild.c; PR #43)
 GENFLAGS_ZIG := -Xclang $(filter -O%,$(GENFLAGS)) -g0 -fomit-frame-pointer

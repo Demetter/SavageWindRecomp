@@ -110,6 +110,7 @@ void vk_collect_dead(void);
 typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
+    bool fx;  // it touches guest memory on the GPU (reads it in place, stores to it, copies it, reads back into it)
     uint64_t seq;
     VkDescriptorPool pools[64];  // (BOTW 1.8.2 records thousands of draws into one submission)
     int npools, cur_pool;
@@ -117,6 +118,7 @@ typedef struct {
 static Sub subs[SUBS];
 static int cur_sub;
 static uint64_t submit_seq;  // last submitted
+static uint64_t fx_seq;      // the last submission that touches guest memory (fx_mark)
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
 static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
@@ -178,7 +180,7 @@ static Sub *sub(void) {
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
-        s->main_begun = s->upload_begun = false;
+        s->main_begun = s->upload_begun = s->fx = false;
     }
     return s;
 }
@@ -291,7 +293,7 @@ void vk_gpuprof_report(void) {
 // and when the GPU finished each, in ms from the start of its translation (a thread waits for every submission).
 static int gtl_on = -1;
 static uint64_t gtl_sub_t[256], gtl_done_t[256];  // by submission number & 255: submitted (by the translation) / done
-typedef struct { uint64_t first, last, x0, x1, draws; } GtlList;
+typedef struct { uint64_t first, last, x0, x1, draws, fx; } GtlList;
 static GtlList gtl_lists[64];
 static _Atomic unsigned gtl_put, gtl_get;
 static void *gtl_thread(void *arg) {
@@ -309,9 +311,10 @@ static void *gtl_thread(void *arg) {
             GtlList *l = &gtl_lists[atomic_load(&gtl_get) & 63];
             if (l->last > v) break;
             char line[512];
-            int n = snprintf(line, sizeof line, "[gtl] %llu draws: exec %.2f ms, done +%.2f (%.2f after exec), pieces:",
+            int n = snprintf(line, sizeof line, "[gtl] %llu draws: exec %.2f ms, done +%.2f (%.2f after exec), fence +%.2f, pieces:",
                              (unsigned long long)l->draws, (l->x1 - l->x0) / 1e6, (gtl_done_t[l->last & 255] - l->x0) / 1e6,
-                             ((double)gtl_done_t[l->last & 255] - (double)l->x1) / 1e6);
+                             ((double)gtl_done_t[l->last & 255] - (double)l->x1) / 1e6,
+                             l->fx >= l->first ? ((double)gtl_done_t[l->fx & 255] - (double)l->x0) / 1e6 : 0.0);
             for (uint64_t q = l->first; q <= l->last && n < (int)sizeof line - 40; q++)
                 n += snprintf(line + n, sizeof line - n, " %.2f>%.2f", (gtl_sub_t[q & 255] - l->x0) / 1e6, (gtl_done_t[q & 255] - l->x0) / 1e6);
             LOG("%s\n", line);
@@ -320,11 +323,12 @@ static void *gtl_thread(void *arg) {
     }
     return NULL;
 }
+uint64_t renderer_fence_seq(void);
 static void gtl_list(uint64_t first, uint64_t last, uint64_t x0, uint64_t draws) {
     if (last < first || draws < 100) return;
     unsigned put = atomic_load(&gtl_put);
     if (put - atomic_load(&gtl_get) >= 64) return;
-    gtl_lists[put & 63] = (GtlList){first, last, x0, plat_now_ns(), draws};
+    gtl_lists[put & 63] = (GtlList){first, last, x0, plat_now_ns(), draws, renderer_fence_seq()};
     atomic_store(&gtl_put, put + 1);
 }
 
@@ -364,6 +368,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         PROF_ADD(prof_submit);
     }
     pthread_mutex_lock(&seq_lock);
+    if (s->fx) fx_seq = submit_seq + 1;
     submit_seq++;
     pthread_mutex_unlock(&seq_lock);
     if (gtl_on > 0) gtl_sub_t[submit_seq & 255] = plat_now_ns();
@@ -399,9 +404,24 @@ void renderer_sync(void) {
     vk_wait_seq(s);
 }
 
+// A fence the game waits on (nvnSyncWait) stands for the GPU work before it that touches guest memory: the game waits
+// to reuse or read memory the GPU reads or writes. On the console that is all of it; here the translation copies what
+// the GPU reads (constants into the ring, textures into images, vertices into the heap copy), so the work after a
+// frame's last piece that touches guest memory - its lighting, post-processing and upscale, ~1.4 ms of GPU at 4K -
+// concerns no memory of the game's. Waiting for it held the game's main thread ~0.8 ms a frame for nothing.
+// SAVAGEWIND_VK_EARLY_FENCE=0: a fence is everything submitted before it, as before.
+static int early_fence(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SAVAGEWIND_VK_EARLY_FENCE") || atoi(getenv("SAVAGEWIND_VK_EARLY_FENCE")) != 0;
+    return on;
+}
+static void fx_mark(void) { sub()->fx = true; }
+
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
-    uint64_t q = submit_seq + (subs[cur_sub].main_begun || subs[cur_sub].upload_begun ? 1 : 0);
+    bool begun = subs[cur_sub].main_begun || subs[cur_sub].upload_begun;
+    uint64_t q = submit_seq + (begun ? 1 : 0);
+    if (early_fence()) q = begun && subs[cur_sub].fx ? submit_seq + 1 : fx_seq;
     pthread_mutex_unlock(&seq_lock);
     return q;
 }
@@ -1056,6 +1076,7 @@ static void readbacks_apply(void) {
 }
 
 static void readback_schedule(VkCommandBuffer cb, NvnTexture *t, const NvnTextureView *v, bool has_view) {
+    fx_mark();  // (its copy reaches guest memory when this submission completes)
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_LINEAR_READBACK") != NULL;  // (A/B tests)
     TexBackend *b = t->backend;
@@ -3235,7 +3256,7 @@ static VkDescriptorBufferInfo gmem_info(void) {
         LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
         off = 1;
     }
-    if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+    if (gmem_buf) { fx_mark(); return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size}; }
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
@@ -3410,6 +3431,7 @@ static void vram_free(void) {
 // full barrier before the main buffer). The barrier first: earlier submissions may still fetch from those pages.
 static void vram_copy(const VkBufferCopy *rg, uint32_t n) {
     if (!n) return;
+    fx_mark();
     VkCommandBuffer cb = vk_upload_cmd();
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
@@ -3590,6 +3612,8 @@ static bool guest_fetch(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSiz
     if (vram_state > 0 && vram_buf && !vram_skip && *off + size <= vram_size && !gw_overlaps(addr, addr + size) &&
         !lw_overlaps(addr, addr + size) && vg_current(addr, addr + size)) {
         *buf = vram_buf;
+    } else {
+        fx_mark();  // (read in place)
     }
     return true;
 }
@@ -3678,6 +3702,7 @@ static bool gw_ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
     VkDeviceSize off;
     if (!guest_direct(addr, size, &b, &off)) return false;
     *out = (VkDescriptorBufferInfo){b, off, size};
+    fx_mark();
     return true;
 }
 
@@ -5218,6 +5243,7 @@ have_pipe:
             oq_scale[i] = vp_sx * vp_sy > 0 ? vp_sx * vp_sy : 1;
             vkCmdResetQueryPool(vk_upload_cmd(), oq_pool, i, 1);
             vkCmdBeginQuery(cb, oq_pool, i, g_vk.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+            fx_mark();  // (its count reaches guest memory when this submission completes)
             oq_run[oq_nrun++] = i;
             oq = (int)i;
         }

@@ -42,6 +42,7 @@ struct KThread {
     int core_held;
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
+    uint64_t woken_ns;  // (SAVAGEWIND_PROF_SVC) when a waker signalled it
 };
 
 typedef struct KSharedMem {

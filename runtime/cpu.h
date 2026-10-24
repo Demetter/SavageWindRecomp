@@ -62,18 +62,25 @@ void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
 
 // volatile: every guest load and store happens, in order, as on the console's CPU. Guest memory is shared with the
-// game's other threads, and the recompiled functions take their Cpu as restrict (tools/gen.py): with plain accesses
-// the compiler could keep a spinlock's word in a register for good (BOTW's 0x7000f9449c spins on a plain LDR until
-// the lock reads free: at -O2 with restrict it read it once and hung) or sink a store out of a loop. The guest code
-// was optimized by its own compiler, so there is little for ours to merge.
-#define LD8(a)  (*(const volatile u8a *)(uintptr_t)(a))
-#define LD16(a) (*(const volatile u16u *)(uintptr_t)(a))
-#define LD32(a) (*(const volatile u32u *)(uintptr_t)(a))
-#define LD64(a) (*(const volatile u64u *)(uintptr_t)(a))
-#define ST8(a, v)  (*(volatile u8a *)(uintptr_t)(a) = (uint8_t)(v))
-#define ST16(a, v) (*(volatile u16u *)(uintptr_t)(a) = (uint16_t)(v))
-#define ST32(a, v) (*(volatile u32u *)(uintptr_t)(a) = (uint32_t)(v))
-#define ST64(a, v) (*(volatile u64u *)(uintptr_t)(a) = (uint64_t)(v))
+// game's other threads: with plain accesses the compiler could keep a spinlock's word in a register for good (BOTW's
+// 0x7000f9449c spins on a plain LDR until the lock reads free: at -O2 it read it once and hung) or sink a store out of
+// a loop.
+// Through types of their own (GMem*), with strict aliasing (GENFLAGS): type-based alias analysis then knows that a
+// guest load or store can't touch the Cpu struct. The addresses come from integers, so restrict on the Cpu couldn't
+// show it, and every guest store made the compiler load the guest registers it held from the Cpu again (a function's
+// prologue reloaded sp between each pair of registers it saved): ~3-5% of the game code's instructions.
+typedef struct { uint8_t m; } __attribute__((packed)) GMem8;
+typedef struct { uint16_t m; } __attribute__((packed)) GMem16;
+typedef struct { uint32_t m; } __attribute__((packed)) GMem32;
+typedef struct { uint64_t m; } __attribute__((packed)) GMem64;
+#define LD8(a)  (((const volatile GMem8 *)(uintptr_t)(a))->m)
+#define LD16(a) (((const volatile GMem16 *)(uintptr_t)(a))->m)
+#define LD32(a) (((const volatile GMem32 *)(uintptr_t)(a))->m)
+#define LD64(a) (((const volatile GMem64 *)(uintptr_t)(a))->m)
+#define ST8(a, v)  (((volatile GMem8 *)(uintptr_t)(a))->m = (uint8_t)(v))
+#define ST16(a, v) (((volatile GMem16 *)(uintptr_t)(a))->m = (uint16_t)(v))
+#define ST32(a, v) (((volatile GMem32 *)(uintptr_t)(a))->m = (uint32_t)(v))
+#define ST64(a, v) (((volatile GMem64 *)(uintptr_t)(a))->m = (uint64_t)(v))
 
 // ---- exclusive monitor (emulated with compare-and-swap)
 #define EXCL(N, T)                                                                         \
