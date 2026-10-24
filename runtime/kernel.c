@@ -549,6 +549,27 @@ static uint32_t block_current(int64_t timeout_ns) {
     uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
+    // A short spin before sleeping, for a thread whose last block was short: the game's main thread waits ~30 times a
+    // frame for its workers' jobs, ~40 us each, and a sleep on its condition plus the wake cost ~8 us each on Windows
+    // (SAVAGEWIND_PROF_SVC). The thread lets its core go while it spins, as when it sleeps. SAVAGEWIND_SPIN_US=<us>
+    // (default 40; 0: no spinning).
+    static int spin_us = -1;
+    if (spin_us < 0) spin_us = getenv("SAVAGEWIND_SPIN_US") ? atoi(getenv("SAVAGEWIND_SPIN_US")) : 40;
+    uint64_t b0 = plat_now_ns();
+    if (spin_us > 0 && t->block_ns < (uint64_t)spin_us * 2000 && t->wait_kind != WAIT_NONE && !t->cancel) {
+        bool held = t->core_held >= 0;
+        pthread_mutex_unlock(&g_klock);
+        if (held) core_release(t);
+        uint64_t end = b0 + (uint64_t)spin_us * 1000;
+        while (__atomic_load_n(&t->wait_kind, __ATOMIC_ACQUIRE) != WAIT_NONE && !g_rt_unwind && plat_now_ns() < end)
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        if (held) core_acquire(t);
+        pthread_mutex_lock(&g_klock);
+    }
     while (t->wait_kind != WAIT_NONE) {
         if (g_rt_unwind) {  // reboot: give up the wait (the thread unwinds when its svc returns)
             t->wait_kind = WAIT_NONE;
@@ -577,6 +598,7 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
+    t->block_ns = plat_now_ns() - b0;
     if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
         LOG("[tl] %.3f %x block %.3f ms (kind %d addr %llx lr %llx)\n", plat_now_ns() / 1e6, t->handle,
             (plat_now_ns() - tl_t0) / 1e6, kind, (unsigned long long)tl_addr, (unsigned long long)t->cpu.x[30]);

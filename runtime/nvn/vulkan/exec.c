@@ -122,6 +122,8 @@ static uint64_t fx_seq;      // the last submission that touches guest memory (f
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
 static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
+static uint32_t chunk_passes; // passes begun since the last submission
+static bool g_piece_ok;       // (begin_pass) pieces may go to the GPU in this list: no hold
 static bool chunk_hold;       // a shader that stores to guest memory was recorded since the last submission
 
 static pthread_mutex_t gpu_mutex;
@@ -314,7 +316,7 @@ static void *gtl_thread(void *arg) {
             int n = snprintf(line, sizeof line, "[gtl] %llu draws: exec %.2f ms, done +%.2f (%.2f after exec), fence +%.2f, pieces:",
                              (unsigned long long)l->draws, (l->x1 - l->x0) / 1e6, (gtl_done_t[l->last & 255] - l->x0) / 1e6,
                              ((double)gtl_done_t[l->last & 255] - (double)l->x1) / 1e6,
-                             l->fx >= l->first ? ((double)gtl_done_t[l->fx & 255] - (double)l->x0) / 1e6 : 0.0);
+                             l->fx >= l->first && l->fx <= l->last ? ((double)gtl_done_t[l->fx & 255] - (double)l->x0) / 1e6 : 0.0);
             for (uint64_t q = l->first; q <= l->last && n < (int)sizeof line - 40; q++)
                 n += snprintf(line + n, sizeof line - n, " %.2f>%.2f", (gtl_sub_t[q & 255] - l->x0) / 1e6, (gtl_done_t[q & 255] - l->x0) / 1e6);
             LOG("%s\n", line);
@@ -376,6 +378,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     stat_flushes++;
     cum_submits++;
     chunk_draws = 0;
+    chunk_passes = 0;
     chunk_hold = false;
     ring_retire();
     vk_collect_dead();
@@ -1209,8 +1212,13 @@ static void begin_pass(void) {
     static int no_hold = -1;  // (debugging) SAVAGEWIND_VK_NO_HOLD=1: pieces go on after such a shader too
     if (no_hold < 0) no_hold = getenv("SAVAGEWIND_VK_NO_HOLD") != NULL;
     // (and not before the heap copy's pages for this list are known: the draws go on recording meanwhile)
-    if (submit_draws > 0 && chunk_draws >= (uint32_t)submit_draws && (!chunk_hold || no_hold) && vram_collect(false))
+    // Or every 32 passes: the end of BOTW's frame is ~150 small passes (lighting, bloom and exposure chains, post
+    // effects, the HUD) with ~200 draws in all, so they went in one last piece, ~1.3 ms of GPU the game waited for
+    // after the translation ended.
+    if (submit_draws > 0 && chunk_draws && (chunk_draws >= (uint32_t)submit_draws || chunk_passes >= 32) &&
+        (!chunk_hold || no_hold) && vram_collect(false))
         vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    g_piece_ok = submit_draws > 0 && (!chunk_hold || no_hold);
     st.rt_dirty = false;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)  // (before the pass's command buffer is taken: a flush ends it)
         if (st.rt.color[i] && (st.rt.color[i]->flags & 0x40) && linear_target_behind(st.rt.color[i])) {
@@ -1358,6 +1366,7 @@ static void begin_pass(void) {
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     vkCmdBeginRendering(cb, &ri);
     in_pass = true;
+    chunk_passes++;
     {   // the pass's formats are in the pipeline key: a new key only when they differ from the last pass's
         static struct { VkFormat c[8], d, s; uint32_t n, samples; } last;
         bool same = last.n == pass_ncolor && last.d == pass_depth && last.s == pass_stencil && last.samples == pass_samples &&
@@ -3454,6 +3463,58 @@ static bool vq_request, vq_done, vq_thread_on;
 static size_t vq_n;        // the query's result: pages listed in vram_pages (or SIZE_MAX / vram_pages_max)
 static bool vram_pending;  // this list's query was asked for and its pages aren't in the copy yet
 
+// What the query looks at: the geometry pages (vg), as a few spans picked by cost. A GetWriteWatch call costs ~100 us
+// whatever its size plus ~0.65 us a MB, and each page it resets faults at the game's next store to it (~0.5 us, ~30x a
+// plain store; measured on a Ryzen 7 7800X3D). Over the whole 3 GB heap that was ~2.2 ms a list - no piece of the
+// list could go to the GPU before it ended - and ~5,000 faults a frame in the game's own code. The geometry (BOTW's
+// Great Plateau: ~36 MB in ~590 runs) fits in ~3 spans: ~0.75 ms, ~1,200 faults. Pages outside the spans are never
+// reset: they stay "written", and the game's stores to them don't fault; a page that becomes geometry is copied then
+// (vg_current) and is in the spans from the next list on. SAVAGEWIND_VK_WW_FULL=1: the whole heap, as before.
+#define VQ_SPANS 64
+static struct { uint64_t lo, hi; } vq_span[VQ_SPANS];  // heap addresses, ascending
+static int vq_nspans;
+
+static int vq_spans_for(size_t gap_words, bool fill) {  // spans of geometry words (64 pages) with gaps under gap_words
+    size_t words = (vg_npages + 63) / 64, lo = 0, hi = 0;
+    int n = 0;
+    bool open = false;
+    for (size_t w = 0; w <= words; w++) {
+        if (w < words && !vg_bits[w]) continue;
+        if (open && (w == words || w - hi > gap_words)) {
+            if (fill && n < VQ_SPANS) {
+                vq_span[n].lo = HEAP_BASE + ((uint64_t)lo << 18);
+                uint64_t e = (uint64_t)(hi + 1) << 18;
+                vq_span[n].hi = HEAP_BASE + (e < vram_size ? e : vram_size);
+            }
+            n++;
+            open = false;
+        }
+        if (w == words) break;
+        if (!open) lo = w, open = true;
+        hi = w;
+    }
+    return n;
+}
+
+static void vq_plan(void) {
+    static int full = -1;
+    if (full < 0) full = getenv("SAVAGEWIND_VK_WW_FULL") != NULL;
+    if (full) { vq_nspans = 1; vq_span[0].lo = HEAP_BASE; vq_span[0].hi = HEAP_BASE + vram_size; return; }
+    static const size_t gaps[] = {4, 64, 512};  // words of 256 KB: 1 MB, 16 MB, 128 MB
+    double best = 1e30;
+    size_t pick = 0;
+    for (int g = 0; g < 3; g++) {
+        int n = vq_spans_for(gaps[g], true);
+        if (n > VQ_SPANS) continue;
+        double mb = 0;
+        for (int i = 0; i < n; i++) mb += (double)(vq_span[i].hi - vq_span[i].lo) / 1048576.0;
+        double cost = 100.0 * n + 0.65 * mb + 0.5 * mb * 2;  // us: calls, scan, ~2 written pages a MB faulting again
+        if (cost < best) best = cost, pick = gaps[g];
+    }
+    vq_nspans = best < 1e30 ? vq_spans_for(pick, true) : 0;
+    if (best >= 1e30 || vq_nspans > VQ_SPANS) { vq_nspans = 1; vq_span[0].lo = HEAP_BASE; vq_span[0].hi = HEAP_BASE + vram_size; }
+}
+
 static void *vq_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&vq_lock);
@@ -3462,7 +3523,13 @@ static void *vq_thread(void *arg) {
         vq_request = false;
         pthread_mutex_unlock(&vq_lock);
         uint64_t t0 = SDL_GetTicksNS();
-        size_t n = plat_written_pages(HEAP_BASE, vram_size, vram_pages, vram_pages_max);
+        size_t n = 0;
+        for (int i = 0; i < vq_nspans; i++) {  // (ascending spans: the pages come out ascending)
+            size_t k = plat_written_pages(vq_span[i].lo, vq_span[i].hi - vq_span[i].lo, vram_pages + n, vram_pages_max - n);
+            if (k == SIZE_MAX) { n = SIZE_MAX; break; }
+            if (k >= vram_pages_max - n) { n = vram_pages_max; break; }
+            n += k;
+        }
         uint64_t dt = SDL_GetTicksNS() - t0;
         pthread_mutex_lock(&vq_lock);
         stat_vram_query_ns += dt;
@@ -3555,6 +3622,8 @@ static void vram_sync(void) {
         if (!vq_thread_on) { vram_full = true; return; }
         pthread_detach(t);
     }
+    vq_plan();
+    if (!vq_nspans) { vg_copy(NULL, 0); return; }  // (no geometry yet: nothing to ask)
     pthread_mutex_lock(&vq_lock);
     vq_request = true;
     pthread_cond_broadcast(&vq_cv);
@@ -5265,6 +5334,18 @@ have_pipe:
     }
     cum_draws++;
     if (g_debug_frame) pick_after_draw();
+    // A long pass goes to the GPU in pieces too (the pass ends and begins again, its targets loaded: on a desktop GPU
+    // that costs next to nothing). BOTW's G-buffer pass has ~2,600 draws, ~2 ms of translation: pieces were cut only
+    // between passes, so the GPU got nothing of the frame until it ended, then all of it at once, and the frame's
+    // last piece finished ~1.4 ms after the translation (the game waits for that). SAVAGEWIND_VK_SPLIT_DRAWS=<n>
+    // (default 600; 0: never inside a pass).
+    static int split = -1;
+    if (split < 0) split = getenv("SAVAGEWIND_VK_SPLIT_DRAWS") ? atoi(getenv("SAVAGEWIND_VK_SPLIT_DRAWS")) : 600;
+    if (split > 0 && in_pass && g_piece_ok && chunk_draws >= (uint32_t)split && !chunk_hold && !g_debug_frame &&
+        vram_collect(false)) {
+        vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);  // (ends the pass: the next draw begins it again)
+        st.rt_dirty = true;
+    }
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
             size_t l = strlen(gp_label[gp_n - 1]);
