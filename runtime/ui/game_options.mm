@@ -134,7 +134,13 @@ const int UPS_DEFAULT = 0;  // (UPSCALE_DEFAULT: Off, the window's resolution)
 std::vector<int> g_shown;   // per item: the value shown instead of get(), one that can't be picked yet (-1: none)
 const char16_t GREY = 3;    // (the game's message colour for greyed values)
 const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
-const char *const k_aa[] = {"Off", "SMAA"};
+const char *const k_aa[] = {"FXAA (the game's)", "SMAA", "DLAA"};  // (AA_*; DLAA only with DLSS: vulkan/dlss.c)
+#ifndef __APPLE__
+extern "C" bool dlss_available(void);
+static int aa_choices() { return dlss_available() ? 3 : 2; }
+#else
+static int aa_choices() { return 2; }
+#endif
 const char *const k_aniso[] = {"Off", "2x", "4x", "8x", "16x"};  // (settings anisotropy 0..4)
 const char *const k_shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", "Extreme (8192)"};  // (SHADOW_*)
 const char *const k_icons[] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Nintendo"};  // (ICONS_*)
@@ -148,6 +154,9 @@ static_assert(k_sens[SENS_DEFAULT] == 300);
 constexpr int k_motion_sens[] = {25, 50, 75, 100, 125, 150, 200, 250, 300, 400};  // motion sensitivity, %
 constexpr int MOTION_SENS_DEFAULT = 3;
 static_assert(k_motion_sens[MOTION_SENS_DEFAULT] == 100);
+constexpr int k_fov[] = FOV_CHOICES;  // field of view, % of the game's own
+constexpr int FOV_DEFAULT_INDEX = 3;
+static_assert(k_fov[FOV_DEFAULT_INDEX] == 100);
 constexpr int k_deadzone[] = {0, 3, 5, 8, 10, 12, 15, 20, 25, 30, 40};  // stick dead zone, % of full tilt
 constexpr int DEADZONE_DEFAULT = 4;
 static_assert(k_deadzone[DEADZONE_DEFAULT] == (int)(STICK_DEADZONE_DEFAULT * 100 + 0.5f));
@@ -285,6 +294,18 @@ void build_items(void) {
     };
     ws.wrap = true;
     v.push_back(ws);
+    v.push_back(toggle(P_VIDEO, "Fill wide screens", "Shows more to the sides on screens wider than 16:9, instead of bars.",
+                       [](const Item &) { return (int)g_settings.wide_view; },
+                       [](const Item &, int x) { g_settings.wide_view = x; }, 1));
+    v.push_back(choice(P_VIDEO, "Field of view", "How much the camera shows in play. Cutscenes keep their own.",
+                       [](const Item &) { return N(k_fov); },
+                       [](const Item &, int x) {
+                           static std::string str;
+                           str = pct(k_fov[x]);
+                           return str.c_str();
+                       },
+                       [](const Item &) { return nearest(k_fov, N(k_fov), (float)g_settings.fov); },
+                       [](const Item &, int x) { g_settings.fov = k_fov[x]; }, FOV_DEFAULT_INDEX));
     Item fps = choice(P_VIDEO, "Frame rate", "",
                       [](const Item &) { return N(k_fps); }, fps_label,
                       [](const Item &) {
@@ -333,8 +354,8 @@ void build_items(void) {
                                          : tr("Renders smaller, then upscales. Coming in a later version.");
     };
     v.push_back(mode);
-    v.push_back(choice(P_VIDEO, "Anti-aliasing", "Smooths jagged edges. Best at a lower resolution.",
-                       [](const Item &) { return N(k_aa); }, [](const Item &, int x) { return tr(k_aa[x]); },
+    v.push_back(choice(P_VIDEO, "Anti-aliasing", "DLAA: NVIDIA's temporal anti-aliasing, the steadiest edges.",
+                       [](const Item &) { return aa_choices(); }, [](const Item &, int x) { return tr(k_aa[x]); },
                        [](const Item &) { return g_settings.antialias; },
                        [](const Item &, int x) { g_settings.antialias = x; }, AA_OFF));
 #ifndef __APPLE__

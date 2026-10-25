@@ -27,12 +27,31 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi);
 // reservation), into pages[] (at most max); the count (max when there may have been more: then take the whole range
 // as written), or SIZE_MAX where the OS can't tell. Only the CPU's writes count, not a GPU's.
 size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max);
+// Non-resetting query and an explicit reset of exactly the region that will be
+// refreshed. A caller must copy every reset page after the reset; it must not
+// clear writes to pages whose cached contents it retains.
+size_t plat_peek_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max);
+bool plat_reset_written_pages(uint64_t addr, uint64_t size);
+#ifdef _WIN32
+// Optional precise geometry CPU-write tracker. Initialized before guest I/O;
+// guarded file destinations stay writable until the kernel operation finishes.
+bool plat_geometry_guard_active(void);
+size_t plat_geometry_guard_collect(const uint64_t *bits, size_t pages, uint64_t *out, size_t cap);
+bool plat_geometry_guard_pending(uint64_t addr);  // diagnostic concurrent-write audit
+#endif
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)
 
 // ---- time
 uint64_t plat_now_ns(void);                // monotonic
+#ifdef _WIN32
+uint64_t plat_thread_cycles(void);         // scheduled CPU cycles; not elapsed time
+uint32_t plat_thread_id(void);
+#else
+static inline uint64_t plat_thread_cycles(void) { return 0; }
+static inline uint32_t plat_thread_id(void) { return 0; }
+#endif
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);  // periodic timing thread (vsync): don't coalesce its timers
 

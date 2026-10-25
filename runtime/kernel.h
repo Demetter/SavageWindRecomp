@@ -33,6 +33,8 @@ struct KThread {
     uint32_t wait_tag, wait_result;
     KThread *wnext;
     KThread *snext;        // in WaitSynchronization (g_syncwaiters)
+    KObject *sync_obj[64]; // the objects of that wait's handles (sync_nobj -1: more than these, any signal may be one)
+    int sync_nobj;
     pthread_cond_t cond;   // each thread sleeps on its own condition; wakers signal it directly
     // in-place reboot (kernel_stop_threads): thread_main's setjmp point, where the thread unwinds to and ends
     jmp_buf unwind;
@@ -41,6 +43,7 @@ struct KThread {
     // core scheduling (runtime/kernel.c "cores"): the core it runs on, the one it holds (-1: none) and its turn
     int core_held;
     uint64_t core_ticket;
+    pthread_cond_t core_cond;  // separate from kernel waits: protected by the core mutex
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
     uint64_t woken_ns;  // (SAVAGEWIND_PROF_SVC) when a waker signalled it
     uint64_t block_ns;  // how long its last block lasted (block_current: it spins first after short ones)

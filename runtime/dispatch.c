@@ -1,3 +1,4 @@
+#include "perf_survey.h"
 // Guest address -> recompiled function lookup, and host (HLE) function registry.
 #include <pthread.h>
 #include <signal.h>
@@ -169,6 +170,11 @@ __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
 void rt_dispatch(Cpu *c) {
     KThread *t = c->thread;  // (a better thread waiting for this one's core gets it: kernel.c kernel_preempt)
     if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held] < t->prio, 0)) kernel_preempt(t);
+    if (perf_survey_mode == SURVEY_MAIN || perf_survey_mode == SURVEY_JOBS || perf_survey_mode == SURVEY_OVERLAP_SENSITIVITY || perf_survey_mode == SURVEY_WAIT_JOBS) {
+        static __thread uint64_t survey_seen;
+        uint64_t frame = atomic_load_explicit(&perf_survey_frame, memory_order_relaxed);
+        if (frame != survey_seen && t && t->core_held >= 0) { survey_seen = frame; perf_survey_guest(t); }
+    }
     unsigned h = dcache_index(c->pc);
     GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
     __attribute__((musttail)) return f(c);

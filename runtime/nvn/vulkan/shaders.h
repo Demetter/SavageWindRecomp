@@ -8,6 +8,8 @@ typedef struct { uint32_t set, binding; VkDescriptorType type; } VkBindingInfo;
 
 void vk_shaders_init(void);
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords);  // malloc'd, NULL on error
+// Explicit compiler policy for isolated experiments; optimization is in the disk cache key.
+uint32_t *vk_glsl_to_spirv_mode(const char *src, int stage, const char *name, size_t *nwords, bool optimize);
 int vk_spirv_ensure(const char *src, int stage);  // in the SPIR-V cache: 0 was there, 1 compiled now, -1 failed
 // (precompile.c) translation + SPIR-V of a binary with a key into the caches: 1 made, 0 cached already, -1 failed (why
 // says why)
@@ -27,6 +29,11 @@ bool vk_precompiled_cache_ok(void);
 ShaderInfo *vk_translate_cached(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
 // The same, only when the translation is already in memory (no file read, no translation): else NULL.
 ShaderInfo *vk_translate_peek(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
+bool vk_shader_constants_on(void);
+// Program compiler constants, snapshotted by the submit thread. The derived cache
+// identity includes their exact bytes. peek never reads disk or compiles.
+ShaderInfo *vk_translate_program(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key,
+                                 const uint8_t *constants, uint32_t size, bool peek);
 // The id of a translation vk_translate_cached returned (its cache/xlate name; 0: not cached), and the translation
 // with that id from memory or cache/xlate/ (NULL: not there, or not of that stage).
 uint64_t vk_translate_id(const ShaderInfo *si);

@@ -2300,7 +2300,7 @@ static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
-        void *x = r->extra;
+        void *x = nvn_cmd_extra(r);
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         switch (r->op) {
         case CMD_END: return;

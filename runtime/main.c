@@ -1,3 +1,4 @@
+#include "perf_survey.h"
 // Savage Wind entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
 #include <stdbool.h>
@@ -307,6 +308,7 @@ bool launcher_config_key_held(void);  // (macOS: Option held while the app opens
 
 int main(int argc, char **argv) {
     plat_init();
+    perf_survey_init();
 #ifndef _WIN32
     setvbuf(stderr, NULL, _IOLBF, 0);  // (Windows: buffered and written by a thread of its own, plat_init)
 #endif

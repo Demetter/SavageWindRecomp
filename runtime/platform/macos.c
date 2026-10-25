@@ -30,6 +30,8 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
 
 // (no page write tracking here: the Vulkan backend's heap copy in video memory stays off and draws read the heap)
 size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) { return SIZE_MAX; }
+size_t plat_peek_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) { return SIZE_MAX; }
+bool plat_reset_written_pages(uint64_t addr, uint64_t size) { return false; }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {

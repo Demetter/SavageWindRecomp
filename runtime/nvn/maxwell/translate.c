@@ -86,6 +86,13 @@ typedef struct {
     bool structured;
     Str *flow_before;
     uint8_t *flow_dead;
+    // (GLSL) register-indexed constant reads (cbr_bound): by instruction index, the registers and predicates the
+    // instruction's code assigns (read back from the code it emitted), and the reads
+    uint64_t (*wr)[4];
+    uint8_t *pwr;
+    size_t cur_i;
+    struct CbrRead { uint32_t i, off; uint8_t idx, reg, words, dst; } *dyn;
+    int ndyn, capdyn;
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -183,6 +190,19 @@ static void set_reg(Ctx *c, int r, const char *expr) {
 
 static bool id_start(char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'; }
 static bool id_char(char ch) { return id_start(ch) || (ch >= '0' && ch <= '9'); }
+
+// The registers and predicates code assigns ("rN = ", "pN = ": set_reg and every other register write): cbr_bound
+static void scan_writes(const char *s, size_t n, uint64_t wr[4], uint8_t *pwr) {
+    for (size_t k = 0; k < n; k++) {
+        if ((s[k] != 'r' && s[k] != 'p') || (k && id_char(s[k - 1]))) continue;
+        size_t j = k + 1;
+        unsigned v = 0;
+        while (j < n && s[j] >= '0' && s[j] <= '9' && j - k <= 3) v = v * 10 + (unsigned)(s[j++] - '0');
+        if (j == k + 1 || j + 2 >= n || s[j] != ' ' || s[j + 1] != '=' || s[j + 2] == '=') continue;
+        if (s[k] == 'r' && v < 256) wr[v >> 6] |= 1ull << (v & 63);
+        else if (s[k] == 'p' && v < 8) *pwr |= (uint8_t)(1u << v);
+    }
+}
 
 // Whether p is "(" + a uint operand + ")": a register (rN), a constant buffer word (cbN[i][j]) or a literal ending in u.
 static bool uint_operand(const char *p) {
@@ -1209,8 +1229,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
             if (!dyn && (off + 4 * i) & 0) {}
-            if (dyn) c->info->cbuf_size[idx] = 0x10000;
+            if (dyn && !c->glsl) c->info->cbuf_size[idx] = 0x10000;  // (GLSL: cbr_bound)
             set_reg(c, d + i, cb);
+        }
+        if (dyn && c->glsl) {
+            if (c->ndyn == c->capdyn) c->dyn = realloc(c->dyn, sizeof *c->dyn * (size_t)(c->capdyn = c->capdyn ? c->capdyn * 2 : 16));
+            // (an indexing mode other than reg + imm: never bounded, words 0)
+            c->dyn[c->ndyn++] = (struct CbrRead){(uint32_t)c->cur_i, (uint32_t)off, (uint8_t)idx, (uint8_t)a,
+                                                 (uint8_t)(bits(w, 44, 2) ? 0 : n), (uint8_t)d};
         }
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
@@ -2141,6 +2167,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->fail) { free(body.buf); free(c->body.buf); free(c); return info; }
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};  // (the prelude goes in front at the end: glsl_with_prelude)
+    if (stage == STAGE_VERTEX && key && key->cube_layer)
+        sp(&s, "#extension GL_ARB_shader_viewport_layer_array : require\n");
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
         uint32_t n = info->cbuf_size[i] / 16;
@@ -2232,6 +2260,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (stage == STAGE_VERTEX) {
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");
+        if (key && key->cube_layer) sp(&s, "  gl_Layer = int(cb3[0][1]);\n");
     } else if (stage == STAGE_FRAGMENT) {
         int r = 0;
         for (int rt = 0; rt < 8; rt++) {
@@ -2299,9 +2328,15 @@ size_t maxwell_binary_size(const uint8_t *blob, size_t max_size, int stage) {
 #endif
 const char *maxwell_translator_id(void) { return TRANSLATOR_ID; }
 
+uint32_t maxwell_translation_policy(void) {
+    const char *e = getenv("SAVAGEWIND_CBR");
+    return e && atoi(e) != 0 ? 1u : 0u;
+}
+
 // Whether a translation depends on more than the binary and the key (debugging switches): not to be cached.
 bool maxwell_translation_uncacheable(void) {
     return maxwell_dbg_code || maxwell_dbg_vs || getenv("SAVAGEWIND_SAVE_MSL") || getenv("SAVAGEWIND_NO_DISCARD") ||
+           getenv("SAVAGEWIND_CBR_DUMP") || getenv("SAVAGEWIND_LOG_CBR") ||
            getenv("SAVAGEWIND_XLATE_NO_STRUCTURE");
 }
 
@@ -2502,6 +2537,372 @@ static void structure_flow(Ctx *c, const uint64_t *code, size_t end) {
     c->flow_dead = NULL;
 }
 
+// ---- register-indexed constant reads (GLSL). LDC c[k][reg + imm] can read anywhere in the buffer, so its buffer was
+// bound whole (64 KB) and, being a snapshot, copied whole at every draw whose constants changed. Most indexes are small
+// and bounded: BOTW's cascaded shadow lookup (vs 49c03b2abd0fcc4b) picks one of three cascades in a loop counting down
+// from 2, LDC c[3][(i << 6) + 160..220], 352 bytes of a 64 KB buffer copied ~220 times a frame (14 MB a frame). The
+// ranges of the registers are found over the program's control flow: unsigned intervals per register, joined where
+// paths meet (and widened to anything after a few rounds), narrowed along branches by what an ISETP against a constant
+// says of its register. A buffer all of whose indexed reads are bounded is declared and bound to its bound, not 64 KB.
+// Sound by construction: a register an instruction writes is known only for the few operations modelled exactly (moves,
+// adds, shifts, masks, min / max, select of known values), anything else it writes is unknown; which registers an
+// instruction writes is read back from the code emitted for it (every write is an "rN = " statement); a read in code the
+// analysis did not reach, or under an indexing mode other than reg + imm, is unbounded; and the GLSL clamps every
+// indexed read to the declared size anyway.
+// SAVAGEWIND_LOG_CBR=1: the outcome per shader (stderr).
+typedef struct { uint32_t lo, hi; } Iv;  // lo > hi: empty (no value: the path cannot be taken)
+#define IV_TOP ((Iv){0, 0xffffffffu})
+#define IV_EMPTY ((Iv){1, 0})
+typedef struct { int reg; Iv t, f; } PFact;  // reg >= 0: reg's range while the predicate is true / false
+typedef struct { Iv r[256]; PFact p[8]; uint8_t reached; uint16_t visits; } RState;
+
+static Iv iv_k(uint32_t v) { return (Iv){v, v}; }
+static bool iv_empty(Iv a) { return a.lo > a.hi; }
+static Iv iv_join(Iv a, Iv b) {
+    if (iv_empty(a)) return b;
+    if (iv_empty(b)) return a;
+    return (Iv){a.lo < b.lo ? a.lo : b.lo, a.hi > b.hi ? a.hi : b.hi};
+}
+static Iv iv_meet(Iv a, Iv b) {
+    Iv r = {a.lo > b.lo ? a.lo : b.lo, a.hi < b.hi ? a.hi : b.hi};
+    return iv_empty(a) || iv_empty(b) || r.lo > r.hi ? IV_EMPTY : r;
+}
+static Iv iv_add(Iv a, Iv b) {  // (uint wraps: both ends on the same side of 2^32, or anything)
+    if (iv_empty(a) || iv_empty(b)) return IV_EMPTY;
+    uint64_t lo = (uint64_t)a.lo + b.lo, hi = (uint64_t)a.hi + b.hi;
+    if (hi - lo > 0xffffffffull || (lo >> 32) != (hi >> 32)) return IV_TOP;
+    return (Iv){(uint32_t)lo, (uint32_t)hi};
+}
+static Iv iv_shl(Iv a, uint32_t s) {
+    if (iv_empty(a)) return a;
+    if (s >= 32) return iv_k(0);
+    if (((uint64_t)a.hi << s) > 0xffffffffull) return IV_TOP;
+    return (Iv){a.lo << s, a.hi << s};
+}
+static Iv iv_shr(Iv a, uint32_t s) { return iv_empty(a) ? a : s >= 32 ? iv_k(0) : (Iv){a.lo >> s, a.hi >> s}; }
+static Iv iv_bits(Iv a, Iv b) {  // a | b, a ^ b: below the next power of two
+    uint32_t m = a.hi > b.hi ? a.hi : b.hi;
+    return (Iv){0, m ? (uint32_t)((1ull << (32 - __builtin_clz(m))) - 1) : 0};
+}
+static Iv rs_reg(const RState *s, int r) { return r == RZ ? iv_k(0) : s->r[r]; }
+static Iv rs_b(const RState *s, uint64_t w) {  // operand B as operand_b reads it
+    switch (b_form(w)) {
+    case B_REG: return rs_reg(s, (int)bits(w, 20, 8));
+    case B_CBUF: return IV_TOP;
+    default: {
+        uint32_t v = (uint32_t)bits(w, 20, 19) | ((uint32_t)bits(w, 56, 1) << 19);
+        if (v & 0x80000u) v |= 0xFFF00000u;
+        return iv_k(v);
+    }
+    }
+}
+
+// The values a satisfying "a op k" (icmp_expr's op numbering), within a's range r: TOP where an interval cannot say it.
+static Iv cmp_set(int op, uint32_t k, bool sgn, Iv r) {
+    if (op == 0) return IV_EMPTY;
+    if (op == 7) return IV_TOP;
+    if (sgn) {
+        if (r.hi <= 0x7fffffffu && k <= 0x7fffffffu) sgn = false;  // (both non-negative: as unsigned)
+        else if (op == 4 && (int32_t)k >= -1) return (Iv){k + 1, 0x7fffffffu};  // a > k: k + 1 .. INT_MAX
+        else if (op == 6 && (int32_t)k >= 0) return (Iv){k, 0x7fffffffu};
+        else return IV_TOP;
+    }
+    switch (op) {
+    case 1: return k ? (Iv){0, k - 1} : IV_EMPTY;
+    case 2: return iv_k(k);
+    case 3: return (Iv){0, k};
+    case 4: return k != 0xffffffffu ? (Iv){k + 1, 0xffffffffu} : IV_EMPTY;
+    case 5: return k == 0 ? (Iv){1, 0xffffffffu} : k == 0xffffffffu ? (Iv){0, k - 1} : IV_TOP;
+    default: return (Iv){k, 0xffffffffu};  // 6: >=
+    }
+}
+
+// One instruction (not flow control) on the state: the registers and predicates its code writes.
+static void rs_step(const Ctx *c, RState *s, size_t i, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), pr = (int)bits(w, 16, 3);
+    bool prn = bits(w, 19, 1);
+    if (pr == PT && prn) return;  // (never executes: emit_insn emits nothing)
+    bool guarded = pr != PT;
+    Iv v = IV_TOP;
+    bool have = false, self_add = false;
+    uint32_t k_add = 0;
+    PFact fp = {-1}, fq = {-1};
+    int fpi = -1, fqi = -1;
+    Iv A = rs_reg(s, a), B = rs_b(s, w);
+    if (OPM(0x0100000000000000ull, 0xfff0000000000000ull)) {  // MOV32I
+        v = iv_k((uint32_t)bits(w, 20, 32)), have = true;
+    } else if (OPM(0x5c98000000000000ull, 0xfff8000000000000ull) || OPM(0x4c98000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3898000000000000ull, 0xfef8000000000000ull)) {  // MOV
+        v = B, have = true;
+    } else if (OPM(0x5c10000000000000ull, 0xfff8000000000000ull) || OPM(0x4c10000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3810000000000000ull, 0xfef8000000000000ull)) {  // IADD
+        if (!bits(w, 43, 1) && !bits(w, 48, 1) && !bits(w, 49, 1)) {
+            v = iv_add(A, B), have = true;
+            if (a == d && b_form(w) == B_IMM) self_add = true, k_add = B.lo;
+        }
+    } else if (OPM(0x1c00000000000000ull, 0xfe00000000000000ull)) {  // IADD32I
+        if (!bits(w, 53, 1) && !bits(w, 56, 1)) {
+            v = iv_add(A, iv_k((uint32_t)bits(w, 20, 32))), have = true;
+            if (a == d) self_add = true, k_add = (uint32_t)bits(w, 20, 32);
+        }
+    } else if (OPM(0x5cc0000000000000ull, 0xfff0000000000000ull) || OPM(0x4cc0000000000000ull, 0xfff0000000000000ull) ||
+               OPM(0x38c0000000000000ull, 0xfef0000000000000ull)) {  // IADD3
+        if (!bits(w, 47, 5)) v = iv_add(iv_add(A, B), rs_reg(s, (int)bits(w, 39, 8))), have = true;
+    } else if (OPM(0x5c18000000000000ull, 0xfff8000000000000ull) || OPM(0x4c18000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3818000000000000ull, 0xfef8000000000000ull)) {  // ISCADD
+        if (!bits(w, 48, 2)) v = iv_add(iv_shl(A, (uint32_t)bits(w, 39, 5)), B), have = true;
+    } else if (OPM(0x1400000000000000ull, 0xfc00000000000000ull)) {  // ISCADD32I
+        v = iv_add(iv_shl(A, (uint32_t)bits(w, 53, 5)), iv_k((uint32_t)bits(w, 20, 32))), have = true;
+    } else if (OPM(0x5c48000000000000ull, 0xfff8000000000000ull) || OPM(0x4c48000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3848000000000000ull, 0xfef8000000000000ull)) {  // SHL
+        if (B.lo == B.hi) v = iv_shl(A, bits(w, 39, 1) ? B.lo & 31 : B.lo), have = true;
+    } else if (OPM(0x5c28000000000000ull, 0xfff8000000000000ull) || OPM(0x4c28000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3828000000000000ull, 0xfef8000000000000ull)) {  // SHR
+        if (B.lo == B.hi && (!bits(w, 48, 1) || A.hi <= 0x7fffffffu)) v = iv_shr(A, B.lo), have = true;
+    } else if (OPM(0x5c40000000000000ull, 0xfff8000000000000ull) || OPM(0x4c40000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3840000000000000ull, 0xfef8000000000000ull) || OPM(0x0400000000000000ull, 0xfc00000000000000ull)) {
+        bool i32 = OPM(0x0400000000000000ull, 0xfc00000000000000ull);  // LOP, LOP32I
+        int op = (int)(i32 ? bits(w, 53, 2) : bits(w, 41, 2));
+        if (i32) B = iv_k((uint32_t)bits(w, 20, 32));
+        if (i32 ? bits(w, 55, 1) : bits(w, 39, 1)) A = IV_TOP;
+        if (i32 ? bits(w, 56, 1) : bits(w, 40, 1)) B = B.lo == B.hi ? iv_k(~B.lo) : IV_TOP;
+        v = op == 0 ? (Iv){0, A.hi < B.hi ? A.hi : B.hi} : op == 3 ? B : iv_bits(A, B), have = true;
+    } else if (OPM(0x5c20000000000000ull, 0xfff8000000000000ull) || OPM(0x4c20000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x3820000000000000ull, 0xfef8000000000000ull)) {  // IMNMX
+        if (!bits(w, 48, 1) || (A.hi <= 0x7fffffffu && B.hi <= 0x7fffffffu)) {
+            Iv mn = {A.lo < B.lo ? A.lo : B.lo, A.hi < B.hi ? A.hi : B.hi};
+            Iv mx = {A.lo > B.lo ? A.lo : B.lo, A.hi > B.hi ? A.hi : B.hi};
+            int pp = (int)bits(w, 39, 3);
+            bool ppn = bits(w, 42, 1);
+            v = pp == PT ? (ppn ? mx : mn) : iv_join(mn, mx), have = true;
+        }
+    } else if (OPM(0x5ca0000000000000ull, 0xfff8000000000000ull) || OPM(0x4ca0000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0x38a0000000000000ull, 0xfef8000000000000ull)) {  // SEL
+        v = iv_join(A, B), have = true;
+    } else if (OPM(0x5b60000000000000ull, 0xfff0000000000000ull) || OPM(0x4b60000000000000ull, 0xfff0000000000000ull) ||
+               OPM(0x3660000000000000ull, 0xfef0000000000000ull)) {  // ISETP: what its predicates say of Ra
+        if (a != RZ && B.lo == B.hi && !iv_empty(A)) {
+            int op = (int)bits(w, 49, 3), bo = (int)bits(w, 45, 2), pp = (int)bits(w, 39, 3);
+            bool sgn = bits(w, 48, 1), ppn = bits(w, 42, 1), pp_t = pp == PT && !ppn, pp_f = pp == PT && ppn;
+            static const int neg[8] = {7, 6, 5, 4, 3, 2, 1, 0};  // !(a op k)
+            Iv yes = iv_meet(A, cmp_set(op, B.lo, sgn, A)), no = iv_meet(A, cmp_set(neg[op], B.lo, sgn, A));
+            // p = cmp bo pp, q = !cmp bo pp: the range while each is true / false (A: nothing said)
+            Iv pt = A, pf = A, qt = A, qf = A;
+            if (bo == 0) { pt = yes, qt = no; if (pp_t) pf = no, qf = yes; }
+            else if (bo == 1) { pf = no, qf = yes; if (pp_f) pt = yes, qt = no; }
+            else if (bo >= 2 && (pp_t || pp_f)) { pt = pp_f ? yes : no, pf = pp_f ? no : yes, qt = pf, qf = pt; }  // (3: as 2)
+            fp = (PFact){a, pt, pf}, fq = (PFact){a, qt, qf};
+            fpi = (int)bits(w, 3, 3), fqi = (int)bits(w, 0, 3);
+        }
+    }
+    const uint64_t *wr = c->wr[i];
+    for (int r = 0; r < 255; r++) {
+        if (!(wr[r >> 6] >> (r & 63) & 1)) continue;
+        s->r[r] = r == d && have ? (guarded ? iv_join(s->r[r], v) : v) : IV_TOP;
+        for (int q = 0; q < 8; q++) {
+            if (s->p[q].reg != r) continue;
+            if (r == d && self_add && !guarded) {  // (r += k: what the predicate says moves with it)
+                Iv k = iv_k(k_add);
+                s->p[q].t = iv_empty(s->p[q].t) ? s->p[q].t : iv_add(s->p[q].t, k);
+                s->p[q].f = iv_empty(s->p[q].f) ? s->p[q].f : iv_add(s->p[q].f, k);
+            } else {
+                s->p[q].reg = -1;
+            }
+        }
+    }
+    for (int q = 0; q < 8; q++) {
+        if (!(c->pwr[i] >> q & 1)) continue;
+        s->p[q] = guarded ? (PFact){-1} : q == fqi ? fq : q == fpi ? fp : (PFact){-1};  // (q is written after p)
+    }
+}
+
+static bool rs_join_into(RState *dst, const RState *src) {  // false: unchanged
+    if (!dst->reached) {
+        *dst = *src;
+        dst->reached = 1, dst->visits = 0;
+        return true;
+    }
+    bool changed = false, widen = ++dst->visits > 8;  // (after a few rounds: what still grows, anything)
+    for (int r = 0; r < 256; r++) {
+        Iv j = iv_join(dst->r[r], src->r[r]);
+        if (j.lo != dst->r[r].lo || j.hi != dst->r[r].hi) dst->r[r] = widen ? IV_TOP : j, changed = true;
+    }
+    for (int q = 0; q < 8; q++) {
+        PFact *f = &dst->p[q];
+        const PFact *g = &src->p[q];
+        if (f->reg < 0) continue;
+        if (g->reg != f->reg || widen) { f->reg = -1, changed = true; continue; }
+        Iv t = iv_join(f->t, g->t), u = iv_join(f->f, g->f);
+        if (memcmp(&t, &f->t, sizeof t) || memcmp(&u, &f->f, sizeof u)) f->t = t, f->f = u, changed = true;
+    }
+    if (!changed) dst->visits--;
+    return changed;
+}
+
+// The state along a flow instruction's edge where its guard predicate is `val`: false if no value can take it.
+static bool rs_refine(RState *s, int pr, bool val) {
+    if (pr == PT) return val;
+    const PFact *f = &s->p[pr];
+    if (f->reg < 0) return true;
+    Iv r = iv_meet(s->r[f->reg], val ? f->t : f->f);
+    if (iv_empty(r)) return false;
+    s->r[f->reg] = r;
+    return true;
+}
+
+static void cbr_bound(Ctx *c, const uint64_t *code, size_t end) {
+    static int logcbr = -1;
+    if (logcbr < 0) logcbr = getenv("SAVAGEWIND_LOG_CBR") ? atoi(getenv("SAVAGEWIND_LOG_CBR")) : 0;
+    ShaderInfo *info = c->info;
+    uint32_t bound[18] = {0}, unbounded = 0;
+    uint8_t *leader = calloc(end + 4, 1);
+    int32_t *slot = NULL;
+    RState *st = NULL;
+    uint32_t *work = NULL;
+    uint8_t *queued = NULL;
+    uint32_t tg[3][64];  // SSY / PBK / PCNT targets (where SYNC / BRK / CONT may go)
+    int ntg[3] = {0};
+    bool ok = end > 1, pops[3] = {0};
+    leader[1] = 1;
+    for (size_t i = 1; i < end && ok; i = next_insn(i)) {
+        uint64_t w = code[i];
+        uint64_t top12 = w & 0xfff0000000000000ull;
+        uint32_t t = norm_target((int64_t)(i * 8) + 8 + sbits(w, 20, 24)) / 8;
+        int kind = top12 == 0xe290000000000000ull ? 0 : top12 == 0xe2a0000000000000ull ? 1 : top12 == 0xe2b0000000000000ull ? 2 : -1;
+        uint8_t top8 = (uint8_t)(w >> 56);
+        if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull) pops[0] = true;  // SYNC
+        if (top12 == 0xe340000000000000ull) pops[1] = true;
+        if (top12 == 0xe350000000000000ull) pops[2] = true;
+        if (top8 == 0xe2 && ((top12 != 0xe240000000000000ull && kind < 0) || (w & 0x20)))
+            ok = false;  // (flow this does not follow: BRX, calls, returns, targets in constants)
+        else if (top8 == 0xe3 && top12 != 0xe300000000000000ull && top12 != 0xe330000000000000ull &&
+                 top12 != 0xe340000000000000ull && top12 != 0xe350000000000000ull)
+            ok = false;
+        else if (top12 == 0xe240000000000000ull || kind >= 0) {
+            if (t >= end) ok = false;
+            else leader[t] = 1;
+            if (kind >= 0 && ntg[kind] < 64) tg[kind][ntg[kind]++] = t;
+            else if (kind >= 0) ok = false;
+        }
+        if (top12 == 0xe240000000000000ull || top12 == 0xe300000000000000ull || top12 == 0xe340000000000000ull ||
+            top12 == 0xe350000000000000ull || (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull)
+            leader[next_insn(i) < end ? next_insn(i) : end] = 1;
+    }
+    for (int k = 0; k < 3; k++)
+        if (pops[k] && !ntg[k]) ok = false;  // (a SYNC / BRK / CONT with nowhere to go)
+    int nl = 0;
+    for (size_t i = 0; i <= end; i++) nl += leader[i];
+    if (nl > 4096) ok = false;  // (too big to bother: ~2 KB a block)
+    nl = 0;
+    if (ok) {
+        slot = malloc(sizeof *slot * (end + 4));
+        for (size_t i = 0; i <= end; i++) slot[i] = leader[i] ? nl++ : -1;
+        st = calloc((size_t)nl, sizeof *st);
+        work = malloc(sizeof *work * (size_t)nl);
+        queued = calloc((size_t)nl, 1);
+        RState *s0 = &st[slot[1]];
+        for (int r = 0; r < 256; r++) s0->r[r] = IV_TOP;
+        for (int q = 0; q < 8; q++) s0->p[q].reg = -1;
+        s0->reached = 1;
+    }
+    // the blocks until nothing changes, then once more each to read the indexes off
+    RState *s = ok ? malloc(sizeof *s) : NULL, *e = ok ? malloc(sizeof *e) : NULL;
+    int wh = 0, wn = 0;
+    if (ok) work[wn++] = 1, queued[slot[1]] = 1;
+    for (int pass = 0; pass < 2 && ok; pass++) {
+        if (pass == 1)  // (every reached block, in order)
+            for (size_t i = 1; i < end; i = next_insn(i))
+                if (leader[i] && st[slot[i]].reached) work[wn++ % nl] = (uint32_t)i;
+        long steps = 0;
+        while (wh != wn && ok) {
+            if (++steps > 200000) { ok = false; break; }  // (a shader too big to bother)
+            uint32_t L = work[wh++ % nl];
+            if (pass == 0) queued[slot[L]] = 0;
+            *s = st[slot[L]];
+            if (logcbr >= 3) {
+                fprintf(stderr, "[cbr]     pass %d block pc %#x (visits %d):", pass, L * 8, s->visits);
+                for (int r = 0; r < 255; r++)
+                    if (s->r[r].lo || s->r[r].hi != 0xffffffffu) fprintf(stderr, " r%d %#x..%#x", r, s->r[r].lo, s->r[r].hi);
+                for (int q = 0; q < 8; q++)
+                    if (s->p[q].reg >= 0) fprintf(stderr, " p%d:r%d t %#x..%#x f %#x..%#x", q, s->p[q].reg, s->p[q].t.lo, s->p[q].t.hi, s->p[q].f.lo, s->p[q].f.hi);
+                fprintf(stderr, "\n");
+            }
+            size_t i = L;
+            for (; i < end; i = next_insn(i)) {
+                if (i != L && leader[i]) {  // falls into the next block
+                    if (pass == 0 && rs_join_into(&st[slot[i]], s) && !queued[slot[i]]) work[wn++ % nl] = (uint32_t)i, queued[slot[i]] = 1;
+                    break;
+                }
+                uint64_t w = code[i];
+                uint64_t top12 = w & 0xfff0000000000000ull;
+                bool sync = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull;
+                int pr = (int)bits(w, 16, 3);
+                bool prn = bits(w, 19, 1), cc = bits(w, 0, 5) != 15;
+                if (top12 == 0xe240000000000000ull || top12 == 0xe300000000000000ull || top12 == 0xe340000000000000ull ||
+                    top12 == 0xe350000000000000ull || sync) {
+                    if (pr == PT && prn) continue;  // (never)
+                    bool always = pr == PT && !cc;
+                    uint32_t to[64];
+                    int nto = 0;
+                    if (top12 == 0xe240000000000000ull) to[nto++] = norm_target((int64_t)(i * 8) + 8 + sbits(w, 20, 24)) / 8;
+                    int kind = sync ? 0 : top12 == 0xe340000000000000ull ? 1 : top12 == 0xe350000000000000ull ? 2 : -1;
+                    for (int k = 0; kind >= 0 && k < ntg[kind]; k++) to[nto++] = tg[kind][k];
+                    if (pass == 0) {
+                        for (int k = 0; k < nto; k++) {  // taken: the guard holds
+                            *e = *s;
+                            if (!cc && !rs_refine(e, pr, !prn)) continue;
+                            if (rs_join_into(&st[slot[to[k]]], e) && !queued[slot[to[k]]]) work[wn++ % nl] = to[k], queued[slot[to[k]]] = 1;
+                        }
+                        size_t nx = next_insn(i);
+                        if (!always && nx < end) {  // not taken
+                            *e = *s;
+                            if ((cc || rs_refine(e, pr, prn)) && rs_join_into(&st[slot[nx]], e) && !queued[slot[nx]])
+                                work[wn++ % nl] = (uint32_t)nx, queued[slot[nx]] = 1;
+                        }
+                    }
+                    break;
+                }
+                if (pass == 1 && OPM(0xef90000000000000ull, 0xfff8000000000000ull) && (int)bits(w, 8, 8) != RZ &&
+                    !(pr == PT && prn))
+                    for (int k = 0; k < c->ndyn; k++) {
+                        const struct CbrRead *rd = &c->dyn[k];
+                        if (rd->i != i) continue;
+                        Iv x = rs_reg(s, rd->reg);
+                        uint64_t hi = (uint64_t)x.hi + rd->off + 4u * rd->words;
+                        if (logcbr >= 2)
+                            fprintf(stderr, "[cbr]   pc %#zx: c[%d][r%d + %u] (%d words, mode ok %d), r%d in %#x..%#x\n", i * 8, rd->idx,
+                                    rd->reg, rd->off, rd->words, rd->words > 0, rd->reg, x.lo, x.hi);
+                        if (!rd->words || iv_empty(x) || hi > 0x10000 || (rd->words > 1 && rd->dst == rd->reg)) unbounded |= 1u << rd->idx;
+                        else if (hi > bound[rd->idx]) bound[rd->idx] = (uint32_t)hi;
+                        c->dyn[k].i = 0xffffffffu;  // (seen)
+                    }
+                rs_step(c, s, i, w);
+            }
+            if (pass == 0 && i >= end) {}  // (runs off the end: nowhere)
+        }
+    }
+    for (int k = 0; k < c->ndyn; k++)
+        if (!ok || c->dyn[k].i != 0xffffffffu) unbounded |= 1u << c->dyn[k].idx;  // (not reached: not bounded)
+    if (logcbr >= 2)
+        for (int k = 0; k < c->ndyn; k++)
+            fprintf(stderr, "[cbr]   read at pc %#x: cbuf %d off %u r%d%s\n", c->dyn[k].i == 0xffffffffu ? 0 : c->dyn[k].i * 8,
+                    c->dyn[k].idx, c->dyn[k].off, c->dyn[k].reg, c->dyn[k].i == 0xffffffffu ? "" : " (not reached)");
+    if (logcbr >= 2 && !ok) fprintf(stderr, "[cbr]   not analysed (flow, size)\n");
+    for (int k = 0; k < 18; k++) {
+        if (!(info->cbuf_dynamic & (1u << k))) continue;
+        if (unbounded & (1u << k)) {
+            info->cbuf_size[k] = 0x10000;
+            if (logcbr) fprintf(stderr, "[cbr] stage %d cbuf %d: indexed reads unbounded (%d blocks)\n", c->stage, k, nl);
+            continue;
+        }
+        uint32_t sz = (bound[k] + 255) & ~255u;
+        if (sz > info->cbuf_size[k]) info->cbuf_size[k] = sz;
+        info->cbuf_dynamic &= ~(1u << k);
+        if (logcbr) fprintf(stderr, "[cbr] stage %d cbuf %d: indexed reads within %u bytes (bound %u)\n", c->stage, k, bound[k], info->cbuf_size[k]);
+    }
+    free(leader), free(slot), free(st), free(work), free(queued), free(s), free(e);
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2562,6 +2963,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("SAVAGEWIND_SAVE_MSL") != NULL;
     c->branchy = any_branch;
+    if (c->glsl) c->wr = calloc(end + 4, sizeof *c->wr), c->pwr = calloc(end + 4, 1);
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
@@ -2573,7 +2975,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             sp(&c->body, "  case %uu:\n", pc);
         }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
+        size_t len0 = c->body.len;
+        c->cur_i = i;
         emit_insn(c, ((const uint64_t *)code)[i], pc);
+        if (c->wr) scan_writes(c->body.buf + len0, c->body.len - len0, c->wr[i], &c->pwr[i]);
         if (dbg && pc == maxwell_dbg_pc) {
             int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
             c->reg_used[rr] = 1;
@@ -2589,6 +2994,35 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         free(c->flow_dead);
     }
     free(label);
+    // Off by default (SAVAGEWIND_CBR=1 turns it on): with the bound, the cascade shader's 512-byte slice of the 64 KB
+    // buffer the game updates between draws came out stale for some draws (shadows flickering on Link and the grass
+    // near him), while binding the whole buffer with the same shader didn't. The suspected copy-path issue must
+    // be checked independently of range analysis and shader specialization before this is enabled by default.
+    bool no_cbr = !(maxwell_translation_policy() & 1u);
+    if (c->glsl && !c->fail && c->info->cbuf_dynamic && no_cbr)
+        for (int k = 0; k < 18; k++)
+            if (c->info->cbuf_dynamic & (1u << k)) c->info->cbuf_size[k] = 0x10000;
+    if (c->glsl && !c->fail && c->info->cbuf_dynamic && !no_cbr) {
+        cbr_bound(c, (const uint64_t *)code, end);
+        // (debugging) SAVAGEWIND_CBR_DUMP=<dir>: the programs with indexed reads left unbounded, <dir>/<stage>_<n>.bin
+        // with the key in front (tools: the analysis tried on them offline)
+        const char *dd = getenv("SAVAGEWIND_CBR_DUMP");
+        if (dd && c->info->cbuf_dynamic) {
+            static int ndump;
+            char path[512];
+            snprintf(path, sizeof path, "%s/%d_%03d.bin", dd, stage, ndump++);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                size_t n = maxwell_binary_size(blob, max_size, stage);
+                ShaderKey k0 = {0};
+                fwrite(key ? key : &k0, sizeof k0, 1, f);
+                fwrite(blob, 1, n, f);
+                fclose(f);
+            }
+        }
+    }
+    free(c->wr), free(c->pwr), free(c->dyn);
+    c->wr = NULL, c->pwr = NULL, c->dyn = NULL;
     if (c->fail) { free(c->body.buf); free(c); return info; }
     if (c->glsl) return glsl_finish(c, any_branch, dbg);
 

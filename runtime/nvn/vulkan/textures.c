@@ -13,6 +13,28 @@
 #include "../astc.h"
 #include "../glyphs.h"
 #include "../renderer.h"
+#include "depth_mirror.h"
+#include "frame_trace.h"
+
+typedef struct DepthMirror {
+    TexBackend image;
+    VkBuffer bridge;
+    VmaAllocation bridge_mem;
+    uint64_t epoch;
+    bool dirty;
+} DepthMirror;
+static uint64_t comparison_epoch = 1;
+bool vk_depth_mirror_enabled;
+bool vk_depth_mirror_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_DEPTH_MIRROR") ? atoi(getenv("SAVAGEWIND_VK_DEPTH_MIRROR")) : 1;
+    return vk_depth_mirror_enabled = on != 0;
+}
+void vk_depth_mirror_invalidate(NvnTexture *t) {
+    if (!t) { comparison_epoch++; return; }
+    TexBackend *b = t->backend;
+    if (b && b->comparison) b->comparison->dirty = true;
+}
 
 // ================================================================== formats
 typedef struct { VkFormat vf; uint8_t expand_rgb, alpha_one; } VkFmt;
@@ -186,10 +208,18 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
         return RS_SHADOW;
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || t->width < 32 || t->height < 16) return RS_NONE;
     if (!(t->flags & 9)) {
-        // (SAVAGEWIND_SCALE_FRACTIONS=1, experimental: exact fractions of the 3D scene without the compressible or
-        // display flags (1600x900 / 2^k, rounded either way) follow it too. BOTW's 400x225 R8 one is its sun's shadow
-        // mask, stretched 9.6 times over a 4K scene (the fringe along Link's outline), but scaled, the shader that
-        // reads it no longer finds the light: the grass and the rocks go dark. Its reads need the scale first.)
+        // BOTW's quarter-size R8 target (400x225, no flags) is its sun's shadow mask: drawn from the half-size scene
+        // buffer (800x450, scaled), blurred twice between two of them, then put back into that buffer; all four passes
+        // sample it with normalized coordinates (fs cb54ea341e41d9c5, b19c72f044b00219, 8222f280bba07b98,
+        // 0f8f1af28fc2064d). At the game's size it was stretched 9.6 times over a 4K scene: a blocky light fringe along
+        // every depth edge (the outline around Link, the fuzz along grass). It follows the scene now.
+        // SAVAGEWIND_NO_SCALE_MASK=1: as before.
+        static int mask_off = -1;
+        if (mask_off < 0) mask_off = getenv("SAVAGEWIND_NO_SCALE_MASK") != NULL;
+        if (!mask_off && t->format == 0x1 && t->width == 400 && t->height == 225) return RS_SCENE;
+        // (SAVAGEWIND_SCALE_FRACTIONS=1, experimental: every exact fraction of the 3D scene without the compressible or
+        // display flags (1600x900 / 2^k, rounded either way) follows it too. Scaling all of them, the grass and the
+        // rocks went dark: some other fraction's readers depend on its size.)
         static int off = -1;
         if (off < 0) off = getenv("SAVAGEWIND_SCALE_FRACTIONS") == NULL;
         bool frac = false;
@@ -272,7 +302,7 @@ void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags as
 }
 
 // Images destroyed by the guest are kept until the submissions that may use them have completed.
-typedef struct { VkImage img; VmaAllocation mem; VkImageView view; uint64_t seq; } Dead;
+typedef struct { VkImage img; VmaAllocation mem; VkImageView view; uint64_t seq; VkBuffer buffer; } Dead;
 static Dead *dead;
 static int ndead, cap_dead;
 static void views_forget(TexBackend *b);
@@ -283,6 +313,7 @@ void vk_collect_dead(void) {
     for (int i = 0; i < ndead; i++) {
         if (dead[i].seq > done) { dead[k++] = dead[i]; continue; }
         if (dead[i].view) vkDestroyImageView(g_vk.dev, dead[i].view, NULL);
+        else if (dead[i].buffer) vmaDestroyBuffer(g_vk.vma, dead[i].buffer, dead[i].mem);
         else vmaDestroyImage(g_vk.vma, dead[i].img, dead[i].mem);
     }
     ndead = k;
@@ -417,6 +448,13 @@ static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->widt
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
 static void destroy_image(TexBackend *b) {
+    if (b->comparison) {
+        DepthMirror *m = b->comparison;
+        views_forget(&m->image);
+        if (m->image.image) defer((Dead){.img=m->image.image, .mem=m->image.mem});
+        if (m->bridge) defer((Dead){.buffer=m->bridge, .mem=m->bridge_mem});
+        free(m); b->comparison = NULL;
+    }
     views_forget(b);
     if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;
@@ -551,23 +589,50 @@ static void release_backend(NvnTexture *t) {  // (gpu lock held)
 static NvnTexture **g_zombies;
 static int g_nzombies, g_cap_zombies;
 
+static bool texture_holder_age(void) {
+    static int on=-1;
+    if (on<0) {
+        const char *e=getenv("SAVAGEWIND_VK_TEXTURE_HOLDER_AGE");
+        on=e ? atoi(e) : 1;
+    }
+    return on!=0;
+}
+
 static void zombies_expire(void) {  // (gpu lock held)
     uint64_t now = renderer_present_count();
-    int k = 0;
+    static int probe=-1;
+    static uint64_t reported;
+    if (probe<0) probe=getenv("SAVAGEWIND_VK_TEXTURE_LIFETIME_PROBE") && atoi(getenv("SAVAGEWIND_VK_TEXTURE_LIFETIME_PROBE"));
+    uint64_t start=vk_frame_trace_on || probe ? plat_now_ns() : 0;
+    int k = 0, before=g_nzombies, released=0;
+    bool per_holder=texture_holder_age();
     for (int i = 0; i < g_nzombies; i++) {
         NvnTexture *t = g_zombies[i];
         TexBackend *b = t->backend;
         if (!b) continue;
-        if (now - b->used_frame > PARK_FRAMES) release_backend(t);
+        if (now - (per_holder ? t->backend_used_frame : b->used_frame) > PARK_FRAMES) { release_backend(t); released++; }
         else g_zombies[k++] = t;
     }
     g_nzombies = k;
+    if (start) {
+        uint64_t end=plat_now_ns();
+        if (vk_frame_trace_on) {
+            char label[112];
+            snprintf(label,sizeof label,"Texture alias retirement: %d scanned, %d released, %d retained",before,released,k);
+            vk_frame_trace_event(label,4,now,0,start,end,0,0);
+        }
+        if (probe && now>=reported+600) {
+            reported=now;
+            LOG("[texture-life] frame %llu holder_age %u scanned %d released %d retained %d holders %d images %d idle %d ms %.4f\n",
+                (unsigned long long)now,per_holder,before,released,k,g_nholders,g_nimages,g_nidle,(end-start)/1e6);
+        }
+    }
 }
 
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        if (t->finalized) b->used_frame = renderer_present_count();
+        if (t->finalized) t->backend_used_frame = b->used_frame = renderer_present_count();
         if (rs_stale(b)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
@@ -609,7 +674,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     t->backend = b;
     holders_add(t);
     if (t->finalized) {
-        b->used_frame = renderer_present_count();
+        t->backend_used_frame = b->used_frame = renderer_present_count();
         if (g_nzombies == g_cap_zombies) {
             g_cap_zombies = g_cap_zombies ? g_cap_zombies * 2 : 64;
             g_zombies = realloc(g_zombies, g_cap_zombies * sizeof *g_zombies);
@@ -637,6 +702,18 @@ void vk_textures_reset(void) {
 
 // ================================================================== uploads (same change detection as metal.m)
 static uint64_t full_hash_budget, full_hash_budget_frame;
+// Renderer-mutex protected, cumulative across resets. Counts only: no per-texture
+// timer. These identify hashing/upload work bursts in individual stutter frames.
+static uint64_t trace_texture_work[7];
+void vk_texture_trace_frame(uint64_t frame) {
+    static uint64_t previous[7];
+    uint64_t delta[7];
+    for (unsigned i = 0; i < 7; i++) { delta[i] = trace_texture_work[i] - previous[i]; previous[i] = trace_texture_work[i]; }
+    TRACE_LOG("[frame-textures] %llu checks %llu samples %llu sampled_words %llu full_bytes %llu dynamic_bytes %llu changed_uploads %llu changed_storage_bytes %llu\n",
+        (unsigned long long)frame, (unsigned long long)delta[0], (unsigned long long)delta[1],
+        (unsigned long long)delta[2], (unsigned long long)delta[3], (unsigned long long)delta[4],
+        (unsigned long long)delta[5], (unsigned long long)delta[6]);
+}
 
 // Four independent lanes (one serial multiply chain ran at ~1.5 bytes/cycle; dynamic textures are hashed every
 // frame). Values are only compared within a run.
@@ -666,6 +743,17 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     return h ^ n;
 }
 
+#include "texture_sample_hash.h"
+static int sample_hash_mode(void) {
+    static int mode=-1;
+    if(mode<0) {
+        const char *e=getenv("SAVAGEWIND_VK_TEXTURE_HASH_LANES");
+        mode=e ? atoi(e) : 1; // same sampled bytes; audited and measured +1.69% in matched native-resolution runs
+        if(mode==2) LOG("[texture-hash-audit] comparing change decisions with original sampler\n");
+    }
+    return mode;
+}
+
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferImageCopy rg, uint32_t gw, uint32_t gh);
@@ -677,6 +765,7 @@ static void upload_pending(TexBackend *b) {
     b->pending_rgba = NULL;
     pthread_mutex_unlock(&pending_lock);
     if (!px) return;
+    if (b->comparison) b->comparison->dirty = true;
     bool scaled = b->scalable && (w != b->width || h != b->height);
     if (!scaled && w > b->width) w = b->width;
     if (!scaled && h > b->height) h = b->height;
@@ -728,6 +817,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     }
     b->checked_frame = frame;
     prof_tex_checks++;
+    if (vk_frame_trace_on) trace_texture_work[0]++;
     if (t->flags & 0x10) b->dynamic = true;
     if (full_hash_budget_frame != frame) { full_hash_budget_frame = frame; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
@@ -737,14 +827,31 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     if (!full && frame - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
     if (!full) {
         prof_tex_samples++;
-        uint64_t sh = fnv_sample(mem, total);
+        if (vk_frame_trace_on) {
+            uint64_t words = total / 8, step = words > 2048 ? words / 2048 : 1;
+            trace_texture_work[1]++;
+            trace_texture_work[2] += (words + step - 1) / step;
+        }
+        uint64_t sh = sample_hash_mode() ? texture_sample_hash4(mem,total) : fnv_sample(mem,total);
+        if(sample_hash_mode()==2) {
+            static uint64_t checks;
+            uint64_t ref=fnv_sample(mem,total);
+            if((sh==b->sample_hash)!=(ref==b->sample_hash_reference))
+                FATAL("texture sample hash change-decision mismatch texture %llu\n",(unsigned long long)t->debug_id);
+            if(!(++checks & 0xffff)) LOG("[texture-hash-audit] %llu decisions; zero mismatches\n",(unsigned long long)checks);
+        }
         if (sh == b->sample_hash) return;
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
+    if (vk_frame_trace_on) { trace_texture_work[3] += total; if (b->dynamic) trace_texture_work[4] += total; }
     uint64_t h = hash_full(mem, total);
     b->full_frame = frame;
-    if (!b->dynamic) b->sample_hash = fnv_sample(mem, total);  // (a dynamic texture is hashed whole every frame: no sample needed)
+    if (!b->dynamic) {
+        b->sample_hash=sample_hash_mode() ? texture_sample_hash4(mem,total) : fnv_sample(mem,total);
+        if(sample_hash_mode()==2) b->sample_hash_reference=fnv_sample(mem,total);
+    }  // (a dynamic texture is hashed whole every frame: no sample needed)
     if (b->uploaded && h == b->data_hash) return;
+    if (vk_frame_trace_on) { trace_texture_work[5]++; trace_texture_work[6] += total; }
     if (b->uploaded && h != b->data_hash && !written) b->dynamic = true;
     b->data_hash = h;
     b->uploaded = true;
@@ -796,6 +903,7 @@ static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferI
 
 // Guest memory -> image for the levels in level_mask (bit per level), every layer or slice.
 static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
+    if (b->comparison) b->comparison->dirty = true;
     const FormatInfo *fi = t->layout.fmt;
     VkFmt mf = fmt_of(t->format);
     if (!t->addr || t->target == 10 || !fi || !fi->bpb || !storage_readable(t, storage_size(t))) return;
@@ -997,7 +1105,10 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
         if (b->gpu_owned) upload_levels(t, b, written);
         else upload_texture(t, b, true);
     }
-    if (for_render) b->gpu_owned = true;
+    if (for_render) {
+        b->gpu_owned = true;
+        if (b->comparison) b->comparison->dirty = true;
+    }
     else if (!b->gpu_owned) {
         extern uint64_t prof_up_ns;
         uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
@@ -1007,12 +1118,114 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     return b;
 }
 
-void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
+void renderer_mark_gpu_owned(NvnTexture *t) {
+    TexBackend *b = tex_backend(t);
+    b->gpu_owned = true;
+    if (b->comparison) b->comparison->dirty = true;
+}
 
 // Guest memory -> image for every level, whoever owns the image (exec.c: linear render targets the CPU wrote).
 void vk_texture_reload(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     upload_levels(t, b, ~0u);
+}
+
+// Diagnostic only: compare every texel of a cached native depth image with its
+// current source. Reads both on the GPU after all preceding writes; no hashes or
+// screenshots stand in for the content comparison. Check one in 600 cache hits.
+static void depth_mirror_verify(TexBackend *b) {
+    static int mode = -1;
+    static unsigned hits, checked;
+    if (mode < 0) mode = getenv("SAVAGEWIND_VK_DEPTH_MIRROR") ? atoi(getenv("SAVAGEWIND_VK_DEPTH_MIRROR")) : 0;
+    if (mode < 2 || ++hits % 600) return;
+    DepthMirror *m = b->comparison;
+    uint32_t bpp = b->format == VK_FORMAT_R32_SFLOAT ? 4 : 2;
+    VkBufferImageCopy src[32], dst[32];
+    VkDeviceSize bytes = depth_mirror_regions(b->width,b->height,b->layers,b->levels,bpp,VK_IMAGE_ASPECT_COLOR_BIT,src,32);
+    if (!bytes) return;
+    depth_mirror_regions(b->width,b->height,b->layers,b->levels,bpp,VK_IMAGE_ASPECT_DEPTH_BIT,dst,32);
+    for (uint32_t i=0;i<b->levels;i++) dst[i].bufferOffset += bytes;
+    vk_end_pass();
+    VkBuffer buffer; VmaAllocation memory; VmaAllocationInfo info;
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=bytes*2,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai={.usage=VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags=VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT|VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VK_CHECK(vmaCreateBuffer(g_vk.vma,&bi,&ai,&buffer,&memory,&info));
+    VkCommandBuffer cb=vk_cmd();
+    vk_full_barrier(cb);
+    vkCmdCopyImageToBuffer(cb,b->image,VK_IMAGE_LAYOUT_GENERAL,buffer,b->levels,src);
+    vkCmdCopyImageToBuffer(cb,m->image.image,VK_IMAGE_LAYOUT_GENERAL,buffer,b->levels,dst);
+    VkMemoryBarrier2 mb={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask=VK_PIPELINE_STAGE_2_TRANSFER_BIT,.srcAccessMask=VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask=VK_PIPELINE_STAGE_2_HOST_BIT,.dstAccessMask=VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di={.sType=VK_STRUCTURE_TYPE_DEPENDENCY_INFO,.memoryBarrierCount=1,.pMemoryBarriers=&mb};
+    vkCmdPipelineBarrier2(cb,&di);
+    renderer_flush();
+    VK_CHECK(vmaInvalidateAllocation(g_vk.vma,memory,0,VK_WHOLE_SIZE));
+    for (uint32_t i=0;i<b->levels;i++) {
+        size_t n=(size_t)src[i].imageExtent.width*src[i].imageExtent.height*b->layers*bpp;
+        if (memcmp((uint8_t *)info.pMappedData+src[i].bufferOffset,(uint8_t *)info.pMappedData+dst[i].bufferOffset,n))
+            FATAL("[depth-verify] stale native comparison image %ux%u mip %u\n",b->width,b->height,i);
+    }
+    vmaDestroyBuffer(g_vk.vma,buffer,memory);
+    checked++;
+    LOG("[depth-verify] %u cached images matched every texel; latest %ux%u layers %u\n",checked,b->width,b->height,b->layers);
+}
+
+bool vk_depth_mirror_prepare(NvnTexture *t) {
+    if (!vk_depth_mirror_on() || !t || (t->format != 0x06 && t->format != 0x0a)) return false;
+    TexBackend *b = vk_tex(t, false);
+    bool fp32 = b->format == VK_FORMAT_R32_SFLOAT;
+    // Without this extension, copying float values outside [0,1] into depth is
+    // undefined. Never clamp or silently change those comparison values.
+    if ((fp32 && !g_vk.depth_range_unrestricted) ||
+        (!fp32 && b->format != VK_FORMAT_R16_UNORM) || b->depth != 1 || b->samples != 1 ||
+        (b->base_type != VK_IMAGE_VIEW_TYPE_2D && b->base_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY)) return false;
+    DepthMirror *m = b->comparison;
+    if (m && !m->dirty && m->epoch == comparison_epoch) { depth_mirror_verify(b); return false; }
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    VkBufferImageCopy color[32], depth[32];
+    uint32_t bpp = fp32 ? 4 : 2;
+    VkFormat depth_format = fp32 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM;
+    VkDeviceSize bytes = depth_mirror_regions(b->width,b->height,b->layers,b->levels,bpp,VK_IMAGE_ASPECT_COLOR_BIT,color,32);
+    if (!bytes) return false;
+    depth_mirror_regions(b->width,b->height,b->layers,b->levels,bpp,VK_IMAGE_ASPECT_DEPTH_BIT,depth,32);
+    if (!m) {
+        VkFormatProperties3 p3 = {.sType=VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 p2 = {.sType=VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,.pNext=&p3};
+        vkGetPhysicalDeviceFormatProperties2(g_vk.phys,depth_format,&p2);
+        if (!(p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT)) return false;
+        m = calloc(1,sizeof *m);
+        if (!m) return false;
+        VkImageCreateInfo ci = {.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,
+            .format=depth_format,.extent={b->width,b->height,1},.mipLevels=b->levels,.arrayLayers=b->layers,
+            .samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+            .usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        VmaAllocationCreateInfo ai = {.usage=VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma,&ci,&ai,&m->image.image,&m->image.mem,NULL));
+        VkBufferCreateInfo bi = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=bytes,
+            .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VK_CHECK(vmaCreateBuffer(g_vk.vma,&bi,&ai,&m->bridge,&m->bridge_mem,NULL));
+        m->image.format=depth_format; m->image.aspect=VK_IMAGE_ASPECT_DEPTH_BIT;
+        m->image.width=b->width; m->image.height=b->height; m->image.depth=1;
+        m->image.levels=b->levels; m->image.layers=b->layers; m->image.samples=1;
+        m->image.base_type=b->base_type;
+        vk_image_init_layout(cb,m->image.image,VK_IMAGE_ASPECT_DEPTH_BIT);
+        b->comparison=m;
+        LOG("[depth-mirror] native %s comparison copy for %ux%u, %u layers, %u mips\n",fp32?"D32":"D16",b->width,b->height,b->layers,b->levels);
+    }
+    // The same bridge and depth image can still be read by earlier submissions.
+    // Full execution scope preserves write-after-read as well as write visibility.
+    vk_depth_mirror_mark(cb,b->width,b->height,b->layers,false);
+    vk_full_barrier(cb);
+    vkCmdCopyImageToBuffer(cb,b->image,VK_IMAGE_LAYOUT_GENERAL,m->bridge,b->levels,color);
+    vk_full_barrier(cb);
+    vkCmdCopyBufferToImage(cb,m->bridge,m->image.image,VK_IMAGE_LAYOUT_GENERAL,b->levels,depth);
+    vk_full_barrier(cb);
+    vk_depth_mirror_mark(cb,b->width,b->height,b->layers,true);
+    m->epoch=comparison_epoch; m->dirty=false;
+    return true;
 }
 uint64_t vk_hash_bytes(const void *p, uint64_t n) { return hash_full(p, n); }
 
@@ -1034,7 +1247,6 @@ void vk_make_scalable_like(NvnTexture *t, NvnTexture *like) {
 
 uint8_t vk_texture_scale_group(NvnTexture *t) { return tex_backend(t)->rs_group; }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
-void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
@@ -1179,6 +1391,27 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
                          t->height, t->depth, t->target, t->format, b->layers);
     return vk_dummy_view(want_textype);
+}
+
+VkImageView vk_depth_mirror_view(NvnTexture *t, const NvnTextureView *v, bool has_view, int type) {
+    TexBackend *src = t ? t->backend : NULL;
+    if (!src || !src->comparison) return VK_NULL_HANDLE;
+    TexBackend *b = &src->comparison->image;
+    if (!has_view) v = NULL;
+    if (v && (v->setmask & 4) && v->format != t->format) return VK_NULL_HANDLE;
+    VkComponentMapping sw = vk_sample_swizzle(t,v);
+    if (sw.r != VK_COMPONENT_SWIZZLE_IDENTITY && sw.r != VK_COMPONENT_SWIZZLE_R) return VK_NULL_HANDLE;
+    if (type != TEXTYPE_2D && type != TEXTYPE_2D_ARRAY) return VK_NULL_HANDLE;
+    uint32_t lv = v && (v->setmask & 1) ? v->base_level : 0;
+    uint32_t ly = v && (v->setmask & 2) ? v->min_layer : 0;
+    if (lv >= b->levels) lv=b->levels-1;
+    if (ly >= b->layers) ly=b->layers-1;
+    uint32_t nl = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels-lv;
+    uint32_t ny = v && (v->setmask & 2) && v->num_layers ? v->num_layers : b->layers-ly;
+    if (nl > b->levels-lv) nl=b->levels-lv;
+    if (ny > b->layers-ly) ny=b->layers-ly;
+    if (type == TEXTYPE_2D) ny=1;
+    return vk_image_view(b,view_type_for(type),b->format,lv,nl,ly,ny,IDENTITY,VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
 // 1x1 black textures for unbound slots, per type

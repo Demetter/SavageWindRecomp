@@ -1,3 +1,6 @@
+#include "vulkan/a1d.h"
+#include "../perf_survey.h"
+#include "../gpu_consumer_probe.h"
 // NVN objects, builders, and state objects (everything except command recording).
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +10,17 @@
 #include "../kernel.h"
 #include "../perfmon.h"
 #include "nvn.h"
+#include "texture_registry.h"
+#ifndef __APPLE__
+#include "vulkan/frame_trace.h"
+#else
+// The flight recorder is part of the Vulkan backend only.
+#define vk_frame_trace_on false
+static void vk_frame_trace_event(const char *n, unsigned l, uint64_t f, uint64_t s,
+                                uint64_t b, uint64_t e, unsigned d, uint64_t h) {
+    (void)n; (void)l; (void)f; (void)s; (void)b; (void)e; (void)d; (void)h;
+}
+#endif
 
 void renderer_sync(void);
 
@@ -167,10 +181,13 @@ bool nvn_timeline(void) {
 // At most QUEUE_AHEAD presents wait in the queue (SAVAGEWIND_QUEUE_AHEAD, default 1): a guest further ahead waits.
 // SAVAGEWIND_ASYNC_EXEC=0: everything runs on the calling thread (as before).
 enum { QOP_EXEC, QOP_FENCE, QOP_PRESENT, QOP_TEXTURE_FINALIZE, QOP_SYNC_FREE };
-typedef struct { int op; uint64_t a; void *p; } QOp;
+typedef struct { int op; uint64_t a; void *p; uint64_t queued_ns; } QOp;
 #define QCAP 4096
 static QOp g_q[QCAP];
 static uint64_t g_q_done, g_q_put;  // operations run / queued (operation k, from 1, is done once g_q_done >= k)
+static uint64_t g_q_translated;
+static struct { uint64_t ticket, seq, required, done; unsigned reasons; } g_q_safe;
+extern bool renderer_safe_overlap_enabled(void);
 static int g_q_presents, g_q_ahead = 1;
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_q_work = PTHREAD_COND_INITIALIZER, g_q_progress = PTHREAD_COND_INITIALIZER;
@@ -198,19 +215,30 @@ static int frame_split(void) {
 static void frame_split_log(void) {
     uint64_t now = plat_now_ns();
     #define FS(t) ((t) ? ((double)now - (double)(t)) / 1e6 : -1.0)
-    LOG("[fsplit] %.3f vfr %.1f sync %.1f-%.1f submit %.1f exec %.1f-%.1f pace %.1f\n", now / 1e6, FS(g_fs_vfr),
+    TRACE_LOG("[fsplit] %.3f vfr %.1f sync %.1f-%.1f submit %.1f exec %.1f-%.1f pace %.1f\n", now / 1e6, FS(g_fs_vfr),
         FS(g_fs_sync0), FS(g_fs_sync1), FS(g_fs_submit), FS(g_fs_x0), FS(g_fs_x1), FS(g_fs_pace));
     #undef FS
 }
 
 static void qop_run(const QOp *o) {
+    if (o->queued_ns) {
+        static const char *names[] = {"Queued command list", "Queued fence", "Queued present", "Queued texture release", "Queued sync release"};
+        vk_frame_trace_event(names[o->op], 7, renderer_present_count(), 0, o->queued_ns, plat_now_ns(), 0, 0);
+    }
     switch (o->op) {
     case QOP_EXEC:
         if (frame_split()) g_fs_x0 = plat_now_ns();
         backend_execute(o->a);
         if (frame_split()) g_fs_x1 = plat_now_ns();
         break;
-    case QOP_FENCE: { NvnSync *s = o->p; s->seq = renderer_fence_seq(); s->signaled = 1; break; }
+    case QOP_FENCE: {
+        NvnSync *s = o->p; s->seq = renderer_fence_seq(); s->signaled = 1;
+        if (perf_survey_mode == SURVEY_FENCE_FLAGS) {
+            extern void renderer_survey_frame_fence(uint64_t);
+            renderer_survey_frame_fence(s->seq);
+        }
+        break;
+    }
     case QOP_PRESENT:
         backend_present(o->p);
         if (frame_split()) frame_split_log();
@@ -233,6 +261,7 @@ static void *queue_thread(void *arg) {
         if (o.op == QOP_EXEC || o.op == QOP_PRESENT) TL("queue: %s done", o.op == QOP_EXEC ? "exec" : "present");
         pthread_mutex_lock(&g_q_lock);
         g_q_done++;
+        if (g_q_done > g_q_translated) g_q_translated = g_q_done;
         if (o.op == QOP_PRESENT) g_q_presents--;
         pthread_cond_broadcast(&g_q_progress);
     }
@@ -252,7 +281,60 @@ static void queue_block(bool (*done)(uint64_t), uint64_t arg) {
     }
 }
 static bool q_reached(uint64_t k) { return g_q_done >= k; }
-static bool q_room(uint64_t present) { return g_q_put - g_q_done < QCAP && (!present || g_q_presents < g_q_ahead); }
+static bool q_translated(uint64_t k) { return g_q_translated >= k; }
+void nvn_survey_translation_complete(void) {
+    if (perf_survey_mode != SURVEY_CPU_FENCE && perf_survey_mode != SURVEY_OVERLAP_SENSITIVITY && perf_survey_mode != SURVEY_WAIT_JOBS && perf_survey_mode != SURVEY_QUEUE_AHEAD && perf_survey_mode != SURVEY_DOWNSTREAM && perf_survey_mode != SURVEY_JOB_WINDOW) return;
+    pthread_mutex_lock(&g_q_lock);
+    g_q_translated = g_q_done + 1;
+    pthread_cond_broadcast(&g_q_progress);
+    pthread_mutex_unlock(&g_q_lock);
+}
+static void survey_wait_translation(uint64_t k) {
+    // Same queue target as normal SyncWait. A never-fenced/acquire-ready sync has
+    // ticket0: it must not become a barrier for unrelated submissions.
+    if (!k) return;
+    pthread_mutex_lock(&g_q_lock);
+    if (k == ~0ull) k = g_q_put;
+    while (k > g_q_done && g_q[(k - 1) % QCAP].op != QOP_EXEC) k--;
+    queue_block(q_translated, k);
+    pthread_mutex_unlock(&g_q_lock);
+}
+// This publication names the currently executing list, never an unfenced sync.
+// Queue mutex release also publishes the completed descriptor copies to main.
+void nvn_safe_translation_complete(uint64_t seq, uint64_t required, uint64_t done, unsigned reasons) {
+    if (!async_exec()) return;
+    pthread_mutex_lock(&g_q_lock);
+    g_q_safe = (typeof(g_q_safe)){g_q_done + 1, seq, required, done, reasons};
+    pthread_cond_broadcast(&g_q_progress);
+    pthread_mutex_unlock(&g_q_lock);
+}
+static bool q_safe_decided(uint64_t ticket) {
+    return g_q_done >= ticket || g_q_safe.ticket == ticket - 1;
+}
+static bool safe_wait_frame(uint64_t ticket, unsigned *reason) {
+    *reason = 512; // unsupported scope or no matching proof: normal queue/GPU wait
+    if (ticket < 2) return false;
+    pthread_mutex_lock(&g_q_lock);
+    // Only a queue fence directly following this list. In-list syncs, queue
+    // finish/flush, and never-fenced/acquire syncs retain their normal semantics.
+    bool eligible = ticket <= g_q_put && g_q_put - ticket < QCAP - 1 &&
+        g_q[(ticket - 1) % QCAP].op == QOP_FENCE && g_q[(ticket - 2) % QCAP].op == QOP_EXEC;
+    if (eligible) {
+        queue_block(q_safe_decided, ticket);
+        if (g_q_safe.ticket == ticket - 1) {
+            *reason = g_q_safe.reasons;
+            bool safe = !*reason && g_q_safe.required <= g_q_safe.done;
+            pthread_mutex_unlock(&g_q_lock);
+            return safe;
+        }
+    }
+    pthread_mutex_unlock(&g_q_lock);
+    return false;
+}
+static bool q_room(uint64_t present) {
+    int ahead = perf_survey_mode == SURVEY_QUEUE_AHEAD ? (perf_survey_on(SURVEY_QUEUE_AHEAD) ? 2 : 1) : g_q_ahead;
+    return g_q_put - g_q_done < QCAP && (!present || g_q_presents < ahead);
+}
 
 static void queue_start(void) {
     pthread_t t;
@@ -263,7 +345,7 @@ static uint64_t queue_put(int op, uint64_t a, void *p) {
     pthread_once(&once, queue_start);
     pthread_mutex_lock(&g_q_lock);
     queue_block(q_room, op == QOP_PRESENT);
-    g_q[g_q_put % QCAP] = (QOp){op, a, p};
+    g_q[g_q_put % QCAP] = (QOp){op, a, p, vk_frame_trace_on ? plat_now_ns() : 0};
     uint64_t k = ++g_q_put;
     if (op == QOP_PRESENT) g_q_presents++;
     pthread_cond_signal(&g_q_work);
@@ -341,6 +423,15 @@ NVN(nvnSyncFinalize) {
 NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
 NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
+    static int probe = -1;
+    if (probe < 0) probe = getenv("SAVAGEWIND_SYNC_PROBE") != NULL;
+    bool survey_waits = perf_survey_mode == SURVEY_DOWNSTREAM || perf_survey_mode == SURVEY_JOB_WINDOW || perf_survey_mode == SURVEY_FENCE_FLAGS || perf_survey_mode == SURVEY_SAFE_OVERLAP;
+    bool safe_on = renderer_safe_overlap_enabled();
+    a1d_init();
+    bool timing = probe || vk_frame_trace_on || survey_waits || safe_on || gcp_active() || a1d_enabled;
+    if (c->x[30] == 0x7000e94a98ull) gcp_fence(false, 0);
+    uint64_t probe_start = timing ? plat_now_ns() : 0;
+    uint64_t probe_frame = vk_frame_trace_on ? renderer_present_count() : 0;
     static int flush = -1;
     static uint64_t n;
     if (flush < 0) flush = getenv("SAVAGEWIND_SYNC_FLUSH") ? 1 : 0;
@@ -353,14 +444,56 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
        (unsigned long long)vk_completed_seq(), (unsigned long long)c->x[30]);
     // the queue first: up to the fence that sets it (a fence inside a command list: everything submitted so far)
     if (frame_split() && s->ticket) g_fs_sync0 = plat_now_ns();
-    if (async_exec()) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
+    bool unsafe_cpu = perf_survey_on(SURVEY_CPU_FENCE), safe_released = false;
+    unsigned safe_reason = 512;
+    if (async_exec()) {
+        if (safe_on && !flush && !whole && !s->in_list && c->x[30] == 0x7000e94a98ull)
+            safe_released = safe_wait_frame(s->ticket, &safe_reason);
+        if (unsafe_cpu) survey_wait_translation(flush || whole || s->in_list ? ~0ull : s->ticket);
+        else if (!safe_released) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
+    }
+    uint64_t probe_queued = timing ? plat_now_ns() : 0;
     if (host_work()) kernel_host_work_begin();
-    if (flush) renderer_flush();
+    uint64_t probe_gpu_start = timing ? plat_now_ns() : 0;
+    if (unsafe_cpu || perf_survey_on(SURVEY_STUB)) { /* DIAGNOSTIC ONLY: ignore GPU ownership completely. */ }
+    else if (safe_released) { /* Guest-memory ownership proven complete for this exact frame list. */ }
+    else if (flush) renderer_flush();
     else if (whole) renderer_sync();
     else renderer_wait_seq(s->seq);  // only the submission that holds this fence
+    uint64_t probe_gpu_end = timing ? plat_now_ns() : 0;
+    if (c->x[30] == 0x7000e94a98ull && gcp_active()) gcp_fence(true, vk_completed_seq());
     if (host_work()) kernel_host_work_end();
+    if (timing) {
+        uint64_t end = plat_now_ns();
+        if(a1d_enabled&&c->x[30]==0x7000e94a98ull){
+            a1d_add(A1D_FENCE,end-probe_start);a1d_add(A1D_FENCE_QUEUE,probe_queued-probe_start);
+            a1d_add(A1D_FENCE_GPU,probe_gpu_end-probe_gpu_start);a1d_add(A1D_FENCE_CORE,end-probe_gpu_end);
+        }
+        if ((safe_on || perf_survey_mode == SURVEY_SAFE_OVERLAP) && c->x[30] == 0x7000e94a98ull)
+            TRACE_LOG("[safe-overlap] %llu frame %llu block %d enabled %d released %d reason %u ticket %llu\n",
+                (unsigned long long)end, (unsigned long long)atomic_load(&perf_survey_frame), atomic_load(&perf_survey_block),
+                safe_on, safe_released, safe_reason, (unsigned long long)s->ticket);
+        if (survey_waits && c->x[30] == 0x7000e94a98ull)
+            TRACE_LOG("[survey-sync] %llu %llu %d cpu %d start %llu queue_ns %llu gpu_ns %llu core_ns %llu\n",
+                (unsigned long long)end, (unsigned long long)atomic_load(&perf_survey_frame), atomic_load(&perf_survey_block), unsafe_cpu,
+                (unsigned long long)probe_start, (unsigned long long)(probe_queued - probe_start),
+                (unsigned long long)(probe_gpu_end - probe_gpu_start), (unsigned long long)(end - probe_gpu_end));
+        if (vk_frame_trace_on) {
+            vk_frame_trace_event("Fence: command queue wait", 8, probe_frame, s->seq, probe_start, probe_queued, 0, c->x[30]);
+            vk_frame_trace_event("Fence: release guest core", 8, probe_frame, s->seq, probe_queued, probe_gpu_start, 0, c->x[30]);
+            vk_frame_trace_event("Fence: GPU completion wait", 8, probe_frame, s->seq, probe_gpu_start, probe_gpu_end, 0, c->x[30]);
+            vk_frame_trace_event("Fence: reacquire guest core", 8, probe_frame, s->seq, probe_gpu_end, end, 0, c->x[30]);
+        }
+        static __thread unsigned sampled;
+        if (probe && end - probe_start >= 250000 && (++sampled % 60 == 1))
+            TRACE_LOG("[sync-probe] lr %llx sync %llx seq %llu in_list %d queue %.3f release %.3f gpu %.3f core %.3f ms\n",
+                (unsigned long long)c->x[30], (unsigned long long)A(0), (unsigned long long)s->seq, s->in_list,
+                (probe_queued - probe_start) / 1e6, (probe_gpu_start - probe_queued) / 1e6,
+                (probe_gpu_end - probe_gpu_start) / 1e6, (end - probe_gpu_end) / 1e6);
+    }
     if (frame_split() && s->ticket) g_fs_sync1 = plat_now_ns();
     TL("syncwait done");
+    if (c->x[30] == 0x7000e94a98ull) gcp_return(s->seq, probe_start, probe_queued, probe_gpu_start, probe_gpu_end);
     RET(0);
 }
 NVN(nvnSyncCreateGLSync) { RET(0); }
@@ -597,38 +730,28 @@ static NvnTexture *texture_from_builder(uint64_t b) {
 
 // Every host texture of this boot (they are only freed by a reboot: see nvnTextureFinalize), so a guest NVNtexture
 // whose first word is not one of them (never initialized, or not a texture) is told apart.
-static uintptr_t *g_tex_set;
-static uint32_t g_tex_cap, g_tex_n;
+static TextureRegistry g_tex_registry;
 static pthread_mutex_t g_tex_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t tex_slot(uintptr_t p) { return (uint32_t)((p >> 4) * 0x9E3779B97F4A7C15ull >> 32) & (g_tex_cap - 1); }
 static void tex_set_put(uintptr_t p) {  // (lock held)
-    if ((g_tex_n + 1) * 2 > g_tex_cap) {
-        uintptr_t *old = g_tex_set;
-        uint32_t oc = g_tex_cap;
-        g_tex_cap = g_tex_cap ? g_tex_cap * 2 : 4096;
-        g_tex_set = calloc(g_tex_cap, sizeof *g_tex_set);
-        g_tex_n = 0;
-        for (uint32_t i = 0; i < oc; i++)
-            if (old[i]) tex_set_put(old[i]);
-        free(old);
+    uint64_t start = vk_frame_trace_on ? plat_now_ns() : 0;
+    uint32_t moved;
+    if (!texture_registry_insert(&g_tex_registry, p, &moved)) FATAL("texture registry allocation failed\n");
+    if (start && moved) {
+        char label[112];
+        snprintf(label, sizeof label, "Texture registry shard growth: %u entries", moved);
+        vk_frame_trace_event(label, 4, renderer_present_count(), 0, start, plat_now_ns(), 0, 0);
     }
-    uint32_t i = tex_slot(p);
-    while (g_tex_set[i]) i = (i + 1) & (g_tex_cap - 1);
-    g_tex_set[i] = p;
-    g_tex_n++;
 }
 static bool tex_set_has(uintptr_t p) {  // (lock held)
-    if (!g_tex_cap) return false;
-    for (uint32_t i = tex_slot(p); g_tex_set[i]; i = (i + 1) & (g_tex_cap - 1))
-        if (g_tex_set[i] == p) return true;
-    return false;
+    return texture_registry_contains(&g_tex_registry, p);
 }
 
 // (debugging) log the textures whose storage holds guest address a
 void nvn_debug_textures_at(uint64_t a) {
     pthread_mutex_lock(&g_tex_lock);
-    for (uint32_t i = 0; i < g_tex_cap; i++) {
-        NvnTexture *t = (NvnTexture *)g_tex_set[i];
+    for (unsigned shard = 0; shard < TEXTURE_REGISTRY_SHARDS; shard++)
+    for (uint32_t i = 0; i < g_tex_registry.shard[shard].capacity; i++) {
+        NvnTexture *t = (NvnTexture *)g_tex_registry.shard[shard].slots[i];
         if (!t || !t->addr) continue;
         uint64_t size = tegra_total_size(&t->layout);
         if (t->stride * t->height > size) size = t->stride * t->height;
@@ -642,10 +765,7 @@ void nvn_debug_textures_at(uint64_t a) {
 }
 
 RT_ON_RESET(tex_set_reset) {  // (after the renderer's reset: no image is left)
-    for (uint32_t i = 0; i < g_tex_cap; i++) free((void *)g_tex_set[i]);
-    free(g_tex_set);
-    g_tex_set = NULL;
-    g_tex_cap = g_tex_n = 0;
+    texture_registry_clear(&g_tex_registry, free);
 }
 
 NVN(nvnTextureInitialize) {
@@ -927,6 +1047,7 @@ static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, 
     d->addr = HOST(NvnPool, pool)->storage + off;
     d->count = count;
     d->entries = calloc(count, entry);
+    d->revision = 1;
     SET_HOST(guest, d);
     G(uint64_t, guest, 8) = pool;
     G(uint64_t, guest, 16) = off;
@@ -952,6 +1073,7 @@ static void register_texture(Cpu *c) {
     e->tex = HOST(NvnTexture, A(2));
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    d->revision++;
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }
@@ -972,12 +1094,16 @@ NVN(nvnSamplerPoolRegisterSampler) {
         NvnSamplerDesc s = *HOST(NvnSamplerDesc, A(2));
         s.backend = NULL;  // (the pool entry gets its own VkSampler)
         ((NvnSamplerDesc *)d->entries)[id] = s;
+        d->revision++;
     }
 }
 NVN(nvnSamplerPoolRegisterSamplerBuilder) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = sampler_desc_from_builder(AP(2));
+    if (id >= 0 && id < d->count) {
+        ((NvnSamplerDesc *)d->entries)[id] = sampler_desc_from_builder(AP(2));
+        d->revision++;
+    }
 }
 
 NvnDescPool *nvn_find_pool(NvnDescPool **reg, uint64_t guest_pool) {
@@ -1146,6 +1272,7 @@ NVN(nvnQueuePresentTexture) {
     if (logged != w->interval) { logged = w->interval; LOG("[nvn] window present interval %d\n", w->interval); }
     TL("present (pace)");
     present_pace(w->interval);
+    perf_survey_present();
     if (frame_split()) g_fs_pace = plat_now_ns();
     perfmon_frame();
     TL("present (backend)");

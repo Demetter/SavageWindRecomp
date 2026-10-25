@@ -1,3 +1,4 @@
+#include "../../perf_survey.h"
 // Vulkan device, window, swapchain and presentation (counterpart of the window/present half of metal.m).
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -16,6 +17,7 @@
 #include "../../ui/menu.h"
 #include "../../window_size.h"
 #include "vk.h"
+#include "frame_trace.h"
 #include "../output_scale.h"
 #include "../renderer.h"
 
@@ -67,6 +69,7 @@ static void create_instance(void) {
     const char *ar = getenv("SAVAGEWIND_VK_ADDR_REPORT");
     if (ar) sscanf(ar, "%llx-%llx", (unsigned long long *)&g_addr_report_lo, (unsigned long long *)&g_addr_report_hi);
     if (validate || ar) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    dlss_instance_extensions(ext, &n_ext, 24);  // (DLSS, when its bridge is there)
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Savage Wind",
                              .pEngineName = "Savage Wind", .apiVersion = VK_API_VERSION_1_3};
@@ -184,14 +187,17 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[24];
+    const char *ext[64];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    bool dlss = dlss_device_extensions(ep, ne, ext, &n_ext, 24);  // (DLSS, when its bridge is there: NGX's extensions)
     bool addr_report = g_addr_report_hi && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
     if (addr_report) ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
     if (g_addr_report_hi) LOG("[vk] address binding report %s\n", addr_report ? "on" : "not supported");
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    g_vk.depth_range_unrestricted = vk_depth_mirror_on() && has_ext(ep, ne, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+    if (g_vk.depth_range_unrestricted) ext[n_ext++] = VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
@@ -245,6 +251,27 @@ static void create_device(void) {
     // when each frame reached the display (SAVAGEWIND_LOG_PRESENT, tests: "present timing" below)
     bool pwait = getenv("SAVAGEWIND_LOG_PRESENT") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                  has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    const char *timing = getenv("SAVAGEWIND_VK_TIMING"), *frames = getenv("SAVAGEWIND_FRAME_LOG");
+    if (getenv("SAVAGEWIND_FRAME_TRACE") || (timing && atoi(timing)) || (frames && atoi(frames) >= 2)) {
+        if (has_ext(ep, ne, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            ext[n_ext++] = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+            g_vk.calibrated_time = 1;
+        } else if (has_ext(ep, ne, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            ext[n_ext++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+            g_vk.calibrated_time = 2;
+        }
+    }
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    if (getenv("SAVAGEWIND_VK_PIPELINE_STATS") && has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &executable};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &query);
+        g_vk.pipeline_stats = executable.pipelineExecutableInfo;
+        if (g_vk.pipeline_stats) ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+    }
+    if (getenv("SAVAGEWIND_VK_PIPELINE_STATS"))
+        LOG("[pipeline-exec] native compiler statistics %s; diagnostic only\n", g_vk.pipeline_stats ? "enabled" : "unavailable");
+    if (getenv("SAVAGEWIND_GPU_TRACE")) LOG("[hardware-profile] external GPU profiler launch; diagnostic only\n");
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -259,9 +286,22 @@ static void create_device(void) {
 #endif
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, .pNext = fbl ? &lr_have : NULL};
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    VkPhysicalDeviceVulkan12Features layer_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                       .pNext = gpl ? (void *)&gpl_have : fbl ? (void *)&lr_have : NULL};
+    VkPhysicalDeviceVulkan11Features draw_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &layer_have};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &draw_have};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    const char *native_draw = getenv("SAVAGEWIND_VK_NATIVE_MULTI_DRAW");
+    int native_mode = native_draw ? atoi(native_draw) : 0;
+    bool native_supported = layer_have.bufferDeviceAddress &&
+        draw_have.shaderDrawParameters && have.features.multiDrawIndirect && have.features.drawIndirectFirstInstance && have.features.shaderInt64 &&
+        g_vk.props.limits.maxDrawIndirectCount >= 128 && g_vk.props.limits.maxBoundDescriptorSets >= 3;
+    g_vk.native_multi_draw = native_supported && (native_mode == 1 || native_mode == 2) ? native_mode : 0;
+    const char *native_ab=getenv("SAVAGEWIND_VK_NATIVE_MULTI_DRAW_AB");
+    g_vk.native_multi_draw_ab=native_ab?strtoull(native_ab,NULL,10):0;
+    if (native_mode) LOG("[vk] native multi-draw pilot mode %u (%s)\n", g_vk.native_multi_draw, g_vk.native_multi_draw ? "enabled" : "unavailable: mode or required features");
+    vkq_native_multi_draw=g_vk.native_multi_draw;
+    g_vk.output_layer = layer_have.shaderOutputLayer;
     if (gpl) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
@@ -274,6 +314,9 @@ static void create_device(void) {
         ext[n_ext++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
     }
     LOG("[vk] graphics pipeline libraries %s\n", g_vk.gpl ? "on (shaders compiled apart from the fixed state)" : "off");
+    const char *gpl_lto = getenv("SAVAGEWIND_VK_GPL_LTO");
+    g_vk.gpl_lto = g_vk.gpl && gpl_lto && atoi(gpl_lto) != 0;
+    if (g_vk.gpl_lto) LOG("[vk] graphics pipeline libraries: optimized GPU linking enabled\n");
     g_vk.feedback_loop = fbl && fbl_have.attachmentFeedbackLoopLayout && lr_have.dynamicRenderingLocalRead;
 #ifdef VK_KHR_unified_image_layouts
     uil = uil && uil_have.unifiedImageLayouts;
@@ -304,11 +347,13 @@ static void create_device(void) {
                                             .pNext = m5 ? (void *)&m5_on : g_vk.custom_border ? (void *)&cbc
                                                                          : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                            .bufferDeviceAddress = g_vk.native_multi_draw != 0,
+                                            .shaderOutputLayer = g_vk.output_layer,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
                                             .scalarBlockLayout = VK_TRUE, .pNext = &f13};
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
+                                            .storageBuffer16BitAccess = VK_TRUE, .shaderDrawParameters = g_vk.native_multi_draw != 0, .pNext = &f12};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT,
@@ -337,6 +382,8 @@ static void create_device(void) {
     g_vk.feat_aniso = h->samplerAnisotropy;
     b->textureCompressionBC = h->textureCompressionBC;
     b->shaderInt64 = h->shaderInt64;
+    b->multiDrawIndirect = g_vk.native_multi_draw != 0;
+    b->drawIndirectFirstInstance = g_vk.native_multi_draw != 0;
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
     g_vk.depth_clamp = h->depthClamp;
@@ -371,6 +418,7 @@ static void create_device(void) {
         ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
     }
     g_vk.present_wait = pwait;
+    if (g_vk.pipeline_stats) { executable.pNext = f.pNext; f.pNext = &executable; }
     float prio[2] = {1.0f, 1.0f};
     // two queues when the family has them: the second one presents (present thread below)
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -378,12 +426,14 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    if (dlss) dlss_device_init();
     vkd_load(g_vk.dev);  // (the hot calls straight to the driver: vkd.h)
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     g_vk.present_queue = g_vk.queue;
     if (qi.queueCount == 2) vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 1, &g_vk.present_queue);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
+                                 .flags = g_vk.native_multi_draw ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0,
                                  .vulkanApiVersion = VK_API_VERSION_1_3};
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
 
@@ -1023,6 +1073,13 @@ uint64_t g_present_split[6];  // (VK_PROF) acquire, end pass, draw + menu, submi
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
 
+static void present_trace_mark(const char *name, uint64_t *start) {
+    if (!*start) return;
+    uint64_t now = plat_now_ns();
+    vk_frame_trace_event(name, 9, renderer_present_count(), vk_pending_seq(), *start, now, 0, 0);
+    *start = now;
+}
+
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
 bool vk_frame_begin(const float clear[4]) {
@@ -1032,7 +1089,9 @@ bool vk_frame_begin(const float clear[4]) {
     // minimised (Windows keeps the window's size then, but its surface is 0 x 0: every acquire was out of date)
     if (!w || !h || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) return false;
     uint64_t tp = SDL_GetTicksNS();
+    uint64_t trace_t = vk_frame_trace_on ? plat_now_ns() : 0;
     vk_present_idle();  // (the swapchain is externally synchronized: no acquire while the present thread presents)
+    present_trace_mark("Present thread idle wait", &trace_t);
     g_present_split[4] += SDL_GetTicksNS() - tp;
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
         atomic_exchange(&pres_stale, 0) || g_vk.sc_mode != wanted_present_mode())
@@ -1045,9 +1104,11 @@ bool vk_frame_begin(const float clear[4]) {
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     uint64_t tw = SDL_GetTicksNS();
     vk_wait_seq(slot_seq[slot]);
+    present_trace_mark("Prepare presentation slot", &trace_t);
     g_present_split[5] += SDL_GetTicksNS() - tw;
     uint64_t ta = SDL_GetTicksNS();
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    present_trace_mark("Acquire swapchain image", &trace_t);
     g_present_split[0] += SDL_GetTicksNS() - ta;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
@@ -1117,6 +1178,8 @@ void vk_frame_end(const char *shot_path) {
     if (!cur_frame.ok) return;
     VkCommandBuffer cb = vk_cmd();
     vkCmdEndRendering(cb);
+    extern void vk_perf_survey_gpu(VkCommandBuffer);
+    vk_perf_survey_gpu(cb);
     VkSpan shot = {0};
     if (shot_path) save_window_image(cb, &shot);
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
@@ -1124,10 +1187,13 @@ void vk_frame_end(const char *shot_path) {
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();
     uint64_t ts = SDL_GetTicksNS();
+    uint64_t trace_submit = vk_frame_trace_on ? plat_now_ns() : 0;
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
+    present_trace_mark("Submit presentation commands", &trace_submit);
     g_present_split[3] += SDL_GetTicksNS() - ts;
     ts = SDL_GetTicksNS();
     if (!present_image(img, done_sem[img])) recreate_swapchain();
+    present_trace_mark("Queue presentation", &trace_submit);
     g_present_split[4] += SDL_GetTicksNS() - ts;
     cur_frame.ok = false;
     if (shot_path) {
@@ -1215,9 +1281,11 @@ static uint64_t pso_wait(void) {  // ns waited
 
 static void present_locked(NvnTexture *t) {
     g_last_presented = t;
-    TexBackend *b = vk_tex(t, true);
-    b->presented = true;
+    bool survey_stub = perf_survey_on(SURVEY_STUB);
+    TexBackend *b = survey_stub ? NULL : vk_tex(t, true);
+    if (b) b->presented = true;
     uint64_t t0 = SDL_GetTicksNS();
+    if (survey_stub) goto survey_account;
     vk_end_pass();
     g_present_split[1] += SDL_GetTicksNS() - t0;
     t0 += pso_wait();  // (not the acquire's time)
@@ -1230,19 +1298,20 @@ static void present_locked(NvnTexture *t) {
     }
     if (have) {
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
-        // render scale + placement in the window: runtime/nvn/output_scale.c (Video page "Upscaler"). The game keeps
-        // its own 16:9 framing, fitted into the window with bars (a widened camera needs a game-specific hook).
+        // render scale + placement in the window: runtime/nvn/output_scale.c (Video page "Upscaler"). A window that
+        // isn't 16:9 shows more of the world (Video > Fill wide screens: the game's views widened, output_scale.c
+        // rt_persp), else the game's 16:9 image fitted into it with bars.
         // Fullscreen on a size the display has no mode for (runtime/window_size.c): that size, scaled to the screen.
         OutScale os;
         int iw, ih;
         if (winsize_virtual(&iw, &ih) && (iw != (int)dw || ih != (int)dh)) {
-            output_scale(iw, ih, false, &os);
+            output_scale(iw, ih, g_settings.wide_view, &os);
             output_scale_screen(dw, dh, iw, ih, &os);
         } else {
-            output_scale(dw, dh, false, &os);
+            output_scale(dw, dh, g_settings.wide_view, &os);
         }
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh;
-        float crop[4] = {0, 0, 1, 1};  // uv origin and size: the whole image
+        float crop[4] = {(float)os.crop[0], (float)os.crop[1], (float)os.crop[2], (float)os.crop[3]};  // (uv origin, size)
         renderer_set_scale((float)sx, (float)sy);
         renderer_set_scene_scale((float)os.scene_sx, (float)os.scene_sy);
         renderer_set_shadow_size(shadow_map_size(total_frames + 1));
@@ -1259,11 +1328,27 @@ static void present_locked(NvnTexture *t) {
         static long win_shot = -1;
         if (win_shot < 0) win_shot = getenv("SAVAGEWIND_WINDOW_SHOT") ? atol(getenv("SAVAGEWIND_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
-        vk_frame_end(shot ? "build/window.png" : NULL);
-        if (shot && getenv("SAVAGEWIND_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        // SAVAGEWIND_WINDOW_SHOT_AT=<frame>,... (ascending, counted as SAVAGEWIND_SHOT_AT): the window as presented
+        // (bars and menus included) -> build/frames/window_N.png
+        static const char *wnext;
+        static int winit;
+        char wpath[256] = "";
+        if (!winit) { winit = 1; wnext = getenv("SAVAGEWIND_WINDOW_SHOT_AT"); if (wnext) mkdir("build/frames", 0755); }
+        if (wnext && *wnext && !shot) {
+            extern uint64_t framepace_script_frame(uint64_t presented);
+            long at = strtol(wnext, NULL, 10);
+            if ((long)framepace_script_frame(total_frames + 1) >= at) {
+                snprintf(wpath, sizeof wpath, "build/frames/window_%05ld.png", at);
+                while (*wnext && *wnext != ',') wnext++;
+                if (*wnext == ',') wnext++;
+            }
+        }
+        vk_frame_end(shot ? "build/window.png" : wpath[0] ? wpath : NULL);
+        if (shot && getenv("SAVAGEWIND_EXIT_AFTER_SHOT")) { plat_trace_flush(); _exit(0); }
     } else {
         renderer_submit();
     }
+survey_account:;
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
     extern void vk_list_stats_frame(void);
@@ -1272,7 +1357,9 @@ static void present_locked(NvnTexture *t) {
         static int ft = -1;
         if (ft < 0) ft = getenv("SAVAGEWIND_FRAME_LOG") != NULL;
         extern int framepace_target(void);
-        if (ft) LOG("[ft] %.3f %llu %d\n", SDL_GetTicksNS() / 1e6, (unsigned long long)total_frames, framepace_target());
+        if (ft) TRACE_LOG("[ft] %.3f %llu %d\n", SDL_GetTicksNS() / 1e6, (unsigned long long)total_frames, framepace_target());
+        extern void vk_frame_trace_present(uint64_t frame, int target);
+        vk_frame_trace_present(total_frames, framepace_target());
     }
     frames++;
     total_frames++;
@@ -1368,6 +1455,14 @@ static void present_locked(NvnTexture *t) {
             if (*next == ',') next++;
         }
     }
+    if(g_vk.native_multi_draw_ab && total_frames-1 >= g_vk.native_multi_draw_ab &&
+        total_frames-1 < g_vk.native_multi_draw_ab+4) {
+        uint64_t rendered=total_frames-1;bool native=vk_native_draw_active(rendered);
+        char path[256];mkdir("build/frames",0755);
+        snprintf(path,sizeof path,"build/frames/native_ab_%05llu_%s.png",(unsigned long long)rendered,native?"native":"reference");
+        LOG("[native-multi-draw-ab] frame %llu path %s\n",(unsigned long long)rendered,native?"native":"reference");
+        renderer_save_texture_tex(b,path);
+    }
     {   // F12 (runtime/hle/input.c): every other game image -> build/frames/rec_N.png until F12 again (catches flicker
         // too short to see; the saves slow the game down meanwhile)
         extern volatile int g_record_frames;
@@ -1377,7 +1472,7 @@ static void present_locked(NvnTexture *t) {
             if (recording) mkdir("build/frames", 0755);
             LOG("[shot] recording %s at frame %llu\n", recording ? "on" : "off", (unsigned long long)total_frames);
         }
-        if (recording && !(total_frames & 1)) {
+        if (b && recording && !(total_frames & 1)) {
             char path[256];
             snprintf(path, sizeof path, "build/frames/rec_%05llu.png", (unsigned long long)total_frames);
             renderer_save_texture_tex(b, path);
@@ -1385,14 +1480,14 @@ static void present_locked(NvnTexture *t) {
     }
     static long shot_from = -1;
     if (shot_from < 0) { const char *e = getenv("SAVAGEWIND_SCREENSHOT_FROM"); shot_from = e ? atol(e) : 0; }
-    if (shot_every && total_frames % shot_every == 0 && (long)total_frames >= shot_from) {
+    if (b && shot_every && total_frames % shot_every == 0 && (long)total_frames >= shot_from) {
         char path[256];
         if (shot_from) mkdir("build/frames", 0755);
         snprintf(path, sizeof path, shot_from ? "build/frames/frame_%05llu.png" : "build/frame_%05llu.png",
                  (unsigned long long)total_frames);
         renderer_save_texture_tex(b, path);
         // a series (SCREENSHOT_FROM) runs on until SAVAGEWIND_WINDOW_SHOT exits
-        if (getenv("SAVAGEWIND_EXIT_AFTER_SHOT") && !shot_from) { fflush(stderr); _exit(0); }
+        if (getenv("SAVAGEWIND_EXIT_AFTER_SHOT") && !shot_from) { plat_trace_flush(); _exit(0); }
     }
     double now = SDL_GetTicks() / 1000.0;
     static double fps_iv = -1, prev_present, max_gap;

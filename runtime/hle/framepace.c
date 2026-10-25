@@ -97,6 +97,22 @@ static bool gui_speed_patched(void) {
     return false;
 }
 
+bool framepace_in_event(void) { return in_event(); }
+
+// The game's UI screen `id` exists (the screen manager's array; ids as runtime/ui/game_options.mm uses them)
+static bool screen_up(uint32_t id) {
+    uint64_t mgr = *(uint64_t *)(uintptr_t)g_site.screen_mgr;
+    if (!mgr || VF(uint32_t, mgr, 0x28) <= id) return false;
+    uint64_t arr = VF(uint64_t, mgr, 0x30);
+    return arr && *(uint64_t *)(uintptr_t)(arr + 8 * id);
+}
+
+// (screens: 1 the start screen, 0x38 its load and confirmation menus)
+bool framepace_title_ui(void) { return screen_up(1) || screen_up(0x38); }
+
+// (pause state 2: the pause menu's pages and the map; 4 is the quick menus over the game)
+bool framepace_menu_ui(void) { return *(uint32_t *)(uintptr_t)PAUSE_STATE == 2; }
+
 int framepace_target(void) {
     static int forced = -2, movie = -2, menu = -2, event = -2;
     if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);

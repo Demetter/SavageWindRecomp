@@ -72,11 +72,61 @@ static void wake(KThread *t) {
 }
 // (SAVAGEWIND_PROF_SVC) wakes per thread: count, signal -> its condition wait returned, -> its core taken again
 static _Atomic uint64_t wake_n[32], wake_cv_ns[32], wake_core_ns[32];
+// (SAVAGEWIND_PROF_SVC) WaitSynchronization wakes per thread that found none of its handles signalled
+static _Atomic uint64_t sync_spurious[32];
+
+// B2 wake cuts (SAVAGEWIND_B2=<bits>, default 0: as before). 1: an object's signal wakes only the threads whose
+// WaitSynchronization includes it, not every waiting thread (each woke, took its core back, found nothing and slept
+// again, and a better one took the core from the thread running there). 2: a priority change wakes only the best waiter
+// of a free core, not every waiter of all four cores (kernel_core.inc). 4: svcSleepThread(0/-1) keeps the core when no
+// thread of the same or better priority waits for it, as Horizon's yield does. SAVAGEWIND_B2_AB=1: the bits (all three
+// if SAVAGEWIND_B2 is unset) alternate with 0, OFF/ON/ON/OFF in ten-second blocks from 45 s after the first frame,
+// logged as [b2-toggle]. Each bit is read where it acts, so switching mid-run is safe.
+static int b2_bits(void) {
+    static int bits = -1, ab;
+    static uint64_t t0;
+    static int shown = INT_MIN;
+    int b = __atomic_load_n(&bits, __ATOMIC_ACQUIRE);
+    if (b < 0) {
+        const char *e = getenv("SAVAGEWIND_B2_AB");
+        ab = e && atoi(e);
+        e = getenv("SAVAGEWIND_B2");
+        b = e ? atoi(e) & 7 : ab ? 7 : 0;
+        __atomic_store_n(&bits, b, __ATOMIC_RELEASE);
+        if (b) LOG("[b2] wake cuts %d%s\n", b, ab ? " (AB)" : "");
+    }
+    if (!ab || !b) return b;
+    extern uint64_t renderer_present_count(void);
+    uint64_t now = plat_now_ns(), start = __atomic_load_n(&t0, __ATOMIC_RELAXED);
+    if (!start) {
+        if (!renderer_present_count()) return 0;
+        uint64_t zero = 0;
+        __atomic_compare_exchange_n(&t0, &zero, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        start = __atomic_load_n(&t0, __ATOMIC_RELAXED);
+    }
+    uint64_t sec = (now > start ? now - start : 0) / 1000000000ull;
+    int block = sec < 45 ? -1 : (int)((sec - 45) / 10);
+    bool on = block >= 0 && (block % 4 == 1 || block % 4 == 2);
+    if (__atomic_load_n(&shown, __ATOMIC_RELAXED) != block && __atomic_exchange_n(&shown, block, __ATOMIC_RELAXED) != block)
+        LOG("[b2-toggle] ns %llu frame %llu block %d on %d\n", (unsigned long long)now,
+            (unsigned long long)renderer_present_count(), block, on);
+    return on ? b : 0;
+}
+
+// Whether t's WaitSynchronization includes o. Caller holds g_klock.
+static bool sync_waits_for(const KThread *t, const KObject *o) {
+    if (t->sync_nobj < 0) return true;
+    for (int i = 0; i < t->sync_nobj; i++)
+        if (t->sync_obj[i] == o) return true;
+    return false;
+}
 
 void kernel_signal(KObject *o) {
     // caller holds g_klock
     o->signaled = true;
-    for (KThread *t = g_syncwaiters; t; t = t->snext) wake(t);
+    bool only_its = b2_bits() & 1;
+    for (KThread *t = g_syncwaiters; t; t = t->snext)
+        if (!only_its || sync_waits_for(t, o)) wake(t);
 }
 
 // ------------------------------------------------------------------ time
@@ -108,75 +158,8 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 // number, then first come); a thread that sees a better one waiting for its core at a syscall gives it up.
 // Generated code has no preemption points of its own, so a long stretch without syscalls keeps the core.
 // SAVAGEWIND_CORES=0 lets every thread run at once, as before.
-typedef struct {
-    pthread_mutex_t m;
-    pthread_cond_t cv;
-    KThread *owner;
-    KThread *waiting[64];
-    int nwaiting;
-    uint64_t next_ticket;
-} Core;
-static Core g_cores[4] = {
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-};
-static int g_cores_on = -1;
-// The best (lowest) priority among the threads waiting for each core, INT_MAX with none: what dispatch.c checks at every
-// indirect call (kernel_preempt). SAVAGEWIND_NO_PREEMPT=1: kept at INT_MAX (preemption at syscalls only, as before).
-volatile int g_core_best_wait[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
-static void core_best_update(Core *k) {  // (k->m held)
-    static int off = -1;
-    if (off < 0) off = getenv("SAVAGEWIND_NO_PREEMPT") != NULL;
-    int best = INT_MAX;
-    for (int i = 0; i < k->nwaiting && !off; i++)
-        if (k->waiting[i]->prio < best) best = k->waiting[i]->prio;
-    __atomic_store_n(&g_core_best_wait[k - g_cores], best, __ATOMIC_RELAXED);
-}
-
-static bool cores_on(void) {
-    if (g_cores_on < 0) g_cores_on = !(getenv("SAVAGEWIND_CORES") && !strcmp(getenv("SAVAGEWIND_CORES"), "0"));
-    return g_cores_on;
-}
-
-// Whether t is the waiter that gets the core next. Caller holds k->m.
-static bool core_next(Core *k, KThread *t) {
-    for (int i = 0; i < k->nwaiting; i++) {
-        KThread *o = k->waiting[i];
-        if (o != t && (o->prio < t->prio || (o->prio == t->prio && o->core_ticket < t->core_ticket))) return false;
-    }
-    return true;
-}
-
-static void core_acquire(KThread *t) {
-    if (!t || !cores_on() || t->core_held >= 0 || t->off_cores) return;
-    static int one_core = -1;  // (debug) SAVAGEWIND_ONE_CORE=1: every thread on core 0, one guest thread at a time
-    if (one_core < 0) one_core = getenv("SAVAGEWIND_ONE_CORE") != NULL;
-    int idx = one_core ? 0 : t->core & 3;
-    Core *k = &g_cores[idx];
-    pthread_mutex_lock(&k->m);
-    t->core_ticket = k->next_ticket++;
-    if (k->nwaiting < 64) k->waiting[k->nwaiting++] = t;
-    core_best_update(k);
-    while ((k->owner || !core_next(k, t)) && !g_rt_unwind) pthread_cond_wait(&k->cv, &k->m);
-    for (int i = 0; i < k->nwaiting; i++)
-        if (k->waiting[i] == t) { k->waiting[i] = k->waiting[--k->nwaiting]; break; }
-    core_best_update(k);
-    if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
-    t->core_held = k->owner == t ? idx : -1;
-    pthread_mutex_unlock(&k->m);
-}
-
-static void core_release(KThread *t) {
-    if (!t || t->core_held < 0) return;
-    Core *k = &g_cores[t->core_held];
-    pthread_mutex_lock(&k->m);
-    if (k->owner == t) k->owner = NULL;
-    t->core_held = -1;
-    pthread_cond_broadcast(&k->cv);
-    pthread_mutex_unlock(&k->m);
-}
+#define CORE_B2_BITS() b2_bits()
+#include "kernel_core.inc"
 
 // A thread that does a coprocessor's work runs beside the four cores, as on the console: the in-process audio
 // renderer (runtime/services/audio.c) is the audio DSP's. Waiting for a core token behind the game's threads, it
@@ -235,8 +218,21 @@ void kernel_preempt(KThread *t) {
 }
 
 // svcSleepThread(0) and friends: let the threads of the same priority waiting for this core go first.
-static void core_yield(KThread *t) {
+// (B2 bit 4) With none of those waiting, 0 and -1 (same priority, with or without migration) keep the core: letting it
+// go woke the best waiter, a worse one, which then mostly found the core taken back. -2 (any thread) lets it go as before.
+static void core_yield(KThread *t, int64_t ns) {
     if (!t || t->core_held < 0) { sched_yield(); return; }
+    if (ns >= -1 && (b2_bits() & 4)) {
+        Core *k = &g_cores[t->core_held];
+        bool turn = false;
+        if (__atomic_load_n(&k->nwaiting, __ATOMIC_RELAXED) || __atomic_load_n(&k->overflow, __ATOMIC_RELAXED)) {
+            pthread_mutex_lock(&k->m);
+            turn = k->overflow > 0;
+            for (int i = 0; i < k->nwaiting && !turn; i++) turn = k->waiting[i]->prio <= t->prio;
+            pthread_mutex_unlock(&k->m);
+        }
+        if (!turn) return;
+    }
     core_release(t);
     core_acquire(t);
 }
@@ -358,7 +354,15 @@ static pthread_t g_host_threads[4];  // (profiling) host threads the sampler tak
 static int g_nhost_threads;
 void kernel_sample_host_thread(void) {
     pthread_mutex_lock(&g_klock);
-    if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
+    if (g_nhost_threads < 4) {
+#ifdef _WIN32
+        // Detached winpthreads do not retain a usable pthread_gethandle(). The
+        // sampler holds its own native handle while this thread is still alive.
+        extern void sampler_register_host_thread(unsigned index);
+        sampler_register_host_thread((unsigned)g_nhost_threads);
+#endif
+        g_host_threads[g_nhost_threads++] = pthread_self();
+    }
     pthread_mutex_unlock(&g_klock);
 }
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
@@ -394,6 +398,7 @@ static void *thread_main(void *arg) {
 static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int prio, int core) {
     KThread *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cond, NULL);
+    pthread_cond_init(&t->core_cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
     t->prio = t->base_prio = prio;
@@ -475,11 +480,7 @@ static void prio_set(KThread *t, int p) {
     if (t->prio == p) return;
     t->prio = p;
     if (!cores_on() || t->off_cores) return;
-    Core *k = &g_cores[t->core & 3];  // (waiting for its core or holding it: the waiters' order and the best wait change)
-    pthread_mutex_lock(&k->m);
-    core_best_update(k);
-    pthread_cond_broadcast(&k->cv);
-    pthread_mutex_unlock(&k->m);
+    core_priority_changed(t);
 }
 
 static uint32_t mutex_owner(uint64_t addr) { return __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST) & ~WAITERS_BIT; }
@@ -769,6 +770,7 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
                 plat_print_backtrace();
             }
     }
+    bool woken = false;
     for (;;) {
         for (int i = 0; i < count; i++) {
             KObject *o = handle_get(hs[i]);
@@ -784,8 +786,11 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         }
         if (t->cancel) { t->cancel = false; r = R_CANCELLED; goto out; }
         if (g_rt_unwind) { r = R_CANCELLED; goto out; }
+        if (woken && prof_svc > 0) sync_spurious[t->id & 31]++;
         if (timeout == 0) { r = R_TIMEOUT; goto out; }
         t->in_sync_wait = true;
+        t->sync_nobj = count <= 64 ? count : -1;
+        for (int i = 0; i < count && i < 64; i++) t->sync_obj[i] = handle_get(hs[i]);
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
         extern bool nvn_timeline(void);
@@ -798,6 +803,7 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
             if (*p == t) { *p = t->snext; break; }
         t->in_sync_wait = false;
         if (!ok) { r = R_TIMEOUT; goto out; }
+        woken = true;
     }
 out:
     pthread_mutex_unlock(&g_klock);
@@ -863,6 +869,10 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
                     LOG(" | wakes %llu: signal->running %.1f us + core %.1f us avg", (unsigned long long)wake_n[t],
                         wake_cv_ns[t] / 1e3 / wake_n[t], wake_core_ns[t] / 1e3 / wake_n[t]);
                     wake_n[t] = wake_cv_ns[t] = wake_core_ns[t] = 0;
+                }
+                if (any && sync_spurious[t]) {
+                    LOG(" | waitsync wakes with nothing signalled %llu", (unsigned long long)sync_spurious[t]);
+                    sync_spurious[t] = 0;
                 }
                 if (any) LOG("\n");
             }
@@ -931,7 +941,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x0A: longjmp(t_cur->unwind, 1);  // ExitThread: back to thread_main, which signals the thread object
     case 0x0B: {  // SleepThread (in slices of at most 50 ms: a reboot doesn't wait out a long sleep)
         int64_t ns = (int64_t)x[0];
-        if (ns <= 0) { core_yield(t_cur); break; }
+        if (ns <= 0) { core_yield(t_cur, ns); break; }
         core_release(t_cur);
         for (uint64_t end = plat_now_ns() + (uint64_t)ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
             uint64_t d = end - now < 50000000 ? end - now : 50000000;
@@ -1142,7 +1152,7 @@ void kernel_stop_threads(void (*idle)(void)) {
         pthread_mutex_unlock(&g_klock);
         for (int i = 0; i < 4; i++) {  // threads waiting for a core run on to their next safe point
             pthread_mutex_lock(&g_cores[i].m);
-            pthread_cond_broadcast(&g_cores[i].cv);
+            core_wake_all(&g_cores[i]);
             pthread_mutex_unlock(&g_cores[i].m);
         }
         if (!live) break;
@@ -1172,6 +1182,7 @@ void kernel_reset(void) {
     for (KThread *t = g_threads, *next; t; t = next) {
         next = t->anext;
         pthread_cond_destroy(&t->cond);
+        pthread_cond_destroy(&t->core_cond);
         free(t);
     }
     g_threads = NULL;
@@ -1185,6 +1196,7 @@ void kernel_reset(void) {
     for (int i = 0; i < 4; i++) {
         g_cores[i].owner = NULL;
         g_cores[i].nwaiting = 0;
+        g_cores[i].overflow = 0;
     }
     g_rt_unwind = 0;
     pthread_mutex_unlock(&g_klock);
@@ -1197,6 +1209,20 @@ static bool guest_mapped(uint64_t a, uint64_t n) {
     for (int i = 0; i < nregions; i++)
         if (a >= regions[i].addr && a + n <= regions[i].addr + regions[i].size) return true;
     return false;
+}
+
+// Current SDK ThreadType: verified from this build's GetThreadNamePointer and thread entry.
+bool kernel_survey_thread_name(KThread *t, char *out, size_t cap) {
+    bool ok = false;
+    pthread_mutex_lock(&g_klock);
+    uint64_t object = 0, name = 0;
+    if (guest_mapped(t->tlr + 0x1f8, 8)) memcpy(&object, (void *)(uintptr_t)(t->tlr + 0x1f8), 8);
+    if (object && guest_mapped(object + 0x1a0, 8)) memcpy(&name, (void *)(uintptr_t)(object + 0x1a0), 8);
+    if (name && cap && guest_mapped(name, cap)) {
+        memcpy(out, (void *)(uintptr_t)name, cap - 1); out[cap - 1] = 0; ok = true;
+    }
+    pthread_mutex_unlock(&g_klock);
+    return ok;
 }
 
 // The current guest thread's lr and frame-record chain as of its last call boundary (dispatch.c, SAVAGEWIND_WATCH:

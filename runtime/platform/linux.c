@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../gamelib.h"
 #include "../platform.h"
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -37,6 +38,8 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
 
 // (no page write tracking here: the Vulkan backend's heap copy in video memory stays off and draws read the heap)
 size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) { return SIZE_MAX; }
+size_t plat_peek_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) { return SIZE_MAX; }
+bool plat_reset_written_pages(uint64_t addr, uint64_t size) { return false; }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
@@ -97,19 +100,14 @@ static void log_to_file_without_terminal(void) {
     setenv("SAVAGEWIND_LOG_APPEND", "1", 1);
 }
 
-#if defined(__x86_64__)
-// The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
-// with an illegal instruction on an older CPU.
+// The recompiled game code is built for a target this CPU runs (runtime/gamelib.h): say so instead of crashing with an
+// illegal instruction on a CPU too old for any.
 static void require_cpu(void) {
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    fprintf(stderr, "FATAL: Savage Wind needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
-                    "newer).\n");
+    const char *need = gamelib_cpu_problem();
+    if (!need) return;
+    fprintf(stderr, "FATAL: Savage Wind needs %s.\n", need);
     exit(1);
 }
-#else
-static void require_cpu(void) {}
-#endif
 
 void plat_init(void) {
     log_to_file_without_terminal();

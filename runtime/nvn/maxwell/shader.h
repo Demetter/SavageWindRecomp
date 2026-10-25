@@ -42,6 +42,7 @@ typedef struct {
     uint8_t rt_kind[8];     // fragment outputs: 0 float, 1 signed int, 2 unsigned int
     bool depth_minus_one;   // NVN depth mode [-1,1]: remap clip z
     bool flip_y;            // lower-left window origin
+    bool cube_layer;        // Vulkan cubemap filter: route each draw to the face in c[3].word[1]
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint32_t shared_size;   // compute: shared memory bytes (from the program's control section)
@@ -94,6 +95,8 @@ void maxwell_free(ShaderInfo *s);
 // translator's build, and whether debugging switches make the output depend on more than binary and key.
 size_t maxwell_binary_size(const uint8_t *code, size_t max_size, int stage);
 const char *maxwell_translator_id(void);
+// Cacheable translation policy, separate from switches that disable the cache.
+uint32_t maxwell_translation_policy(void);
 bool maxwell_translation_uncacheable(void);
 // Disassemble for debugging (writes text to f).
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);

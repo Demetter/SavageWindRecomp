@@ -21,6 +21,12 @@
 #include "../maxwell/shader.h"
 
 void vk_device_fault_report(void);
+void vk_texture_trace_frame(uint64_t frame);
+// DLSS (dlss.c; swdlss.dll next to the executable): extensions for the instance and the device, NGX on the device
+void dlss_instance_extensions(const char **ext, uint32_t *n, uint32_t cap);
+bool dlss_device_extensions(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t cap);
+void dlss_device_init(void);
+bool dlss_available(void);
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_fault_report(); \
     FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } } while (0)
 
@@ -39,14 +45,21 @@ typedef struct {
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, wide_lines;
     bool feat_aniso;  // samplerAnisotropy (Video > Anisotropic filtering)
+    bool output_layer;        // vertex shaders can select a layered rendering attachment's face
     bool depth_clamp;          // depthClamp feature (nvnCommandBufferSetDepthClamp: shadow maps keep occluders before the near plane)
+    bool depth_range_unrestricted; // preserve float comparison texture values outside [0,1] in D32 copies
     bool occlusion_precise;    // occlusionQueryPrecise: SAMPLES_PASSED counts samples, not just "any"
     bool feedback_loop;        // attachment feedback loops + barriers inside dynamic rendering (exec.c)
     bool feedback_layout;      // ... in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL layout (no VK_KHR_unified_image_layouts: GENERAL otherwise)
     bool gpl;                  // graphics pipeline libraries with fast linking (exec.c)
+    bool gpl_lto;              // opt-in optimized GPU linking; all four libraries retain optimization data
     bool dmabuf;               // memory exported as dma-bufs (Linux: the guest heap, exec.c backend_heap_set)
     bool radv;                 // the driver is Mesa's RADV
     bool present_wait;         // VK_KHR_present_id + present_wait on (SAVAGEWIND_LOG_PRESENT: when frames are shown)
+    uint8_t calibrated_time;   // diagnostic clock correlation: 1 KHR, 2 EXT, 0 unavailable/off
+    bool pipeline_stats;       // opt-in native compiler statistics (not hardware counters)
+    uint8_t native_multi_draw; // 0 off, 1 both stages, 2 vertex only; guarded BDA/MDI pilot
+    uint64_t native_multi_draw_ab; // diagnostic: alternate paths for four adjacent frames
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -58,6 +71,10 @@ typedef struct {
     VkImageView sc_views[8];
 } VkG;
 extern VkG g_vk;
+static inline bool vk_native_draw_active(uint64_t frame) {
+    return g_vk.native_multi_draw && (!g_vk.native_multi_draw_ab ||
+        frame < g_vk.native_multi_draw_ab || frame >= g_vk.native_multi_draw_ab + 4 || (frame & 1));
+}
 
 // ---- submissions (exec.c)
 // Work is recorded into the current command buffer; uploads go into a separate one that runs first.
@@ -86,6 +103,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2, RS_SHADOW = 3 };
 
 typedef struct TexBackend {
+    struct DepthMirror *comparison;  // optional native depth copy of a color comparison texture
     VkImage image;
     VmaAllocation mem;
     VkFormat format;
@@ -98,6 +116,7 @@ typedef struct TexBackend {
     bool feedback_seen;      // a draw sampled it while writing it: its passes begin with the feedback loop enabled
     bool in_feedback_layout; // in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL now (g_vk.feedback_layout: a pass that loops, exec.c)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint64_t sample_hash_reference; // diagnostic original-hash change oracle
     bool scalable, presented;
     bool target_logged;          // (SAVAGEWIND_LOG_TARGETS: listed once)
     uint8_t rs_group;            // RS_*: which output scale its allocation follows (textures.c)
@@ -129,6 +148,12 @@ VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 // View of t (optionally through an NVN texture view) for rendering or sampling.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype);
+bool vk_depth_mirror_on(void);
+extern bool vk_depth_mirror_enabled;
+void vk_depth_mirror_invalidate(NvnTexture *t);  // NULL: unknown image write; aliases share the backend
+bool vk_depth_mirror_prepare(NvnTexture *t);    // outside the next draw/dispatch, may end the preceding pass
+void vk_depth_mirror_mark(VkCommandBuffer cb, uint32_t width, uint32_t height, uint32_t layers, bool done);
+VkImageView vk_depth_mirror_view(NvnTexture *t, const NvnTextureView *v, bool has_view, int type);
 VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v);  // (a colour texture's, sampled)
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);

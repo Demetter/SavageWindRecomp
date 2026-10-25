@@ -47,7 +47,6 @@ GENFLAGS += -fdenormal-fp-math=dynamic
 # The game code (made by `make gen` from your own game files) is its own library next to the app (runtime/gamelib.h);
 # the app itself holds none of it. $(GEN)/layout.c, then a folder per module (main, subsdk*, sdk)
 GEN_SRC  := $(wildcard $(GEN)/*.c) $(wildcard $(GEN)/*/*.c)
-GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/obj/tools/gamelib_entry.o
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
 RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
@@ -76,6 +75,7 @@ EXE      := $(B)/savagewind
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include,$(shell pkg-config --cflags libavformat 2>/dev/null))  # (openSUSE has them in /usr/include/ffmpeg)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
+GENARCH_COMPAT ?= -march=x86-64-v2  # CPUs without them (GAMELIB_ID_COMPAT below)
 endif
 GENFLAGS += $(GENARCH) -fPIC
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
@@ -104,7 +104,8 @@ else
 EXE      := $(B)/savagewind.exe
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S -DWIN32_LEAN_AND_MEAN -DNOMINMAX
-GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h); override for older CPUs
+GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h)
+GENARCH_COMPAT ?= -march=x86-64-v2  # CPUs without them (GAMELIB_ID_COMPAT below)
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
             -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -l:libz.a \
@@ -124,13 +125,46 @@ GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
 CONFIG_EXE := $(B)/savagewind-config.exe
 endif
 
+# Cross-unit optimization of the lifted CPU code. Windows is the measured target;
+# other platforms retain their existing default. GENLTO=0 is the rollback.
+GENLTO ?= $(if $(filter windows,$(PLATFORM)),1,0)
+LTO_JOBS ?= 4
+ifeq ($(GENLTO),1)
+GENFLAGS += -flto=thin
+GAMELIB_LTOFLAGS := -flto=thin -Wl,--lto-O2 -Wl,--thinlto-jobs=$(LTO_JOBS)
+GAMELIB_LDFLAGS += $(GAMELIB_LTOFLAGS) -Wl,--thinlto-cache-dir=$(B)/game-lto-cache
+GAMELIB_CLANG_LINK_FLAGS := -fuse-ld=lld $(GAMELIB_LTOFLAGS)
+# zig cc parses linker arguments itself; GNU --lto-O2 / --thinlto-jobs are rejected.
+# The packaged slim compiler calls lld-link directly, with the explicit flags below.
+# Feed already-produced bitcode to LLD, without applying -flto to Zig's own
+# MinGW CRT build (0.17.0 otherwise loses runtime export aliases at the link).
+GAMELIB_ZIG_LINK_FLAGS := -O2
+GAMELIB_LLD_FLAGS := -opt:lldlto=2 -opt:lldltojobs=$(LTO_JOBS)
+endif
+
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
 # flags). A library with another id is rebuilt by the start screen, never loaded.
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
-                runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
+                runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h
 GAMELIB_SRCS += tools/layout.py tools/game_sites.py
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+# Never mix native objects and ThinLTO bitcode after a flag/ABI change (including
+# switching back). Each game library identity owns its complete object set.
+GEN_OBJDIR := $(B)/obj-$(GAMELIB_ID)
+GEN_OBJ := $(patsubst %.c,$(GEN_OBJDIR)/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(GEN_OBJDIR)/tools/gamelib_entry.o
+# The compatible target (#9): x86-64 CPUs without AVX2 / FMA / BMI2 get the game code built with GENARCH_COMPAT in
+# place of GENARCH (no -mfma: simd.h's fma is runtime/simd_softfma.h, slower). The start screen builds the one the CPU
+# runs (runtime/gamelib.h gamelib_compat); its id differs, so neither library is ever loaded in place of the other.
+# `make` builds the GENARCH one.
+ifneq ($(strip $(GENARCH)),)
+ifneq ($(strip $(GENARCH_COMPAT)),)
+GENFLAGS_COMPAT := $(subst $(strip $(GENARCH)),$(strip $(GENARCH_COMPAT)),$(GENFLAGS))
+GAMELIB_ID_COMPAT := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS_COMPAT)'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GAMELIB_TARGETS := -DGAMELIB_ARCH='"$(strip $(GENARCH))"' -DGAMELIB_ARCH_COMPAT='"$(strip $(GENARCH_COMPAT))"' \
+                   -DGAMELIB_ID_COMPAT='"$(GAMELIB_ID_COMPAT)"'
+endif
+endif
 
 # TRANSLATOR_ID / SPIRV_ID: what translated shaders and their SPIR-V are made from (the Maxwell translator, the
 # GLSL -> SPIR-V step). The shader caches (cache/xlate, cache/spirv, the pipeline cache and list) are kept while these
@@ -138,6 +172,7 @@ GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)'; echo '$(GENFLAGS
 TRANSLATOR_SRCS := runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 TRANSLATOR_ID := $(shell cat $(TRANSLATOR_SRCS) | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 SPIRV_ID := $(shell cat runtime/nvn/vulkan/spirv.c | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+CONSTANTS_ID := $(shell cat runtime/nvn/vulkan/shader_constants.c runtime/nvn/vulkan/shader_constants.h | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb $(DEPINC) $(OSFLAGS)
@@ -145,23 +180,33 @@ CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime
 
 all: $(EXE) $(CONFIG_EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (GEN_SRC is a space when there is no generated/)
 
-$(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h  # (cpu.h includes both)
+$(GEN_OBJDIR)/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h  # (cpu.h includes them)
 	@mkdir -p $(dir $@)
 	@$(CC) $(GENFLAGS) -c $< -o $@
-$(B)/obj/layout.o: runtime/gamelib.h
+$(GEN_OBJDIR)/layout.o: runtime/gamelib.h
 
-$(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS)
+$(GEN_OBJDIR)/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -c $< -o $@
 $(B)/rt/nvn/maxwell/translate.o: RTFLAGS += -DTRANSLATOR_ID='"$(TRANSLATOR_ID)"'
 $(B)/rt/nvn/vulkan/spirv.o: RTFLAGS += -DSPIRV_ID='"$(SPIRV_ID)"'
-$(B)/rt/gamelib.o: $(GAMELIB_SRCS)
-$(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"'
+$(B)/rt/nvn/vulkan/shaders.o: runtime/nvn/vulkan/shader_constants.c
+$(B)/rt/nvn/vulkan/exec.o: runtime/nvn/vulkan/shader_heap_cache.inc runtime/nvn/vulkan/compute_heap_cache.inc runtime/nvn/vulkan/compute_shader_opt.inc runtime/nvn/vulkan/geometry_watch.h runtime/nvn/vulkan/write_watch_parallel.h
+$(B)/rt/nvn/objects.o: runtime/nvn/texture_registry.h
+$(B)/rt/nvn/vulkan/textures.o: runtime/nvn/vulkan/depth_mirror.h
+$(B)/rt/nvn/vulkan/shaders.o: RTFLAGS += -DCONSTANTS_ID='"$(CONSTANTS_ID)"'
+$(B)/rt/gamelib.o: $(GAMELIB_SRCS) Makefile
+$(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' $(GAMELIB_TARGETS)
 # the start screen's build of it (runtime/gamebuild.c) uses the same flags
 $(B)/rt/gamebuild.o: $(GAMELIB_SRCS) Makefile
-$(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_CFLAGS='"$(strip $(filter-out -Iruntime,$(GENFLAGS)))"' \
-                                -DGAMELIB_ZIGFLAGS='"$(GENFLAGS_ZIG)"' \
-                                -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
+$(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_CFLAGS='"$(strip $(filter-out -Iruntime,$(GENFLAGS)))"' \
+                                $(if $(GENFLAGS_COMPAT),-DGAMELIB_CFLAGS_COMPAT='"$(strip $(filter-out -Iruntime,$(GENFLAGS_COMPAT)))"') \
+                                -DGAMELIB_ZIGFLAGS='"$(GENFLAGS_ZIG)"' -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"' \
+                                -DGAMELIB_LLD_FLAGS='"$(GAMELIB_LLD_FLAGS)"' \
+                                -DGAMELIB_CLANG_LINK_FLAGS='"$(GAMELIB_CLANG_LINK_FLAGS)"' \
+                                -DGAMELIB_ZIG_LINK_FLAGS='"$(GAMELIB_ZIG_LINK_FLAGS)"'
+
+$(B)/rt/kernel.o: runtime/kernel_core.inc
 
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
@@ -193,10 +238,16 @@ $(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
 	mv -f $(dir $@)link/$(notdir $@) $@
 
 # its id file (<library>.id) says what it was built from without loading it (runtime/gamelib.c)
-$(GAMELIB): $(GEN_OBJ) | $(EXE)
-	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $^
+$(GEN_OBJDIR)/$(notdir $(GAMELIB)): $(GEN_OBJ) | $(EXE)
+	$(file >$(B)/game-link.rsp,$(foreach obj,$(GEN_OBJ),"$(obj)"))
+	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp @$(B)/game-link.rsp
 	mv -f $@.tmp $@
-	echo $(GAMELIB_ID) > $@.id
+
+.PHONY: game-library-select
+game-library-select:
+$(GAMELIB): $(GEN_OBJDIR)/$(notdir $(GAMELIB)) game-library-select
+	@if [ "$$(cat $@.id 2>/dev/null)" != "$(GAMELIB_ID)" ] || [ "$<" -nt "$@" ]; then \
+	    cp "$<" "$@.tmp" && mv -f "$@.tmp" "$@" && echo $(GAMELIB_ID) > "$@.id"; fi
 
 $(B)/rt/ui/i18n.o: $(wildcard runtime/ui/i18n/*.inc) runtime/ui/i18n.h
 $(B)/rt/ui/%.o: runtime/ui/%.mm $(RT_HDRS)
@@ -226,6 +277,16 @@ gen-objs: $(GEN_OBJ)
 
 # Runtime objects only (no generated code, no link): quick compile check
 runtime-objs: $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ)
+
+# The scheduler test uses the same arbitration as kernel.c, without game files.
+CORE_TEST := $(B)/tests/core-handoff$(if $(filter windows,$(PLATFORM)),.exe)
+$(CORE_TEST): tools/test_core_handoff.c runtime/kernel_core.inc $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -Wall -Wno-unused-function -Wno-missing-field-initializers -Iruntime $< -o $@ -lpthread
+.PHONY: test-core-handoff
+test-core-handoff: $(CORE_TEST)
+	SAVAGEWIND_CORE_DIRECT_WAKE=0 $(CORE_TEST)
+	SAVAGEWIND_CORE_DIRECT_WAKE=1 $(CORE_TEST)
 
 $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico
 	@mkdir -p $(dir $@)
@@ -263,7 +324,7 @@ dmg: app
 # (RELEASE=1: the log goes to savagewind.log next to the exe, fatal errors show a message box). Its DLLs are looked up
 # with build/deps-win/bin first (the FFmpeg DLL names are the same as MSYS2's GPL ones). vulkan-1.dll is left
 # out: every Vulkan driver installs the loader in System32. Saves and game files go next to the exe at run time.
-# Needs: Windows 10+ x64, a Vulkan 1.3 driver, an AVX2 CPU (GENARCH x86-64-v3; checked at startup).
+# Needs: Windows 10+ x64, a Vulkan 1.3 driver, an SSE4.2 CPU (GENARCH_COMPAT x86-64-v2; checked at startup).
 DIST     := build/dist/Savage Wind
 WIN_B    := build/win-release
 deps-windows:
@@ -279,11 +340,12 @@ dist:
 	rm -rf build/dist && mkdir -p "$(DIST)/gamelib-src"
 	cp $(WIN_B)/savagewind.exe $(WIN_B)/savagewind.dll.a "$(DIST)/"
 	cp $(WIN_B)/savagewind-config.exe "$(DIST)/Savage Wind Configuration.exe"
-	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS)))  # (zig with its runtime built ahead of time)
+	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS))) \
+	    $(if $(GENFLAGS_COMPAT),-- $(strip $(filter-out -Iruntime,$(GENFLAGS_COMPAT))))  # (zig, its runtime built ahead of time)
 	cp -R build/helper/swgen "$(DIST)/"
 	cp -R build/zig-slim "$(DIST)/zig"
-	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
-	    "$(DIST)/gamelib-src/"
+	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c \
+	    runtime/hle/hle_symbols.txt "$(DIST)/gamelib-src/"
 	cp docs/icon/icon_1024.png "$(DIST)/icon.png"
 	cp third_party/fonts/FiraSans/FiraSans-SemiBold.ttf third_party/fonts/FiraSans/FiraSans-Medium.ttf "$(DIST)/"  # (menus, OFL)
 	cp third_party/fonts/FiraSans/OFL.txt "$(DIST)/FiraSans-OFL.txt"

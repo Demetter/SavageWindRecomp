@@ -11,6 +11,10 @@
 
 #include "../shader_archive.h"
 #include "shaders.h"
+#include "shader_constants.h"
+#ifndef CONSTANTS_ID
+#define CONSTANTS_ID __DATE__ " " __TIME__
+#endif
 
 // What the translated shaders depend on besides their binaries: the translator's sources (maxwell_translator_id)
 // and the GLSL -> SPIR-V step's (vk_spirv_id). Caches built from translated shaders (cache/xlate, the pipeline cache,
@@ -18,7 +22,7 @@
 // builds that do not change them keep the caches.
 const char *vk_shader_version(void) {
     static char v[64];
-    if (!v[0]) snprintf(v, sizeof v, "%s/%s", maxwell_translator_id(), vk_spirv_id());
+    if (!v[0]) snprintf(v, sizeof v, "%s/%s/p%u", maxwell_translator_id(), vk_spirv_id(), maxwell_translation_policy());
     return v;
 }
 
@@ -43,7 +47,7 @@ void vk_cache_path(char *out, size_t n, const char *name) {
 // disk as cache/xlate/<hash>.bin, so a shader seen in an earlier session costs a file read. The hash covers the bytes
 // the translator reads, the key and the translator's build (a new build of translate.c starts over).
 // The hash is also the translation's id (vk_translate_id): the pipeline list (exec.c) names shaders by it.
-typedef struct { char magic[4]; uint32_t info_size, msl_len, bin_size; ShaderKey key; int32_t stage; } XlateHeader;
+typedef struct { char magic[4]; uint32_t info_size, msl_len, bin_size; ShaderKey key; int32_t stage; uint32_t policy; } XlateHeader;
 #define XLATE_TAB 16384
 static struct { uint64_t h; ShaderInfo *si; } xlate_tab[XLATE_TAB];
 static struct { const ShaderInfo *si; uint64_t h; } xlate_ids[XLATE_TAB];  // the other way round
@@ -76,9 +80,10 @@ static ShaderInfo *xlate_load(uint64_t h, const XlateHeader *want, int stage) {
     bool ok = fread(&hd, sizeof hd, 1, f) == 1 && hd.msl_len < (64u << 20);
     if (ok && want)
         ok = !memcmp(&hd, want, offsetof(XlateHeader, msl_len)) && hd.bin_size == want->bin_size &&
-             !memcmp(&hd.key, &want->key, sizeof hd.key) && hd.stage == want->stage;
+             !memcmp(&hd.key, &want->key, sizeof hd.key) && hd.stage == want->stage && hd.policy == want->policy;
     else if (ok)
-        ok = !memcmp(hd.magic, "SWX2", 4) && hd.info_size == sizeof(ShaderInfo) && hd.stage == stage && hd.msl_len;
+        ok = !memcmp(hd.magic, "SWX3", 4) && hd.info_size == sizeof(ShaderInfo) && hd.stage == stage && hd.msl_len &&
+             hd.policy == maxwell_translation_policy();
     uint32_t zn = 0;
     if (ok) {
         si = malloc(sizeof *si);
@@ -402,11 +407,12 @@ int vk_keylog_read(VkKeyLogEntry **out) {
 // The translation's id (its cache/xlate name) and the header its file has
 static uint64_t xlate_id(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key, XlateHeader *hd) {
     memset(hd, 0, sizeof *hd);
-    memcpy(hd->magic, "SWX2", 4);
+    memcpy(hd->magic, "SWX3", 4);
     hd->info_size = sizeof(ShaderInfo);
     hd->bin_size = (uint32_t)maxwell_binary_size(code, max_size, stage);
     hd->key = *key;
     hd->stage = stage;
+    hd->policy = maxwell_translation_policy();
     const char *id = maxwell_translator_id();
     uint64_t h = hash64(0xcbf29ce484222325ull, id, strlen(id));
     h = hash64(h, hd, sizeof *hd);
@@ -496,6 +502,68 @@ ShaderInfo *vk_translate_cached(const uint8_t *code, size_t max_size, int stage,
         hd.msl_len = (uint32_t)strlen(si->msl);
         xlate_store(h, &hd, si);
     }
+    pthread_mutex_lock(&xlate_lock);
+    si = xlate_keep(h, si);
+    pthread_mutex_unlock(&xlate_lock);
+    return si;
+}
+
+static pthread_once_t constants_once = PTHREAD_ONCE_INIT;
+static bool constants_enabled;
+static void constants_init(void) {
+    const char *e = getenv("SAVAGEWIND_VK_SHADER_CONSTANTS");
+    // Exact-bit compiler constants expose folding to the PC shader compiler.
+    // SAVAGEWIND_VK_SHADER_CONSTANTS=0 retains the original uniform path.
+    constants_enabled = !e || atoi(e) != 0;
+}
+bool vk_shader_constants_on(void) {
+    pthread_once(&constants_once, constants_init);
+    return constants_enabled;
+}
+
+static ShaderInfo *xlate_peek_id(uint64_t h) {
+    pthread_mutex_lock(&xlate_lock);
+    uint32_t slot = (uint32_t)h & (XLATE_TAB - 1), probes = 0;
+    while (xlate_tab[slot].h && xlate_tab[slot].h != h && probes++ < XLATE_TAB) slot = (slot + 1) & (XLATE_TAB - 1);
+    ShaderInfo *si = xlate_tab[slot].h == h ? xlate_tab[slot].si : NULL;
+    pthread_mutex_unlock(&xlate_lock);
+    return si;
+}
+
+ShaderInfo *vk_translate_program(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key,
+                                 const uint8_t *constants, uint32_t size, bool peek) {
+    if (!vk_shader_constants_on() || !constants || !size || size > 65536 || (size & 3) || xlate_off())
+        return peek ? vk_translate_peek(code, max_size, stage, key) : vk_translate_cached(code, max_size, stage, key);
+    XlateHeader hd;
+    uint64_t base_id = xlate_id(code, max_size, stage, key, &hd);
+    uint64_t h = hash64(base_id, CONSTANTS_ID, strlen(CONSTANTS_ID));
+    h = hash64(h, &size, sizeof size);
+    h = hash64(h, constants, size);
+    if (!h) h = 1;
+    ShaderInfo *si = xlate_peek_id(h);
+    if (si) return si;
+    if (!peek && (si = xlate_load(h, &hd, stage))) {
+        pthread_mutex_lock(&xlate_lock);
+        si = xlate_keep(h, si);
+        pthread_mutex_unlock(&xlate_lock);
+        return si;
+    }
+    ShaderInfo *base = peek ? xlate_peek_id(base_id) : vk_translate_cached(code, max_size, stage, key);
+    if (!base || !base->msl || !(base->cbuf_mask & 2) || (base->cbuf_dynamic & 2)) return base;
+    if (peek) return NULL;
+    char *source = vk_shader_literal_constants(base->msl, constants, size);
+    if (!source) return base;  // dynamic/unrecognized/out-of-blob reads retain the original shader
+    si = malloc(sizeof *si);
+    if (!si) { free(source); return base; }
+    *si = *base;
+    si->msl = source;
+    si->cbuf_mask &= ~2u;
+    si->cbuf_dynamic &= ~2u;
+    si->cbuf_size[1] = 0;
+    hd.msl_len = (uint32_t)strlen(source);
+    xlate_store(h, &hd, si);  // normal pipeline pre-warm can reload this exact derived shader by ID
+    LOG("[shader-constants] stage %d %016llx -> %016llx, %u bytes baked\n", stage,
+        (unsigned long long)base_id, (unsigned long long)h, size);
     pthread_mutex_lock(&xlate_lock);
     si = xlate_keep(h, si);
     pthread_mutex_unlock(&xlate_lock);
@@ -815,6 +883,28 @@ static const char *builtin_src(const char *name, int *stage) {
                "  float w = amp.g * peak;\n"
                "  vec3 r = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);\n"
                "  o = vec4(clamp(r, 0.0, 1.0), e4.a);\n"
+               "}\n";
+    }
+    // DLAA's motion vectors (exec.c dlaa_run): where each scene pixel was last frame, from its depth and the camera's
+    // motion alone. pc.m = last frame's view-projection x the inverse of this frame's (both unjittered), applied to the
+    // pixel's NDC (GL depth: the depth buffer holds (z + 1) / 2; y up); pc.s = size, 1 / size. Out: last frame's
+    // position - this one, in pixels (DLSS's convention).
+    if (!strcmp(name, "dlss_mv.comp")) {
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "layout(local_size_x = 8, local_size_y = 8) in;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D depth;\n"
+               "layout(set = 0, binding = 1, rg16f) uniform writeonly image2D mv;\n"
+               "layout(push_constant) uniform P { mat4 m; vec4 s; } pc;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+               "  if (p.x >= int(pc.s.x) || p.y >= int(pc.s.y)) return;\n"
+               "  vec2 uv = (vec2(p) + 0.5) * pc.s.zw;\n"
+               "  float d = texelFetch(depth, p, 0).r;\n"
+               "  vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);\n"
+               "  vec2 n = q.xy / q.w;\n"
+               "  vec2 puv = vec2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5);\n"
+               "  imageStore(mv, p, vec4((puv - uv) * pc.s.xy, 0.0, 0.0));\n"
                "}\n";
     }
     if (!strcmp(name, "clear.vert")) {

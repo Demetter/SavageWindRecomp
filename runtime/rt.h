@@ -9,6 +9,14 @@
 
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
+#ifdef _WIN32
+int plat_trace_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+void plat_trace_flush(void);
+#define TRACE_LOG(...) plat_trace_log(__VA_ARGS__)
+#else
+#define TRACE_LOG(...) LOG(__VA_ARGS__)
+#define plat_trace_flush() fflush(stderr)
+#endif
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the

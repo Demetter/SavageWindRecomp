@@ -7,8 +7,68 @@
 #include <shellapi.h>
 #include <timeapi.h>
 #include <io.h>
+#include <stdarg.h>
 
+#include "../gamelib.h"
+#include "../gpu_consumer_probe.h"
 #include "../platform.h"
+#include "../rt.h"
+#include "geometry_guard.h"
+#include "trace_log.h"
+
+int plat_trace_log(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    if (!trace_log.thread) {
+        int n = vfprintf(stderr, format, args);
+        va_end(args);
+        return n;
+    }
+    char text[2048];
+    int n = vsnprintf(text, sizeof text, format, args);
+    va_end(args);
+    if (n < 0 || n >= (int)sizeof text) {
+        // Unexpected large records stay complete, and retain ordering relative
+        // to earlier queued telemetry. This is not a steady-state trace path.
+        plat_trace_flush();
+        va_start(args, format);
+        n = vfprintf(stderr, format, args);
+        va_end(args);
+    } else if (n) trace_log_append(text, (size_t)n);
+    return n;
+}
+
+void plat_trace_flush(void) {
+    if (!trace_log_flush()) fprintf(stderr, "[trace-log] flush timeout or I/O error; capture may be incomplete\n");
+    if (trace_log.thread) {
+        AcquireSRWLockExclusive(&trace_log.lock);
+        uint64_t waits = trace_log.backpressure;
+        ReleaseSRWLockExclusive(&trace_log.lock);
+        if (waits) fprintf(stderr, "[trace-log] producer backpressure: %llu waits; capture perturbed\n", (unsigned long long)waits);
+    }
+    fflush(stderr);
+}
+
+static void geometry_guard_start(void) {
+    const char *e = getenv("SAVAGEWIND_VK_GEOMETRY_GUARD");
+    if (e && atoi(e) && !gg_init(HEAP_BASE, HEAP_MAX))
+        fprintf(stderr, "[geometry-guard] allocation failed; using OS write watch\n");
+}
+
+size_t plat_geometry_guard_collect(const uint64_t *bits, size_t pages, uint64_t *out, size_t cap) {
+    return gg_collect(bits, pages, out, cap);
+}
+bool plat_geometry_guard_active(void) { return InterlockedCompareExchange64(&gg_base_atomic, 0, 0) != 0; }
+bool plat_geometry_guard_pending(uint64_t addr) {
+    AcquireSRWLockExclusive(&gg_lock);
+    bool pending = false;
+    if (addr >= gg_base && addr - gg_base < gg_size) {
+        size_t p = (size_t)((addr - gg_base) >> 12);
+        pending = gg_bit(gg_dirty, p) || gg_io[p] || gg_bit(gg_blocked, p);
+    }
+    ReleaseSRWLockExclusive(&gg_lock);
+    return pending;
+}
 
 // ---- guest address space
 // The window is reserved up front and committed per region (plat_commit from the loader / kernel). Anything
@@ -51,6 +111,8 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     }
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     uint64_t fa = er->ExceptionInformation[1];
+    if (gcp_fault(fa, ep->ContextRecord->Rip, er->ExceptionInformation[0] == 1)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (gg_fault(fa, er->ExceptionInformation[0] == 1)) return EXCEPTION_CONTINUE_EXECUTION;
     if (lazy_commit(fa)) return EXCEPTION_CONTINUE_EXECUTION;
     g_fault_is_write = er->ExceptionInformation[0] == 1;
     if (g_report_crashes && rt_fault_watch(fa, ep->ContextRecord->Rip)) {
@@ -76,6 +138,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     g_lo = lo;
     g_hi = hi;
     AddVectoredExceptionHandler(1, vectored_handler);
+    geometry_guard_start();  // before guest file reads can begin
     return true;
 }
 
@@ -87,26 +150,48 @@ size_t plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t 
     return n >= max ? max : (size_t)n;  // (a full array may have left pages out: they're reset all the same)
 }
 
+size_t plat_peek_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) {
+    ULONG_PTR n = max;
+    ULONG gran;
+    if (GetWriteWatch(0, (void *)(uintptr_t)addr, size, (void **)pages, &n, &gran) != 0 || gran != 4096)
+        return SIZE_MAX;
+    return n >= max ? max : (size_t)n;
+}
+bool plat_reset_written_pages(uint64_t addr, uint64_t size) {
+    return ResetWriteWatch((void *)(uintptr_t)addr, size) == 0;
+}
+
 // Decommit everything: the range stays reserved, and pages come back zeroed when committed again (lazily).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
-    return VirtualFree((void *)(uintptr_t)lo, hi - lo, MEM_DECOMMIT) != 0;
+    gg_reset();  // teardown has stopped guest threads and drained renderer work
+    bool ok = VirtualFree((void *)(uintptr_t)lo, hi - lo, MEM_DECOMMIT) != 0;
+    if (ok) geometry_guard_start();
+    return ok;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
     uint64_t a = addr & ~0xFFFull, e = (addr + size + 0xFFF) & ~0xFFFull;
+    gg_io_range(a, e - a, true);
     if (!VirtualAlloc((void *)(uintptr_t)a, e - a, MEM_COMMIT, PAGE_READWRITE))
         fprintf(stderr, "[plat] commit %llx+%llx failed (%lu)\n", (unsigned long long)addr,
                 (unsigned long long)size, GetLastError());
+    gg_io_range(a, e - a, false);
 }
 
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
+    gg_exclude(addr, size);
     DWORD p = prot == PLAT_PROT_NONE ? PAGE_NOACCESS : prot == PLAT_PROT_READ ? PAGE_READONLY : PAGE_READWRITE, old;
     if (addr >= g_lo && addr < g_hi) plat_commit(addr, size);
     return VirtualProtect((void *)(uintptr_t)addr, size, p, &old) ? 0 : -1;
 }
 
 // ---- time
+uint64_t plat_thread_cycles(void) {
+    ULONG64 cycles;
+    return QueryThreadCycleTime(GetCurrentThread(), &cycles) ? cycles : 0;
+}
+uint32_t plat_thread_id(void) { return GetCurrentThreadId(); }
 static LARGE_INTEGER qpf;
 
 uint64_t plat_now_ns(void) {
@@ -162,18 +247,20 @@ static void log_to_file_without_console(void) {
     _putenv("SAVAGEWIND_LOG_APPEND=1");
 }
 
-// The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
-// with an illegal instruction on an older CPU.
+// The recompiled game code is built for a target this CPU runs (runtime/gamelib.h): say so instead of crashing with an
+// illegal instruction on a CPU too old for any.
 static void require_cpu(void) {
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    MessageBoxA(NULL, "Savage Wind needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer).",
-                "Savage Wind", MB_ICONERROR | MB_OK);
+    const char *need = gamelib_cpu_problem();
+    if (!need) return;
+    char text[256];
+    snprintf(text, sizeof text, "Savage Wind needs %s.", need);
+    MessageBoxA(NULL, text, "Savage Wind", MB_ICONERROR | MB_OK);
     ExitProcess(1);
 }
 
 // Fatal error (rt_fatal_trace): the last FATAL / exception line of the log in a message box, when there is no console.
 void plat_fatal_notice(void) {
+    plat_trace_flush();
     if (!g_log_path[0]) return;
     fflush(stderr);
     char text[1024] = "Savage Wind stopped because of an error.";
@@ -238,6 +325,10 @@ void plat_init(void) {
     _fmode = _O_BINARY;  // fopen/open default to binary (the runtime's "r"/"w" files are binary or LF text)
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
+    if (!getenv("SAVAGEWIND_SYNC_TRACE_LOG") && trace_log_init(stderr)) {
+        atexit(plat_trace_flush);
+        LOG("[trace-log] asynchronous telemetry writer, %u bytes preallocated\n", TRACE_LOG_CAPACITY);
+    }
     SetConsoleOutputCP(CP_UTF8);
     timeBeginPeriod(1);  // 1 ms Sleep / condition-variable timeouts (default 15.6 ms)
     // Opt out of EcoQoS and of Windows 11 ignoring the timer resolution while the window is occluded.
@@ -274,6 +365,7 @@ static void append_arg(char *out, size_t cap, const char *a) {
 
 // No exec() on Windows: start the new process with the same console / standard handles, then exit.
 void plat_exec(char *const argv[]) {
+    plat_trace_flush();
     STARTUPINFOW si = {.cb = sizeof si};
     PROCESS_INFORMATION pi;
     BOOL ok;
@@ -361,10 +453,14 @@ static ssize_t prw(int fd, void *buf, size_t n, off_t off, bool write) {
         ov.Offset = (DWORD)o;
         ov.OffsetHigh = (DWORD)(o >> 32);
         DWORD chunk = n - done > 0x40000000 ? 0x40000000 : (DWORD)(n - done), got = 0;
+        if (!write) gg_io_range((uintptr_t)buf + done, chunk, true);
         BOOL ok = write ? WriteFile(h, (const char *)buf + done, chunk, &got, &ov)
                         : ReadFile(h, (char *)buf + done, chunk, &got, &ov);
+        DWORD error = ok ? 0 : GetLastError();
+        if (!write) gg_io_range((uintptr_t)buf + done, chunk, false);
         if (!ok) {
-            if (GetLastError() == ERROR_HANDLE_EOF) break;
+            if (error == ERROR_HANDLE_EOF) break;
+            SetLastError(error);
             return done ? (ssize_t)done : -1;
         }
         if (!got) break;
@@ -443,6 +539,7 @@ bool plat_remove_tree(const char *dir) {
 
 // End the process at once, skipping DLL teardown (from an atexit handler, after flushing). Exit status 0.
 void plat_terminate(void) {
+    plat_trace_flush();
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
 }

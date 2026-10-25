@@ -1,3 +1,4 @@
+#include "../../perf_survey.h"
 // Command recording on a thread of its own (vkq.h). The ring holds entries of a 16-byte header (the replay function,
 // the entry's size) and the call's arguments, the arrays its pointers point to right after them; a pointer inside is
 // rebuilt at replay from where its array sits in the entry. One producer (the submission thread, while it translates
@@ -8,16 +9,59 @@
 #include <string.h>
 #include <time.h>
 #include <immintrin.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define VKD_NO_REDIRECT
 #include "vkd.h"
 #include "vkq.h"
+#include "timing.h"
+#include "a1d.h"
+#include "frame_trace.h"
 #include "../../rt.h"
 
 __thread bool vkq_on;
+bool vkq_address_wait;
+bool vkq_native_multi_draw;
+void vk_native_batch_replay(void *);
+void vk_native_batch_flush(void);
+static void R_NativeFlush(void *unused) { (void)unused; vk_native_batch_flush(); }
+#ifdef _WIN32
+static BOOL (WINAPI *wait_address_fn)(volatile VOID *, PVOID, SIZE_T, DWORD);
+static VOID (WINAPI *wake_address_one_fn)(PVOID), (WINAPI *wake_address_all_fn)(PVOID);
+#endif
+
+void vkq_wait_address(volatile void *address, uint64_t expected, size_t bytes) {
+#ifdef _WIN32
+    // Caller always rechecks its acquire-loaded condition, including on a
+    // spurious wake. WaitOnAddress compares before sleeping, so early wakes are safe.
+    wait_address_fn(address, &expected, bytes, INFINITE);
+#else
+    (void)address; (void)expected; (void)bytes;
+#endif
+}
+
+void vkq_wake_address(void *address, bool all) {
+#ifdef _WIN32
+    if (all) wake_address_all_fn(address); else wake_address_one_fn(address);
+#else
+    (void)address; (void)all;
+#endif
+}
 
 typedef void (*ReplayFn)(void *args);
 typedef struct { ReplayFn fn; uint32_t size, pad; } Hdr;  // size: the whole entry, a multiple of 16
+static void R_CmdDraw(void *), R_CmdDrawIndexed(void *), R_CmdBindIndexBuffer(void *);
+static void R_CmdBindVertexBuffers(void *), R_CmdBindDescriptorSets(void *);
+static __thread bool batch_probe;
+static __thread uint64_t batch_probe_token;
+static __thread ReplayFn batch_probe_descriptor_bind;
+uint64_t vkq_batch_probe_token(void (*descriptor_bind)(void *)) {
+    batch_probe = true;
+    batch_probe_descriptor_bind = descriptor_bind;
+    return batch_probe_token;
+}
 #define RING_SIZE (64u << 20)
 
 static uint8_t *ring;
@@ -32,15 +76,35 @@ static pthread_cond_t cv_work = PTHREAD_COND_INITIALIZER, cv_idle = PTHREAD_COND
 static _Alignas(64) _Atomic int sleeping, waiting;
 static int state;  // 0 not started, 1 on, -1 off (SAVAGEWIND_VK_NO_DEFER, or no thread)
 static _Atomic int failed;  // a deferred submission failed: the producer reports it at the next drain
+static _Atomic uint64_t trace_ring_ns, trace_drain_ns;
+uint64_t renderer_present_count(void);
+
+void vkq_trace_frame(uint64_t frame) {
+    static uint64_t previous[2];
+    uint64_t current[2] = {atomic_load_explicit(&trace_ring_ns, memory_order_relaxed),
+                           atomic_load_explicit(&trace_drain_ns, memory_order_relaxed)};
+    TRACE_LOG("[vkq-work] %llu recorder_ring_wait_ns %llu recorder_drain_wait_ns %llu\n",
+              (unsigned long long)frame, (unsigned long long)(current[0] - previous[0]),
+              (unsigned long long)(current[1] - previous[1]));
+    memcpy(previous, current, sizeof previous);
+}
 
 void kernel_sample_host_thread(void);
 static void *recorder(void *arg) {
     (void)arg;
     kernel_sample_host_thread();  // (SAVAGEWIND_SAMPLE profiles it as a host thread)
+    uint64_t a1d_busy=0;unsigned a1d_ops=0;
     for (;;) {
         uint64_t r = atomic_load_explicit(&rpos, memory_order_relaxed);
         uint64_t w = atomic_load_explicit(&wpos, memory_order_acquire);
         if (r == w) {
+            if(a1d_busy){a1d_local[A1D_RECORDER]+=plat_now_ns()-a1d_busy;a1d_busy=0;a1d_publish();}
+            if (vkq_address_wait) {
+                if (atomic_load(&waiting)) vkq_wake_address(&rpos, false);
+                for (int i = 0; i < 64 && atomic_load_explicit(&wpos, memory_order_acquire) == r; i++) _mm_pause();
+                if (atomic_load_explicit(&wpos, memory_order_acquire) == r) vkq_wait_address(&wpos, r, sizeof wpos);
+                continue;
+            }
             if (atomic_load(&waiting)) { pthread_mutex_lock(&m); pthread_cond_broadcast(&cv_idle); pthread_mutex_unlock(&m); }
             bool got = false;
             for (int i = 0; i < 4000 && !got; i++) {  // (a short spin: the next command is usually microseconds away)
@@ -55,9 +119,15 @@ static void *recorder(void *arg) {
             pthread_mutex_unlock(&m);
             continue;
         }
+        if(a1d_enabled&&!a1d_busy)a1d_busy=plat_now_ns();
         Hdr *h = (Hdr *)(ring + (r % RING_SIZE));
-        if (h->fn) h->fn(h + 1);  // (fn NULL: padding to the end of the ring)
+        if (h->fn) {
+            perf_survey_delay(SURVEY_RECORDER, 0);
+            if(vkq_native_multi_draw&&h->fn!=vk_native_batch_replay)vk_native_batch_flush();
+            h->fn(h + 1);
+        }  // (fn NULL: padding to the end of the ring)
         atomic_store_explicit(&rpos, r + h->size, memory_order_release);
+        if(a1d_busy&&!(++a1d_ops&63)){a1d_local[A1D_RECORDER]+=plat_now_ns()-a1d_busy;a1d_busy=0;a1d_publish();}
     }
     return NULL;
 }
@@ -66,17 +136,29 @@ static bool start(void) {
     if (state) return state > 0;
     state = -1;
     if (getenv("SAVAGEWIND_VK_NO_DEFER")) { LOG("[vk] command recording on the submission thread (SAVAGEWIND_VK_NO_DEFER)\n"); return false; }
+#ifdef _WIN32
+    const char *native = getenv("SAVAGEWIND_VK_ADDRESS_WAIT");
+    if (native && atoi(native)) {
+        HMODULE kernel = GetModuleHandleA("kernelbase.dll");
+        wait_address_fn = (void *)GetProcAddress(kernel, "WaitOnAddress");
+        wake_address_one_fn = (void *)GetProcAddress(kernel, "WakeByAddressSingle");
+        wake_address_all_fn = (void *)GetProcAddress(kernel, "WakeByAddressAll");
+        vkq_address_wait = wait_address_fn && wake_address_one_fn && wake_address_all_fn;
+    }
+#endif
     ring = malloc(RING_SIZE);
     pthread_t t;
     if (!ring || pthread_create(&t, NULL, recorder, NULL)) { LOG("[vk] no recording thread: commands recorded in place\n"); return false; }
     pthread_detach(t);
     state = 1;
     LOG("[vk] commands recorded on a thread of their own while lists are translated\n");
+    if (vkq_address_wait) LOG("[vk] native address waits for recorder and descriptor jobs\n");
     return true;
 }
 
 static void publish(void) {
     atomic_store_explicit(&wpos, wlocal, memory_order_release);
+    if (vkq_address_wait) { vkq_wake_address(&wpos, false); return; }
     if (atomic_load(&sleeping)) { pthread_mutex_lock(&m); pthread_cond_signal(&cv_work); pthread_mutex_unlock(&m); }
 }
 
@@ -84,15 +166,27 @@ static void publish(void) {
 // are published in batches of 2 KB (about two draws): publishing each took a cache line from the recorder every call.
 // Submissions and drains publish at once.
 static void *push(ReplayFn fn, size_t args) {
+    if (batch_probe && fn != R_CmdDraw && fn != R_CmdDrawIndexed &&
+        fn != R_CmdBindIndexBuffer && fn != R_CmdBindVertexBuffers &&
+        fn != R_CmdBindDescriptorSets && fn != batch_probe_descriptor_bind)
+        batch_probe_token++;
     if (wlocal - atomic_load_explicit(&wpos, memory_order_relaxed) >= 2048) publish();
     uint32_t size = (uint32_t)((sizeof(Hdr) + args + 15) & ~(size_t)15);
     uint64_t off = wlocal % RING_SIZE;
     uint32_t pad = off + size > RING_SIZE ? (uint32_t)(RING_SIZE - off) : 0;  // (an entry never wraps)
+    uint64_t trace_wait = 0;
     while (wlocal + pad + size - rcache > RING_SIZE) {
         rcache = atomic_load_explicit(&rpos, memory_order_acquire);
         if (wlocal + pad + size - rcache <= RING_SIZE) break;
+        if (vk_frame_trace_on && !trace_wait) trace_wait = plat_now_ns();
         publish();
         _mm_pause();
+    }
+    if (trace_wait) {
+        uint64_t end = plat_now_ns();
+        atomic_fetch_add_explicit(&trace_ring_ns, end - trace_wait, memory_order_relaxed);
+        if (end - trace_wait >= 25000) vk_frame_trace_event("Vulkan command ring full", 1,
+            renderer_present_count(), 0, trace_wait, end, 0, 0);
     }
     if (pad) {
         Hdr *p = (Hdr *)(ring + off);
@@ -109,8 +203,16 @@ static void *push(ReplayFn fn, size_t args) {
 
 void vkq_drain(void) {
     if (state <= 0) return;
+    if(vkq_native_multi_draw)push(R_NativeFlush,0);
     publish();
-    if (atomic_load_explicit(&rpos, memory_order_acquire) != wlocal) {
+    uint64_t trace_wait = vk_frame_trace_on && atomic_load_explicit(&rpos, memory_order_acquire) != wlocal ? plat_now_ns() : 0;
+    if (vkq_address_wait) {
+        atomic_store(&waiting, 1);
+        uint64_t r;
+        while ((r = atomic_load_explicit(&rpos, memory_order_acquire)) != wlocal)
+            vkq_wait_address(&rpos, r, sizeof rpos);
+        atomic_store(&waiting, 0);
+    } else if (atomic_load_explicit(&rpos, memory_order_acquire) != wlocal) {
         pthread_mutex_lock(&m);
         atomic_store(&waiting, 1);
         while (atomic_load_explicit(&rpos, memory_order_acquire) != wlocal) {
@@ -123,6 +225,12 @@ void vkq_drain(void) {
         }
         atomic_store(&waiting, 0);
         pthread_mutex_unlock(&m);
+    }
+    if (trace_wait) {
+        uint64_t end = plat_now_ns();
+        atomic_fetch_add_explicit(&trace_drain_ns, end - trace_wait, memory_order_relaxed);
+        if (end - trace_wait >= 25000) vk_frame_trace_event("Drain Vulkan command recorder", 1,
+            renderer_present_count(), 0, trace_wait, end, 0, 0);
     }
     if (atomic_exchange(&failed, 0)) FATAL("deferred vkQueueSubmit2 failed (see the log above)\n");
 }
@@ -149,6 +257,72 @@ bool vkq_custom(void (*fn)(void *), const void *arg, size_t size) {
 // ---- argument blocks: what follows a struct in its entry
 #define AFTER(e) ((uint8_t *)((e) + 1))
 #define ARR(T, n) (((size_t)(n) * sizeof(T) + 15) & ~(size_t)15)
+
+typedef struct {
+    VkCommandBuffer cb;
+    VkPipelineLayout layout;
+    VkDescriptorSet sets[2];
+    void (*bind_job)(VkCommandBuffer, VkPipelineLayout, void *);
+    void *job;
+    VkBuffer index;
+    VkDeviceSize index_offset;
+    VkQueryPool query_pool;
+    uint32_t ndyn, vertex_mask, flags, count, instances, first, base_instance;
+    int32_t base_vertex;
+    VkIndexType index_type;
+    uint32_t query;
+    VkQueryControlFlags query_flags;
+} DrawPacket;
+
+static void R_DrawPacket(void *p) {
+    DrawPacket *a = p;
+    unsigned nv = (unsigned)__builtin_popcount(a->vertex_mask);
+    const uint32_t *dyn = (const uint32_t *)AFTER(a);
+    const VkBuffer *buffers = (const VkBuffer *)(AFTER(a) + ARR(uint32_t, a->ndyn));
+    const VkDeviceSize *offsets = (const VkDeviceSize *)((const uint8_t *)buffers + ARR(VkBuffer, nv));
+    if (a->bind_job) a->bind_job(a->cb, a->layout, a->job);
+    else if (a->flags & 1) vkd_CmdBindDescriptorSets(a->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, a->layout, 0, 2, a->sets, a->ndyn, dyn);
+    if (a->flags & 2) vkd_CmdBindIndexBuffer(a->cb, a->index, a->index_offset, a->index_type);
+    // Adjacent changed streams bind together; gaps retain their existing state.
+    unsigned pos = 0;
+    for (unsigned s = 0; s < 17;) {
+        if (!(a->vertex_mask & (1u << s))) { s++; continue; }
+        unsigned first = s++;
+        while (s < 17 && (a->vertex_mask & (1u << s))) s++;
+        unsigned n = s - first;
+        vkd_CmdBindVertexBuffers(a->cb, first, n, buffers + pos, offsets + pos);
+        pos += n;
+    }
+    if (a->query_pool) vkd_CmdBeginQuery(a->cb, a->query_pool, a->query, a->query_flags);
+    if (a->flags & 4) vkd_CmdDrawIndexed(a->cb, a->count, a->instances, a->first, a->base_vertex, a->base_instance);
+    else vkd_CmdDraw(a->cb, a->count, a->instances, a->first, a->base_instance);
+    if (a->query_pool) vkd_CmdEndQuery(a->cb, a->query_pool, a->query);
+}
+
+void vkq_draw_packet(const VkqDraw *d) {
+    uint32_t mask = d->vertex_mask & ((1u << 17) - 1);
+    unsigned nv = (unsigned)__builtin_popcount(mask);
+    unsigned ndyn = d->bind_sets && !d->bind_job ? d->ndyn : 0;
+    if (ndyn > 32) FATAL("native draw packet: too many dynamic offsets\n");
+    size_t size = sizeof(DrawPacket) + ARR(uint32_t, ndyn) + ARR(VkBuffer, nv) + ARR(VkDeviceSize, nv);
+    _Alignas(16) uint8_t local[1024];
+    _Static_assert(sizeof(DrawPacket) + 128 + 2 * 144 <= sizeof local, "draw packet scratch");
+    DrawPacket *a = vkq_on ? push(R_DrawPacket, size) : (DrawPacket *)local;
+    *a = (DrawPacket){.cb = d->cb, .layout = d->layout, .sets = {d->sets[0], d->sets[1]},
+        .bind_job = d->bind_job, .job = d->job, .index = d->index, .index_offset = d->index_offset,
+        .query_pool = d->query_pool, .ndyn = ndyn, .vertex_mask = mask,
+        .flags = (d->bind_sets ? 1u : 0) | (d->bind_index ? 2u : 0) | (d->indexed ? 4u : 0),
+        .count = d->count, .instances = d->instances, .first = d->first, .base_instance = d->base_instance,
+        .base_vertex = d->base_vertex, .index_type = d->index_type, .query = d->query, .query_flags = d->query_flags};
+    memcpy(AFTER(a), d->dyn, ndyn * sizeof(uint32_t));
+    VkBuffer *buffers = (VkBuffer *)(AFTER(a) + ARR(uint32_t, ndyn));
+    VkDeviceSize *offsets = (VkDeviceSize *)((uint8_t *)buffers + ARR(VkBuffer, nv));
+    unsigned pos = 0;
+    for (unsigned s = 0; s < 17; s++) if (mask & (1u << s)) {
+        buffers[pos] = d->vertex[s]; offsets[pos++] = d->offsets[s];
+    }
+    if (!vkq_on) R_DrawPacket(a);
+}
 
 // ---- scalar calls
 #define SCALAR0(name)                                                                                                 \
@@ -508,7 +682,9 @@ static void R_QueueSubmit2(void *p) {
     a->si.pCommandBufferInfos = (const VkCommandBufferSubmitInfo *)q;
     q += ARR(VkCommandBufferSubmitInfo, a->si.commandBufferInfoCount);
     a->si.pSignalSemaphoreInfos = (const VkSemaphoreSubmitInfo *)q;
+    vk_timing_driver(1, &a->si, false);
     VkResult r = vkd_QueueSubmit2(a->q, 1, &a->si, VK_NULL_HANDLE);
+    vk_timing_driver(1, &a->si, true);
     if (r != VK_SUCCESS) {
         LOG("[vk] deferred vkQueueSubmit2: %d\n", r);
         if (r == VK_ERROR_DEVICE_LOST) { extern void vk_devlost_dump(void); vk_devlost_dump(); }
@@ -516,7 +692,13 @@ static void R_QueueSubmit2(void *p) {
     }
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkq_QueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence f) {
-    if (!vkq_on || n != 1 || f || si->pNext) { if (vkq_on) vkq_drain(); return vkd_QueueSubmit2(q, n, si, f); }
+    if (!vkq_on || n != 1 || f || si->pNext) {
+        if (vkq_on) vkq_drain();
+        vk_timing_driver(n, si, false);
+        VkResult r = vkd_QueueSubmit2(q, n, si, f);
+        vk_timing_driver(n, si, true);
+        return r;
+    }
     uint32_t nw = si->waitSemaphoreInfoCount, nc = si->commandBufferInfoCount, ns = si->signalSemaphoreInfoCount;
     A_QueueSubmit2 *a = push(R_QueueSubmit2, sizeof *a + ARR(VkSemaphoreSubmitInfo, nw) +
                                                  ARR(VkCommandBufferSubmitInfo, nc) + ARR(VkSemaphoreSubmitInfo, ns));

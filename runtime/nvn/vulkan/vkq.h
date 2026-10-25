@@ -10,12 +10,46 @@
 #include <vulkan/vulkan.h>
 
 extern __thread bool vkq_on;  // this thread's Vulkan commands go to the recording thread
+extern bool vkq_native_multi_draw; // device initialization sets this before recorder creation
 void vkq_defer_begin(void);   // (the submission thread, at the start of a list)
 void vkq_defer_end(void);     // all of it recorded and submitted: direct calls are safe again
 void vkq_drain(void);         // everything deferred so far recorded and submitted (deferring goes on)
+void vkq_trace_frame(uint64_t frame); // diagnostic wait deltas, separate from descriptor-job waits
+extern bool vkq_address_wait; // native Windows waits, selected before recorder/descriptor workers start
+void vkq_wait_address(volatile void *address, uint64_t expected, size_t bytes);
+void vkq_wake_address(void *address, bool all);
 // fn(arg) on the recording thread, after the commands deferred before it (size bytes of arg copied); false: not
 // deferring (the caller runs it itself)
 bool vkq_custom(void (*fn)(void *), const void *arg, size_t size);
+// Diagnostic only. Starts tracking producer-side ordering boundaries, excluding
+// draw/geometry/descriptor bindings and the supplied descriptor-job callback.
+// All other commands (including queries, barriers and submissions) advance it.
+uint64_t vkq_batch_probe_token(void (*descriptor_bind)(void *));
+
+// Prepared native draw. The queue stores one compact packet rather than a
+// record for every descriptor/index/vertex bind and draw. Guest state and
+// memory dependencies have already been resolved by the producer.
+typedef struct {
+    VkCommandBuffer cb;
+    VkPipelineLayout layout;
+    VkDescriptorSet sets[2];
+    uint32_t dyn[32], ndyn;
+    void (*bind_job)(VkCommandBuffer, VkPipelineLayout, void *);
+    void *job;
+    uint32_t vertex_mask;
+    VkBuffer vertex[17];
+    VkDeviceSize offsets[17];
+    VkBuffer index;
+    VkDeviceSize index_offset;
+    VkIndexType index_type;
+    bool bind_sets, bind_index, indexed;
+    uint32_t count, instances, first, base_instance;
+    int32_t base_vertex;
+    VkQueryPool query_pool;
+    uint32_t query;
+    VkQueryControlFlags query_flags;
+} VkqDraw;
+void vkq_draw_packet(const VkqDraw *draw);
 
 // The deferring versions of vkd.h's functions (the driver's own when vkq_on is false)
 VKAPI_ATTR VkResult VKAPI_CALL vkq_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi);

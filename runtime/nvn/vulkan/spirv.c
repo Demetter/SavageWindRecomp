@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 
 #include "shaders.h"
+#include "buffer_cache_shader.h"
+extern bool vk_buffer_cache_configured(void);
 
 #ifndef SPIRV_ID
 #define SPIRV_ID __DATE__ " " __TIME__  // (built without the Makefile's hash: valid for this build only)
@@ -29,8 +31,11 @@ static shaderc_shader_kind kind_of(int stage) {
 // another build's folder is removed (vk_cache_cleanup). A file: "SPZ1", the SPIR-V's word count, the SPIR-V
 // deflated (zlib; a third to a quarter of the size: the precompiled shaders of the whole game take ~0.4 GB instead
 // of 1.4).
-static uint64_t src_hash(const char *src, int stage) {
+static uint64_t src_hash(const char *src, int stage, bool optimize) {
     uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)stage;
+    // Compiler options are part of the identity. Previously an OPT experiment
+    // could silently reuse the unoptimized file (or contaminate later runs).
+    if (optimize) h ^= 0x7d5e921c0ab3468full;
     for (const char *p = vk_spirv_id(); *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
     for (const char *p = src; *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
     return h;
@@ -156,8 +161,12 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // driver optimises anyway. SAVAGEWIND_VK_OPT=1 turns it back on (experiments).
 // The SPIR-V of src in the disk cache (compiled now if missing): 0 it was there, 1 compiled, -1 failed.
 int vk_spirv_ensure(const char *src, int stage) {
+    if (vk_buffer_cache_configured()) {
+        char *owned = buffer_cache_shader_stage(src,stage);
+        if (owned) { int result = vk_spirv_ensure(owned, stage); free(owned); return result; }
+    }
     char path[512];
-    spirv_path(path, sizeof path, src_hash(src, stage));
+    spirv_path(path, sizeof path, src_hash(src, stage, getenv("SAVAGEWIND_VK_OPT") != NULL));
     struct stat st;
     if (!getenv("SAVAGEWIND_VK_NO_SPIRV_CACHE") && !stat(path, &st) && st.st_size > 20) return 0;
     size_t n = 0;
@@ -181,7 +190,19 @@ static void strip_names(uint32_t *spv, size_t *nwords) {
 }
 
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
-    uint64_t h = src_hash(src, stage);
+    return vk_glsl_to_spirv_mode(src, stage, name, nwords, getenv("SAVAGEWIND_VK_OPT") != NULL);
+}
+
+uint32_t *vk_glsl_to_spirv_mode(const char *src, int stage, const char *name, size_t *nwords, bool optimize) {
+    if (vk_buffer_cache_configured()) {
+        char *owned = buffer_cache_shader_stage(src,stage);
+        if (owned) {
+            uint32_t *result = vk_glsl_to_spirv_mode(owned, stage, name, nwords, optimize);
+            free(owned);
+            return result;
+        }
+    }
+    uint64_t h = src_hash(src, stage, optimize);
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("SAVAGEWIND_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -190,8 +211,8 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     if (!comp) comp = shaderc_compiler_initialize();
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    shaderc_compile_options_set_optimization_level(o, getenv("SAVAGEWIND_VK_OPT") ? shaderc_optimization_level_performance
-                                                                                  : shaderc_optimization_level_zero);
+    shaderc_compile_options_set_optimization_level(o, optimize ? shaderc_optimization_level_performance
+                                                              : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
