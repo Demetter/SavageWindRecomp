@@ -27,7 +27,8 @@ void dlss_instance_extensions(const char **ext, uint32_t *n, uint32_t cap);
 bool dlss_device_extensions(const VkExtensionProperties *have, uint32_t nhave, const char **ext, uint32_t *n, uint32_t cap);
 void dlss_device_init(void);
 bool dlss_available(void);
-#define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_fault_report(); \
+#define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) { vk_device_fault_report(); \
+    FATAL("Vulkan device lost: the GPU stopped responding (%s, %s:%d)\n", #x, __FILE__, __LINE__); } \
     FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } } while (0)
 
 typedef struct {

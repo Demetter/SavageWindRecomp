@@ -288,9 +288,9 @@ test-core-handoff: $(CORE_TEST)
 	SAVAGEWIND_CORE_DIRECT_WAKE=0 $(CORE_TEST)
 	SAVAGEWIND_CORE_DIRECT_WAKE=1 $(CORE_TEST)
 
-$(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico
+$(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc runtime/platform/windows.manifest docs/icon/icon.ico
 	@mkdir -p $(dir $@)
-	$(WINDRES) -I docs/icon -O coff $< -o $@
+	$(WINDRES) -I docs/icon -I runtime/platform -O coff $< -o $@
 
 $(B)/rt/platform/windows_config.o: runtime/platform/windows_config.c
 	@mkdir -p $(dir $@)

@@ -17,7 +17,9 @@ SI int FN(issnan)(U u) { return FN(isnan)(u) && !(u & QB); }
 SI int FN(isqnan)(U u) { return FN(isnan)(u) && (u & QB); }
 SI int FN(isinf)(U u) { return (u & ~SGN) == EXPM; }
 SI int FN(iszero)(U u) { return !(u & ~SGN); }
-SI int FN(isden)(U u) { return !(u & EXPM) && (u & ~SGN); }
+// (A denormal by its fraction bits: "u & ~SGN" != 0 compiles to a float compare with zero, which MXCSR.DAZ - FPCR.FZ
+// on x86-64 - makes true for denormals, so they were kept instead of flushed.)
+SI int FN(isden)(U u) { return !(u & EXPM) && (u & (MINN - 1)); }
 SI T FN(flush)(T x) { U u = FN(fb)(x); return FN(isden)(u) ? FN(fv)(u & SGN) : x; }
 SI T FN(fz)(Cpu *c, T x) { return __builtin_expect(c->fpcr & FPCR_FZ, 0) ? FN(flush)(x) : x; }
 SI T FN(neg)(T x) { return FN(fv)(FN(fb)(x) ^ SGN); }
@@ -181,8 +183,8 @@ SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 
 SI VT FN(vfz)(Cpu *c, VT a) {
     if (__builtin_expect(c->fpcr & FPCR_FZ, 0)) {
-        VTU u = (VTU)a, mag = u & ~((VTU){} + SGN);
-        VTS den = (mag != 0) & ((u & EXPM) == 0);
+        VTU u = (VTU)a;
+        VTS den = ((u & (MINN - 1)) != 0) & ((u & EXPM) == 0);  // (fraction bits: as isden)
         a = (VT)FN(vsel)(den, u & SGN, u);
     }
     return a;

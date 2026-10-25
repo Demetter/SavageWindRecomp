@@ -63,7 +63,10 @@ void settings_load(void) {
     while (fgets(line, sizeof line, f)) {
         char key[64];
         char val[128];
-        if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 1) continue;
+        val[0] = 0;
+        if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue;
+        for (size_t n = strlen(val); n && (val[n - 1] == ' ' || val[n - 1] == '\t'); n--) val[n - 1] = 0;  // (a file
+        // edited by hand: Notepad's CRLF line ends and stray spaces would make the names below not match)
         if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;

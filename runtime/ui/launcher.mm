@@ -331,18 +331,19 @@ static void explain_status(const std::string &st) {
                      : version_failure(st) ? version_failure(st) : FAIL_MISSING);
 }
 
-// exefs: the folder with main and main.npdm; romfs: a folder named romfs (the game's data root). Found in the picked
-// folder or a few levels below it (extraction tools nest them).
-static bool is_romfs_name(const std::string &dir) {
+// exefs: the folder with main and main.npdm; romfs: a folder named romfs, or one holding System/Version.txt (the
+// game's data root: some tools name it after the game). Found in the picked folder or a few levels below it
+// (extraction tools nest them).
+static bool is_romfs_dir(const std::string &dir) {
     size_t sl = dir.find_last_of("/\\");
     std::string n = sl == std::string::npos ? dir : dir.substr(sl + 1);
     for (auto &ch : n) ch = (char)tolower((unsigned char)ch);
-    return n == "romfs";
+    return n == "romfs" || file_exists(dir + "/System/Version.txt");
 }
 static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &unusable) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
     if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
-    if (romfs.empty() && is_romfs_name(dir)) { romfs = dir; return; }  // (not searched further: the game's own tree)
+    if (romfs.empty() && is_romfs_dir(dir)) { romfs = dir; return; }  // (not searched further: the game's own tree)
     DIR *d = opendir(dir.c_str());
     if (!d) return;
     std::vector<std::string> sub;

@@ -280,7 +280,13 @@ void plat_fatal_notice(void) {
             char *end = strchr(line, '\n');
             if (end) *end = 0;
             snprintf(text, sizeof text, "Savage Wind stopped because of an error:\n\n%.600s", line);
-            if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {
+            if (strstr(line, "device lost")) {
+                size_t l = strlen(text);
+                snprintf(text + l, sizeof text - l, "\n\nThe graphics driver reset the GPU. Usually a frame took it too long "
+                         "(Windows resets a GPU after 2 seconds) or it ran out of video memory. Lower Video > Upscaler "
+                         "quality and Shadow resolution, close other programs and update the driver; on a laptop, run "
+                         "Savage Wind on the dedicated GPU.");
+            } else if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {
                 size_t l = strlen(text);
                 snprintf(text + l, sizeof text - l, "\n\nSavage Wind needs a graphics driver with Vulkan 1.3: install the "
                          "latest driver for your GPU (NVIDIA, AMD or Intel).");
