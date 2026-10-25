@@ -1489,6 +1489,7 @@ typedef struct {
     VkPipelineLayout layout;
     struct StageBuildRef { void *v, *f; } stages;  // (the ProgBuild's StageBuilds: graphics pipeline libraries)
     bool vs_uses_vid;
+    uint8_t fs_gather;  // (up_fix) the fragment stage's first gathered texture: 0 not looked yet, 1 none, 2 + its slot
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
@@ -2944,6 +2945,93 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     return m->found;
 }
 
+// BOTW's half-size passes on a scaled scene: the draws that bring its half-size buffers (lighting, the sun's shadow
+// mask, the clouds) back to the full image pick, per pixel, the half-size texel whose depth is nearest (the deferred
+// lighting's fs 966dae9aeabc743a and its variants, the clouds' fs c233c59930c7a676: textureGather of the half-size
+// depth, then the sample point moved toward the best texel). The gather reads the scaled image's texels; the move is
+// in the game's: the vertex shader takes the texel grid from a constant row (c[3] row 18 = 1600, 900, 1/1600, 1/900,
+// the scene's size), the clouds take the step from a fragment constant (c[3] row 2 words 2-3: 1/800, 1/450). Scaled
+// 3.2 times (5120x2160), each pixel's lighting came from up to three texels off: a light, beaded line along every
+// depth edge (around Link, along grass and leaves), distant trunks filled with sky, and around distant mountains and
+// Hyrule Castle a light band of sky with no cloud. In draws that gather from a texture at their target's scale, a
+// vertex constant row (w, h, 1/w, 1/h) with (w, h) the target's size times 1/4 .. 4 is made that size times the
+// gathered texture's own scale (its allocated size over the game's: each scaled size is rounded on its own), and a
+// fragment constant pair (1/w, 1/h) of the gathered texture's size becomes its allocated texel: the same choice in the
+// scaled image's texels. At the game's own size nothing changes. SAVAGEWIND_NO_UPSAMPLE_FIX=1: as before.
+static struct { uint32_t gw, gh; float sx, sy; uint32_t tw, th, aw, ah; } up_fix;  // (the draw in progress; sx 0: not such a draw)
+
+static bool up_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    static struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float sx, sy; bool found; VkDescriptorBufferInfo d; } memo[8];
+    __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
+    uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
+    if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
+        m->gw == up_fix.gw && m->gh == up_fix.gh && m->sx == up_fix.sx && m->sy == up_fix.sy) {
+        if (m->found) *out = m->d;
+        return m->found;
+    }
+    *m = (__typeof__(*m)){.addr = addr, .size = size, .gen = gen, .serial = uub_serial, .seq = seq, .gw = up_fix.gw,
+                          .gh = up_fix.gh, .sx = up_fix.sx, .sy = up_fix.sy};
+    const float *g = (const float *)(uintptr_t)addr;
+    static float buf[0x10000 / 4];
+    static int nlog;
+    uint64_t nw = (size < sizeof buf ? size : sizeof buf) / 4;
+    for (uint64_t i = 0; i + 3 < nw; i += 4) {  // (a vec4: 16-byte aligned)
+        float w = g[i], h = g[i + 1];
+        if (!(w >= 16 && h >= 16) || fabsf(w * g[i + 2] - 1) > 1e-5f || fabsf(h * g[i + 3] - 1) > 1e-5f) continue;
+        bool match = false;
+        for (int k = -2; k <= 2 && !match; k++) {
+            float f = k < 0 ? 1.0f / (float)(1 << -k) : (float)(1 << k);
+            match = w == (float)up_fix.gw * f && h == (float)up_fix.gh * f;
+        }
+        if (!match) continue;
+        if (!m->found) memcpy(buf, g, nw * 4);
+        m->found = true;
+        buf[i] = w * up_fix.sx, buf[i + 1] = h * up_fix.sy;
+        buf[i + 2] = g[i + 2] / up_fix.sx, buf[i + 3] = g[i + 3] / up_fix.sy;
+        if (nlog < 4) {
+            nlog++;
+            LOG("[upsample] %ux%u target at %.2fx%.2f: texel grid %gx%g -> %gx%g (vertex constant buffer %llx row %llu)\n",
+                up_fix.gw, up_fix.gh, up_fix.sx, up_fix.sy, w, h, buf[i], buf[i + 1], (unsigned long long)addr,
+                (unsigned long long)(i / 4));
+        }
+    }
+    if (m->found) m->d = *out = ubo_span(vk_transient_copy(buf, nw * 4, 256), nw * 4);
+    return m->found;
+}
+
+static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    static struct { uint64_t addr, size, gen, serial, seq; uint32_t tw, th, aw, ah; bool found; VkDescriptorBufferInfo d; } memo[8];
+    __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
+    uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
+    if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
+        m->tw == up_fix.tw && m->th == up_fix.th && m->aw == up_fix.aw && m->ah == up_fix.ah) {
+        if (m->found) *out = m->d;
+        return m->found;
+    }
+    *m = (__typeof__(*m)){.addr = addr, .size = size, .gen = gen, .serial = uub_serial, .seq = seq, .tw = up_fix.tw,
+                          .th = up_fix.th, .aw = up_fix.aw, .ah = up_fix.ah};
+    if (!up_fix.tw || !up_fix.th || (up_fix.tw == up_fix.aw && up_fix.th == up_fix.ah)) return false;
+    const float *g = (const float *)(uintptr_t)addr;
+    float tx = 1.0f / (float)up_fix.tw, ty = 1.0f / (float)up_fix.th;
+    static float buf[0x10000 / 4];
+    static int nlog;
+    uint64_t nw = (size < sizeof buf ? size : sizeof buf) / 4;
+    for (uint64_t i = 0; i + 1 < nw; i += 2) {  // (a vec2: 8-byte aligned)
+        if (fabsf(g[i] - tx) > tx * 1e-5f || fabsf(g[i + 1] - ty) > ty * 1e-5f) continue;
+        if (!m->found) memcpy(buf, g, nw * 4);
+        m->found = true;
+        buf[i] = 1.0f / (float)up_fix.aw, buf[i + 1] = 1.0f / (float)up_fix.ah;
+        if (nlog < 4) {
+            nlog++;
+            LOG("[upsample] %ux%u texture at %ux%u: fragment texel size %g %g -> %g %g (constant buffer %llx word %llu)\n",
+                up_fix.tw, up_fix.th, up_fix.aw, up_fix.ah, tx, ty, buf[i], buf[i + 1], (unsigned long long)addr,
+                (unsigned long long)i);
+        }
+    }
+    if (m->found) m->d = *out = ubo_span(vk_transient_copy(buf, nw * 4, 256), nw * 4);
+    return m->found;
+}
+
 // The views widened to the window (output_scale.c rt_persp), in draws into the final image (RS_OUT) whose vertex
 // constant buffer c3 starts with a symmetric perspective matrix (the HUD's and menus' layers: nn::ui2d's vertex block,
 // the matrix in c3[0-3], the view in c3[4-6], the pane's rectangle - width, height, left, top - in c3[33]):
@@ -3041,6 +3129,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     VkDescriptorBufferInfo direct;
     if (gw_ubo_direct(r.addr, size, &direct)) return direct;  // (written by a storing shader: read in place, see gw_note)
     if (stage == 1 && sdw_fix.s > 1 && sdw_patch(r.addr, size, &direct)) return direct;  // (texel size: see sdw_fix)
+    if (stage == 0 && up_fix.sx > 0 && up_patch(r.addr, size, &direct)) return direct;  // (up_fix: texel grid)
+    if (stage == 1 && up_fix.sx > 0 && up_patch_frag(r.addr, size, &direct)) return direct;  // (up_fix: texel step)
     if (stage == 0 && k == 3 && hud_patch(r.addr, size, &direct)) return direct;  // (a 16:9 HUD layer: see hud_patch)
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
@@ -4632,6 +4722,28 @@ have_pipe:
             if (t && vk_texture_scale_group(t) == RS_SHADOW) { sdw_fix.gw = wh[0]; sdw_fix.gh = wh[1]; sdw_fix.s = sc[0]; }
         }
     }
+    up_fix.sx = 0;
+    {   // a scaled scene's half-size buffers brought back by nearest depth: the texel grid and step scaled (up_fix)
+        static int off = -1;
+        if (off < 0) off = getenv("SAVAGEWIND_NO_UPSAMPLE_FIX") != NULL;
+        bool scaled = !off && st.rt.ncolor && st.rt.color[0] && (pass_sx > 1 || pass_sy > 1);
+        if (scaled && !pr->fs_gather) {  // (the first gathered texture's slot, from the translated source: 2 + slot)
+            const char *p = pr->fi->msl ? strstr(pr->fi->msl, "textureGather(t") : NULL;
+            int slot = p ? atoi(p + 15) : -1;
+            pr->fs_gather = slot >= 0 && slot < pr->fi->ntex && slot < 64 ? (uint8_t)(2 + slot) : 1;
+        }
+        int gs = scaled ? pr->fs_gather - 2 : -1;
+        NvnTexture *gt = gs >= 0 && fabsf(tex_sc[1][gs][0] - pass_sx) < 0.01f * pass_sx &&
+                         fabsf(tex_sc[1][gs][1] - pass_sy) < 0.01f * pass_sy ? shader_texture_object(1, &pr->fi->tex[gs]) : NULL;
+        TexBackend *gb = gt ? gt->backend : NULL;
+        if (gb && gt->width && gt->height) {
+            up_fix.gw = st.rt.color[0]->width, up_fix.gh = st.rt.color[0]->height;
+            up_fix.sx = (float)gb->width / (float)gt->width, up_fix.sy = (float)gb->height / (float)gt->height;
+            up_fix.tw = gt->width, up_fix.th = gt->height, up_fix.aw = gb->width, up_fix.ah = gb->height;
+            ndyn = 0;  // (the vertex set again, with its constants: the first of the draw's dynamic offsets)
+            vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
+        }
+    }
     if (profd) prof_tex += SDL_GetTicksNS() - prof_tx_;
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
@@ -4679,7 +4791,7 @@ have_pipe:
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = profd ? SDL_GetTicksNS() : 0;
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
-    sdw_fix.s = 0;
+    sdw_fix.s = 0, up_fix.sx = 0;
     if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     if (ndyn > 32) ndyn = 32;
