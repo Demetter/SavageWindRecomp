@@ -4149,6 +4149,7 @@ static uint64_t bound_cbuf_size(const ShaderInfo *si, int k, Range r) {
         full = getenv("SAVAGEWIND_CBR_BINDFULL") != NULL;
         atomic_store_explicit(&bindfull, full, memory_order_relaxed);
     }
+    if (perfx_trial(PERFX_CBR)) full = !perfx(PERFX_CBR);  // (A/B: the bounded copy, or the whole range as before)
     if (full && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     return size < 16 ? 16 : size;
@@ -5390,7 +5391,7 @@ static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptor
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     static int mode = -1;
     if (mode < 0) mode = getenv("SAVAGEWIND_VK_TEXTURE_BINDINGS") ? atoi(getenv("SAVAGEWIND_VK_TEXTURE_BINDINGS")) : 0;
-    if (!mode || nfeedback) {
+    if ((perfx_trial(PERFX_TEXBIND) ? !perfx(PERFX_TEXBIND) : !mode) || nfeedback) {
         texture_info_uncached(stage, si, i, out, sc, wh);
         return;
     }
@@ -9488,6 +9489,7 @@ static void survey_list_work(uint64_t draws_before, uint64_t readbacks_before, b
 void backend_execute(uint64_t handle) {
     uint64_t survey_draws = op_counts[CMD_DRAW_ARRAYS] + op_counts[CMD_DRAW_ELEMENTS];
     uint64_t survey_readbacks = op_counts[CMD_COPY_TEXTURE_TO_BUFFER];
+    perfx_list_begin();  // (SAVAGEWIND_PERFX: this list's translation and its draw jobs see one state)
     perf_survey_delay(SURVEY_PRODUCER, 0);
     if (perf_survey_mode == SURVEY_STUB || perf_survey_mode == SURVEY_WAIT_JOBS) {
         static bool was_stub;

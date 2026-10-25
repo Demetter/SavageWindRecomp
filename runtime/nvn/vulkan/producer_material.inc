@@ -41,7 +41,9 @@ static bool producer_material_allowed(Prog *pr) {
         !stage_reuse_mode && !g_vk.native_multi_draw && draw_batch_probe_on <= 0 &&
         st.program->stage_mask == 3 && pr->vi->ntex <= DJ_TEX && pr->fi->ntex <= DJ_TEX &&
         in_pass && !st.rt_dirty && !pass_out && !pass_cube_layers &&
-        g_settings.upscaler == UPSCALE_OFF && !g_settings.sharpening && !dlaa_wanted();
+        // (PERFX_MATUP) with an upscaler, DLAA or sharpening too: what they change per draw (the composite's scene,
+        // scaled textures) is never captured (producer_material_capture)
+        (perfx(PERFX_MATUP) || (g_settings.upscaler == UPSCALE_OFF && !g_settings.sharpening && !dlaa_wanted()));
 }
 
 static bool producer_material_current(const ProducerMaterial *m, Prog *pr) {

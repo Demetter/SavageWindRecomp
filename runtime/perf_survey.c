@@ -10,7 +10,53 @@ uint64_t perf_survey_epoch, perf_survey_start_ns = 45000000000ull;
 static uint64_t block_ns = 10000000000ull;
 static const char *names[] = {"off", "main", "jobs", "producer", "descriptor", "recorder", "gpu", "stub", "cpu-fence", "overlap-sensitivity", "overlap-jobs-stub", "overlap-queue-ahead", "overlap-downstream", "job-window", "fence-flags", "safe-overlap"};
 
+_Atomic uint32_t g_perfx, g_perfx_list;
+uint32_t g_perfx_mask;
+static uint32_t perfx_ab, perfx_ab_start = 3000;
+
+void perfx_list_begin(void) { atomic_store_explicit(&g_perfx_list, atomic_load(&g_perfx), memory_order_relaxed); }
+
+// (PERFX_SMT) one logical processor per physical core for the whole process, or all of them back: the game's critical
+// threads then never share a core with a spinning helper. Changed at once, from any thread.
+#ifdef _WIN32
+
+#include <windows.h>
+static void perfx_smt(bool one_per_core) {
+    static DWORD_PTR all, one;
+    if (!all) {
+        DWORD_PTR sys;
+        GetProcessAffinityMask(GetCurrentProcess(), &all, &sys);
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+        char *buf = malloc(len);
+        if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len))
+            for (DWORD o = 0; o < len;) {
+                SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)(buf + o);
+                KAFFINITY m = e->Processor.GroupMask[0].Mask & all;
+                if (e->Processor.GroupMask[0].Group == 0 && m) one |= m & (~m + 1);  // (the core's first logical processor)
+                o += e->Size;
+            }
+        free(buf);
+        if (!one) one = all;
+        LOG("[perfx] logical processors %#llx, one per core %#llx\n", (unsigned long long)all, (unsigned long long)one);
+    }
+    SetProcessAffinityMask(GetCurrentProcess(), one_per_core ? one : all);
+}
+#else
+static void perfx_smt(bool one_per_core) { (void)one_per_core; }
+#endif
+
 void perf_survey_init(void) {
+    const char *x = getenv("SAVAGEWIND_PERFX");
+    g_perfx_mask = x ? (uint32_t)strtoul(x, NULL, 0) : 0;
+    x = getenv("SAVAGEWIND_PERFX_AB");
+    perfx_ab = x ? (uint32_t)strtoul(x, NULL, 0) : 0;
+    x = getenv("SAVAGEWIND_PERFX_AB_START");
+    if (x) perfx_ab_start = (uint32_t)strtoul(x, NULL, 0);
+    atomic_store(&g_perfx, perfx_ab ? 0 : g_perfx_mask);
+    atomic_store(&g_perfx_list, atomic_load(&g_perfx));
+    if (g_perfx_mask) LOG("[perfx] mask %#x%s\n", g_perfx_mask, perfx_ab ? ", alternating" : "");
+    if ((g_perfx_mask & PERFX_SMT) && !perfx_ab) perfx_smt(true);
     const char *v = getenv("SAVAGEWIND_SURVEY");
     if (!v || !*v) return;
     for (int i = 1; i <= SURVEY_SAFE_OVERLAP; i++) if (!strcmp(v, names[i])) perf_survey_mode = i;
@@ -37,6 +83,19 @@ void perf_survey_init(void) {
 }
 
 void perf_survey_present(void) {
+    if (perfx_ab) {  // (SAVAGEWIND_PERFX_AB) off / on / on / off blocks
+        static uint64_t frames;
+        static int last = -2;
+        uint64_t f = ++frames;
+        int b = f < perfx_ab_start ? -1 : (int)((f - perfx_ab_start) / perfx_ab);
+        if (b != last) {
+            bool on = b >= 0 && (b % 4 == 1 || b % 4 == 2);
+            atomic_store(&g_perfx, on ? g_perfx_mask : 0);
+            if (g_perfx_mask & PERFX_SMT) perfx_smt(on);
+            LOG("[perfx] frame %llu block %d %s\n", (unsigned long long)f, b, on ? "on" : "off");
+            last = b;
+        }
+    }
     if (!perf_survey_mode) return;
     uint64_t now = plat_now_ns(), elapsed = now - perf_survey_epoch;
     int b = elapsed < perf_survey_start_ns ? -1 : (int)((elapsed - perf_survey_start_ns) / block_ns);

@@ -1462,6 +1462,8 @@ survey_account:;
                 char path[256];
                 snprintf(path, sizeof path, "build/frames/frame_%05ld.png", at);
                 renderer_save_texture_tex(b, path);
+                extern _Atomic uint32_t g_perfx_list;  // (perf_survey.h: the A/B state the frame was translated in)
+                LOG("[shot] %ld frame %llu perfx %#x\n", at, (unsigned long long)total_frames, (unsigned)g_perfx_list);
             }
             if (*next == ',') next++;
         }

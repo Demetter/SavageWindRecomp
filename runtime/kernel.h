@@ -64,6 +64,7 @@ typedef struct {
 } KTransferMem;
 
 extern pthread_mutex_t g_klock;
+void klock(void);  // pthread_mutex_lock(&g_klock), with a short spin first (kernel.c)
 extern KThread *g_waitlist;
 
 KObject *handle_get(uint32_t h);

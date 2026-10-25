@@ -14,6 +14,18 @@ void perf_survey_present(void);
 void perf_survey_delay(int role, unsigned identity);
 struct KThread;
 void perf_survey_guest(struct KThread *t);
+
+// Optimizations on trial, one bit each (PERFX_*): SAVAGEWIND_PERFX=<mask> turns them on. With
+// SAVAGEWIND_PERFX_AB=<frames> they go off / on / on / off in blocks of that many presented frames from
+// SAVAGEWIND_PERFX_AB_START (default 3000), for an A/B within one launch: "[perfx] frame <n> block <b> on|off".
+// The render thread takes the bits on at the start of each command list (perfx_list_begin; the list's draw jobs are
+// all done before the next list starts), so a list's translation and its workers see one state.
+enum { PERFX_CBR = 1, PERFX_TEXBIND = 2, PERFX_SMT = 4, PERFX_MATUP = 8, PERFX_KSPIN = 16 };
+extern _Atomic uint32_t g_perfx, g_perfx_list;
+extern uint32_t g_perfx_mask;  // the bits on trial (SAVAGEWIND_PERFX)
+void perfx_list_begin(void);
+static inline bool perfx(uint32_t bit) { return atomic_load_explicit(&g_perfx_list, memory_order_relaxed) & bit; }
+static inline bool perfx_trial(uint32_t bit) { return g_perfx_mask & bit; }
 static inline bool perf_survey_on(int mode) {
     if (perf_survey_mode == SURVEY_DOWNSTREAM || perf_survey_mode == SURVEY_JOB_WINDOW) {
         int b = atomic_load_explicit(&perf_survey_block, memory_order_relaxed);
