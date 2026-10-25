@@ -11,6 +11,7 @@
 #include "vk.h"
 #include "../../settings.h"
 #include "../astc.h"
+#include "../font_scale.h"
 #include "../glyphs.h"
 #include "../renderer.h"
 #include "depth_mirror.h"
@@ -316,6 +317,7 @@ bool renderer_texture_presented(NvnTexture *t) {
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     if (b && b->scalable) { *sx = b->sx; *sy = b->sy; }
+    else if (b && b->font_scale > 1) *sx = *sy = b->font_scale;  // (texel fetches and size queries in the guest's texels)
     else { *sx = 1; *sy = 1; }
 }
 
@@ -362,6 +364,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         if (tw < 1) tw = 1;
         if (th < 1) th = 1;
     }
+    if (b->font_scale > 1) { tw *= b->font_scale; th *= b->font_scale; }  // (a font sheet: upload_levels)
     VkImageType type = VK_IMAGE_TYPE_2D;
     uint32_t layers = 1, depth = 1;
     switch (t->target) {
@@ -932,6 +935,24 @@ static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferI
     vk_defer_image(img, mem);
 }
 
+// How many times its guest size t's image is made at: the game's font sheets (runtime/nvn/font_scale.c) at
+// SAVAGEWIND_FONT_SCALE, or with auto at the text's size on screen when they go up (the 1280x720 layouts are drawn
+// 1.5 times as large into the 1920x1080 final image, RS_OUT); everything else 1.
+static uint8_t font_scale_of(NvnTexture *t, TexBackend *b) {
+    int n = font_scale_setting();
+    if (n == 1 || b->gpu_owned || b->dynamic || (t->format != 0x49 && t->format != 0x01) || (t->target != 1 && t->target != 4) ||
+        nvn_texture_flags_pitch(t->flags) ||
+        !font_sheet_is((const uint8_t *)(uintptr_t)t->addr, tegra_layer_size(&t->layout), t->layout.layers ? t->layout.layers : 1,
+                       t->format, t->width, t->height, t->layout.levels))
+        return 1;
+    if (!n) n = (int)lroundf(1.5f * g_rs[RS_OUT][1]);
+    n = n < 1 ? 1 : n > 4 ? 4 : n;
+    static int nlog;
+    if (nlog++ < 48) LOG("[fonts] font sheet %llx (%ux%ux%u, format %#x) at %dx\n", (unsigned long long)t->addr, t->width,
+                         t->height, t->layout.layers ? t->layout.layers : 1, t->format, n);
+    return (uint8_t)n;
+}
+
 // Guest memory -> image for the levels in level_mask (bit per level), every layer or slice.
 static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
     if (b->comparison) b->comparison->dirty = true;
@@ -939,6 +960,13 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
     VkFmt mf = fmt_of(t->format);
     if (!t->addr || t->target == 10 || !fi || !fi->bpb || !storage_readable(t, storage_size(t))) return;
     if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
+    uint8_t fs = font_scale_of(t, b);
+    if (fs != (b->font_scale > 1 ? b->font_scale : 1)) {  // (a font sheet now, or no longer: made again at its size)
+        destroy_image(b);
+        b->font_scale = fs;
+        create_image(t, b);
+        if (b->format != mf.vf) return;
+    }
     VkCommandBuffer cb = vk_upload_cmd();
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
@@ -995,6 +1023,17 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
                         (unsigned long long)t->debug_id, (unsigned long long)t->addr, t->flags, (unsigned long long)t->stride, t->levels,
                         l.block_height_log2, l.block_depth_log2, path);
                 }
+            }
+            if (b->font_scale > 1) {  // (a font sheet: made n times as large from its glyphs, runtime/nvn/font_scale.c)
+                uint32_t n = b->font_scale;
+                VkSpan big = vk_transient(sz * n * n, 16);
+                font_sheet_upscale(t->format, lin, l.wb * fi->bw, l.hb * fi->bh, (int)n, big.ptr);
+                VkBufferImageCopy rg = {.bufferOffset = big.off, .bufferRowLength = l.wb * fi->bw * n,
+                                        .bufferImageHeight = l.hb * fi->bh * n, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
+                                        .imageExtent = {level_w(b, lv), level_h(b, lv), 1}};
+                vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, lv);
+                vkCmdCopyBufferToImage(cb, big.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                continue;
             }
             if (expand) {  // RGB8 -> RGBA8
                 uint8_t *o = s.ptr;
