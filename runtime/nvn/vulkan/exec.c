@@ -2643,6 +2643,42 @@ static const NvnTexEntry *shader_texture_entry(int stage, ShaderTexture *st_) {
     return &((NvnTexEntry *)st.tpool->entries)[tic];
 }
 
+// (vk_shadow_direct, textures.c) the cascades the game last made its half-size shadow copy from in this frame: its pass
+// draws into the copy and samples them, a depth 2D array of 3 layers twice the copy's size. The copy's readers compare
+// against them instead, at the same normalized coordinates and layers. Matched by storage address: the render target
+// and a pool entry can be different host objects for one image.
+static struct { uint64_t copy_addr; NvnTexture *src; uint64_t frame; } shadow_src;
+
+static void shadow_copy_note(ShaderInfo *fi) {
+    NvnTexture *copy = st.rt.ncolor > 0 ? st.rt.color[0] : NULL;
+    if (!vk_shadow_direct() || !vk_is_shadow_copy(copy) || !copy->addr) return;
+    for (int i = 0; i < fi->ntex; i++) {
+        NvnTexture *t = shader_texture_object(1, &fi->tex[i]);
+        if (t && t->target == 4 && t->depth == 3 && renderer_format_is_depth(t->format) && t->width == 2 * copy->width &&
+            t->height == 2 * copy->height) {
+            if (!vk_shadow_scaled(t)) return;  // (Console: the copy, as the game made it)
+            extern uint64_t vk_frame_counter(void);
+            if (shadow_src.src != t || shadow_src.copy_addr != copy->addr) {
+                static int nlog;
+                if (nlog++ < 4) LOG("[shadow] the %ux%ux3 copy's readers compare against its %ux%ux3 cascades\n", copy->width,
+                                    copy->height, t->width, t->height);
+            }
+            shadow_src.copy_addr = copy->addr, shadow_src.src = t, shadow_src.frame = vk_frame_counter();
+            return;
+        }
+    }
+}
+
+// The cascades to compare against in place of t, if t is that copy and this frame's pass named them; else NULL (the
+// copy, at the game's size)
+static NvnTexture *shadow_copy_source(const NvnTexture *t) {
+    extern uint64_t vk_frame_counter(void);
+    return vk_shadow_direct() && t && shadow_src.src && shadow_src.frame == vk_frame_counter() &&
+                   t->addr == shadow_src.copy_addr && vk_is_shadow_copy(t)
+               ? shadow_src.src
+               : NULL;
+}
+
 static bool is_attachment(NvnTexture *t) {
     if (!t) return false;
     if (t == st.rt.depth) return true;
@@ -3484,6 +3520,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                     layout = VK_IMAGE_LAYOUT_GENERAL;
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
+            NvnTexture *cascades = st_->shadow ? shadow_copy_source(et) : NULL;  // (the copy's readers: the cascades)
+            if (cascades) {
+                VkImageView v = vk_view(cascades, &e->view, e->has_view, false, st_->type);
+                if (v) view = v, layout = VK_IMAGE_LAYOUT_GENERAL;
+            }
         }
     }
     if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok);
@@ -4696,6 +4737,7 @@ have_pipe:
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
     sdw_fix.s = 0;
+    shadow_copy_note(pr->fi);
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
         float sc[2]; uint32_t wh[2];
         texture_info(1, pr->fi, i, &fii[i], sc, wh);

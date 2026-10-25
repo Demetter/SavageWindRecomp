@@ -182,6 +182,28 @@ static bool rs_stale(const TexBackend *b) {
 // setting then made again empty: the terrain went). Everything else keeps its guest size: LUTs, cubemaps, the small
 // odd-sized steps of the bloom and exposure chains (sampled with normalized coordinates, they work at any size).
 // SAVAGEWIND_NO_SCALE=1: none scaled.
+// The sun cascades' half-size copy (R16 2D array of 3 layers, square, 256 or more: 448x448x3 in BOTW): a pass takes the
+// max of each 2x2 of the cascades into it, and water, terrain, grass and the other forward-shaded surfaces do their
+// shadow comparisons on it.
+bool vk_is_shadow_copy(const NvnTexture *t) {
+    return t && t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 &&
+           t->depth == 3;
+}
+
+// Above the console's shadow resolution, the copy's readers compare against the cascades themselves (exec.c
+// shadow_copy_source): already a depth image, already at the chosen size, sampled at the same normalized coordinates and
+// layers. The copy stays at the game's size. Scaling the copy with the cascades instead (as before) made it 4096x4096x3
+// at Extreme, drawn every frame and sampled by every forward-shaded pixel: 1.5-1.7 ms of GPU on an RTX 5090 at
+// 5120x2160. SAVAGEWIND_NO_SHADOW_DIRECT=1: the scaled copy, as before.
+bool vk_shadow_direct(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_NO_SHADOW_DIRECT") == NULL;
+    return on;
+}
+
+// The cascades t are made bigger than the game's (Shadow resolution above Console); at Console the copy's readers keep it
+bool vk_shadow_scaled(const NvnTexture *t) { return t && g_shadow_size > t->width; }
+
 static uint8_t tex_scale_group(const NvnTexture *t) {
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_NO_SCALE") == NULL;
@@ -189,8 +211,7 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
     if ((t->target == 1 || t->target == 4) && t->samples <= 1 && (t->flags & 8) && renderer_format_is_depth(t->format) &&
         t->width == t->height && t->width >= 512)
         return RS_SHADOW;
-    if (t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 && t->depth == 3)
-        return RS_SHADOW;
+    if (!vk_shadow_direct() && vk_is_shadow_copy(t)) return RS_SHADOW;  // (the copy's readers use the cascades instead)
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || !(t->flags & 9) || t->width < 32 || t->height < 16) return RS_NONE;
     float a = (float)t->width / (float)t->height;
     if (a < 1.74f || a > 1.81f) return RS_NONE;

@@ -147,6 +147,9 @@ void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
 void vk_make_scalable_like(NvnTexture *t, NvnTexture *like);  // a pass's attachments share one scale
 uint8_t vk_texture_scale_group(NvnTexture *t);
+bool vk_is_shadow_copy(const NvnTexture *t);  // the sun cascades' half-size R16 copy (textures.c)
+bool vk_shadow_direct(void);                  // its readers compare against the cascades (SAVAGEWIND_NO_SHADOW_DIRECT=1: off)
+bool vk_shadow_scaled(const NvnTexture *t);  // the cascades t are bigger than the game's (Shadow resolution above Console)
 void renderer_get_scene_scale(float *sx, float *sy);
 void renderer_set_scene_scale(float sx, float sy);
 void renderer_set_shadow_size(uint32_t n);  // shadow maps' width (RS_SHADOW; 0: the game's own)
