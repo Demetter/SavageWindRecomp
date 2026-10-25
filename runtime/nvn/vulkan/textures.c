@@ -208,8 +208,14 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
         return RS_SHADOW;
     // (the cascades' half-size copy, R16 448x448x3, the max of each 2x2: water and the other forward-shaded surfaces
     // take their shadows from it, issue #101. Exactly 3 layers: a looser rule also took a 1024x1024x8 R16 array filled
-    // once at load, which a change of the setting then made again empty, and the terrain went)
-    if (t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 && t->depth == 3)
+    // once at load, which a change of the setting then made again empty, and the terrain went).
+    // SAVAGEWIND_SHADOW_COPY_SCALE=0: the copy stays at the game's size, as before (A/B of its GPU cost at Extreme,
+    // where it is 4096x4096x3)
+    static int copy_scale = -1;
+    if (copy_scale < 0)
+        copy_scale = !getenv("SAVAGEWIND_SHADOW_COPY_SCALE") || atoi(getenv("SAVAGEWIND_SHADOW_COPY_SCALE")) != 0;
+    if (copy_scale && t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 &&
+        t->depth == 3)
         return RS_SHADOW;
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || t->width < 32 || t->height < 16) return RS_NONE;
     if (!(t->flags & 9)) {
