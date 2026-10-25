@@ -24,6 +24,7 @@ Settings g_settings = {
     .movie_audio = true,
     .upscaler = UPSCALE_DEFAULT,  // (Off: the window's resolution; MetalFX on macOS)
     .upscale_quality = UPQ_QUALITY,
+    .dlss_mode = DLQ_QUALITY,
     .mouse_camera = true,
     .mouse_sens = MOUSE_SENS_DEFAULT,
     .motion_sens = 1.0f,
@@ -49,6 +50,7 @@ static const char *const k_vsync[VSYNC_COUNT] = {"on", "fast", "adaptive", "off"
 static const char *const k_icons[ICONS_COUNT] = {"auto", "keyboard", "xbox", "playstation", "nintendo"};
 
 static const char *const k_quality[UPQ_COUNT] = {"ultra_quality", "quality", "balanced", "performance"};
+static const char *const k_dlss_mode[DLQ_COUNT] = {"dlaa", "quality", "balanced", "performance", "ultra_performance"};
 
 void settings_load(void) {
     static bool loaded;
@@ -80,11 +82,19 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "settings_version")) version = atoi(val);
         else if (!strcmp(key, "resolution")) snprintf(old_res, sizeof old_res, "%s", val);  // (version 1)
-        else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's spatial upscaler; fsr3 / dlss: not yet)
-            g_settings.upscaler = !strcmp(val, "fsr1") || !strcmp(val, "metalfx") ? UPSCALE_SPATIAL : UPSCALE_OFF;
+        else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's spatial upscaler; dlss: Vulkan; fsr3: not yet)
+            g_settings.upscaler = !strcmp(val, "fsr1") || !strcmp(val, "metalfx") ? UPSCALE_SPATIAL
+#ifndef __APPLE__
+                                : !strcmp(val, "dlss") ? UPSCALE_DLSS
+#endif
+                                : UPSCALE_OFF;
         else if (!strcmp(key, "upscaler_quality")) {
             for (int i = 0; i < UPQ_COUNT; i++)
                 if (!strcmp(val, k_quality[i])) g_settings.upscale_quality = i;
+        }
+        else if (!strcmp(key, "dlss_mode")) {
+            for (int i = 0; i < DLQ_COUNT; i++)
+                if (!strcmp(val, k_dlss_mode[i])) g_settings.dlss_mode = i;
         }
         else if (!strcmp(key, "window_size")) {  // (WxH in pixels, or default)
             int w = 0, h = 0;
@@ -200,6 +210,8 @@ void settings_save(void) {
     int u = g_settings.upscaler, uq = g_settings.upscale_quality;
     fprintf(f, "upscaler = %s\n", u >= 0 && u < UPSCALE_COUNT ? ups[u] : "off");
     fprintf(f, "upscaler_quality = %s\n", k_quality[uq >= 0 && uq < UPQ_COUNT ? uq : UPQ_QUALITY]);
+    int dm = g_settings.dlss_mode;
+    fprintf(f, "dlss_mode = %s\n", k_dlss_mode[dm >= 0 && dm < DLQ_COUNT ? dm : DLQ_QUALITY]);
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : g_settings.antialias == AA_DLAA ? "dlaa" : "off");
     int an = g_settings.anisotropy;
     if (an >= 1 && an <= 4) fprintf(f, "anisotropy = %dx\n", 1 << an);

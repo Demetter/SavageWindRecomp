@@ -134,6 +134,9 @@ const int UPS_DEFAULT = 0;  // (UPSCALE_DEFAULT: Off, the window's resolution)
 std::vector<int> g_shown;   // per item: the value shown instead of get(), one that can't be picked yet (-1: none)
 const char16_t GREY = 3;    // (the game's message colour for greyed values)
 const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
+// (DLSS's own modes, g_settings.dlss_mode: the mode row shows these while the upscaler is DLSS)
+const char *const k_dlss_modes[] = {"DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+bool dlss_upscaler() { return g_settings.upscaler == UPSCALE_DLSS; }
 const char *const k_aa[] = {"FXAA (the game's)", "SMAA", "DLAA"};  // (AA_*; DLAA only with DLSS: vulkan/dlss.c)
 #ifndef __APPLE__
 extern "C" bool dlss_available(void);
@@ -226,7 +229,10 @@ const char *ups_label(const Item &, int x) {
     if (u == UPSCALE_METALFX) return tr("MetalFX");
     if (u == UPSCALE_FSR1) return tr("AMD FSR 1");
     if (u == UPSCALE_FSR3) return soon("FSR 3");
-    return soon("DLSS", renderer_gpu_rtx() ? "(coming soon)" : "(NVIDIA RTX only)");
+#ifndef __APPLE__
+    if (dlss_available()) return tr("DLSS");
+#endif
+    return soon("DLSS", renderer_gpu_rtx() ? "(not installed)" : "(NVIDIA RTX only)");
 }
 
 const char *fps_label(const Item &, int x) {
@@ -342,16 +348,27 @@ void build_items(void) {
                        },
                        [](const Item &, int x) { g_settings.upscaler = k_ups_value[x]; }, UPS_DEFAULT));
     v.back().value_off = [](const Item &, int x) { return !upscaler_available(k_ups_value[x]); };
+    v.back().desc_fn = [](const Item &) {
+        return g_settings.upscaler == UPSCALE_DLSS && upscaler_available(UPSCALE_DLSS)
+                   ? tr("NVIDIA DLSS: renders smaller, then rebuilds the detail from earlier frames.")
+                   : tr("Off: full resolution. AMD FSR 1: renders smaller, then upscales.");
+    };
+    // (its values: AMD's four modes, or DLSS's five while the upscaler is DLSS - the same default, Quality, at 1)
     Item mode = choice(P_VIDEO, "Upscaler mode", "",
-                       [](const Item &) { return N(k_modes); },
-                       [](const Item &, int x) { return upscale_modes_available() ? tr(k_modes[x]) : soon(k_modes[x]); },
-                       [](const Item &) { return g_settings.upscale_quality; },
-                       [](const Item &, int x) { g_settings.upscale_quality = x; }, UPQ_QUALITY);
+                       [](const Item &) { return dlss_upscaler() ? N(k_dlss_modes) : N(k_modes); },
+                       [](const Item &, int x) {
+                           const char *m = dlss_upscaler() ? k_dlss_modes[x] : k_modes[x];
+                           return upscale_modes_available() ? tr(m) : soon(m);
+                       },
+                       [](const Item &) { return dlss_upscaler() ? g_settings.dlss_mode : g_settings.upscale_quality; },
+                       [](const Item &, int x) { (dlss_upscaler() ? g_settings.dlss_mode : g_settings.upscale_quality) = x; },
+                       UPQ_QUALITY);
     mode.value_off = [](const Item &, int) { return !upscale_modes_available(); };
     mode.desc_fn = [](const Item &) {
         // (one line: the game's description pane is one English line wide)
-        return upscale_modes_available() ? tr("Ultra Quality is the sharpest, Performance the fastest.")
-                                         : tr("Renders smaller, then upscales. Coming in a later version.");
+        if (!upscale_modes_available()) return tr("Renders smaller, then upscales. Coming in a later version.");
+        return dlss_upscaler() ? tr("DLAA is the sharpest, Ultra Performance the fastest.")
+                               : tr("Ultra Quality is the sharpest, Performance the fastest.");
     };
     v.push_back(mode);
     v.push_back(choice(P_VIDEO, "Anti-aliasing", "DLAA: NVIDIA's temporal anti-aliasing, the steadiest edges.",
@@ -700,7 +717,13 @@ extern "C" int rt_opt_store(uint64_t row) {
             fprintf(stderr, "[options] %s = %d at %.3f s\n", it->title, x, SDL_GetTicksNS() / 1e9);
     }
     if (it->kind != KIND_BUTTON) settings_save();
-    if (it->page == P_VIDEO) mark_all_rows(rd64(row));  // (the sizes offered follow Fullscreen, texts the upscaler)
+    if (it->page == P_VIDEO) {  // (the sizes offered follow Fullscreen, texts and the modes offered the upscaler)
+        for (size_t i = 0; i < g_items.size(); i++) {
+            Entry &e = g_entries[GAME_ENTRIES + i];
+            if (g_items[i].kind == KIND_CHOICE) e.last_value = e.first_value + game_count(g_items[i]) - 1;
+        }
+        mark_all_rows(rd64(row));
+    }
     if (past_end) g_dirty.push_back(row);                // (first: the row shows the value at the other end)
     return 1;
 }

@@ -3842,7 +3842,11 @@ static struct {
     uint32_t frames;         // frames DLSS ran in a row (0: the next one resets its history)
 } taa;
 
-static bool dlaa_wanted(void) { return g_settings.antialias == AA_DLAA && dlss_available(); }
+// DLSS as the upscaler (Video > Upscaler: NVIDIA DLSS, its mode: g_settings.dlss_mode): the same jittered frames and
+// motion vectors as DLAA, the scene rendered smaller by its mode (output_scale.c) and brought by DLSS to its size in
+// the final image at the composite (scene_post). In its DLAA mode it renders at that size: DLAA itself.
+static bool dlss_upscaling(void) { return g_settings.upscaler == UPSCALE_DLSS && dlss_available(); }
+static bool dlaa_wanted(void) { return (g_settings.antialias == AA_DLAA || dlss_upscaling()) && dlss_available(); }
 static float halton(uint32_t i, uint32_t b) {
     float f = 1, r = 0;
     for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
@@ -8568,7 +8572,7 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
 // size in the window (its crop is drawn into the viewport).
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
     VkImageView v = raw_view(b);
-    bool smaa = g_settings.antialias == AA_SMAA;
+    bool smaa = g_settings.antialias == AA_SMAA && !dlss_upscaling();  // (DLSS anti-aliases the scene itself)
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
@@ -8643,13 +8647,13 @@ static TexBackend *taa_image(int i, uint32_t w, uint32_t h, VkFormat f) {  // 0:
     return d;
 }
 
-typedef struct { VkCommandBuffer cb; SwDlssImage c, d, m, o; float jx, jy; int reset; } DlssOp;
+typedef struct { VkCommandBuffer cb; SwDlssImage c, d, m, o; float jx, jy; int reset, quality; unsigned flags; } DlssOp;
 static void dlss_replay(void *p) {
     DlssOp *o = p;
     // (made, or made again for a new size; then the frame. Recorded where the list's commands are)
     static int preset = -1;  // (A/B) SAVAGEWIND_DLSS_PRESET=<n>: the model (5: E, the older CNN; 11: K, the transformer)
     if (preset < 0) preset = getenv("SAVAGEWIND_DLSS_PRESET") ? atoi(getenv("SAVAGEWIND_DLSS_PRESET")) : 0;
-    if (dlss_create(o->cb, o->c.width, o->c.height, o->o.width, o->o.height, SWDLSS_DLAA, SWDLSS_PRESET(preset)))
+    if (dlss_create(o->cb, o->c.width, o->c.height, o->o.width, o->o.height, o->quality, o->flags | SWDLSS_PRESET(preset)))
         dlss_evaluate(o->cb, &o->c, &o->d, &o->m, &o->o, o->jx, o->jy, 1.0f, 1.0f, o->reset);
 }
 
@@ -8675,8 +8679,9 @@ static void mat4_inverse(const double *m, double *inv) {  // (row-major; a singu
     for (int i = 0; i < 16; i++) inv[i] = fabs(det) > 1e-30 ? a[i] / det : (i % 5 == 0);
 }
 
-// The scene b (the composite's input) anti-aliased by DLSS: its output image, or NULL (DLAA can't run this frame).
-static TexBackend *dlaa_run(VkCommandBuffer cb, TexBackend *b, VkImageView src) {
+// The scene b (the composite's input) anti-aliased by DLSS into an ow x oh image (b's own size: DLAA; bigger: DLSS as
+// the upscaler, in its mode): that image, or NULL (DLSS can't run this frame).
+static TexBackend *dlaa_run(VkCommandBuffer cb, TexBackend *b, VkImageView src, uint32_t ow, uint32_t oh) {
     if (!taa.active || taa.frame != renderer_present_count() || !taa.depth || !taa.depth->image || taa.w != b->width ||
         taa.h != b->height)
         return NULL;
@@ -8700,7 +8705,7 @@ static TexBackend *dlaa_run(VkCommandBuffer cb, TexBackend *b, VkImageView src) 
         VK_CHECK(vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pipe));
     }
     uint32_t w = b->width, h = b->height;
-    TexBackend *mv = taa_image(0, w, h, VK_FORMAT_R16G16_SFLOAT), *out = taa_image(1, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
+    TexBackend *mv = taa_image(0, w, h, VK_FORMAT_R16G16_SFLOAT), *out = taa_image(1, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT);
     static const VkComponentMapping id = {0};
     VkImageView dv = vk_image_view(taa.depth, VK_IMAGE_VIEW_TYPE_2D, taa.depth->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
     VkImageView mvv = post_view(mv), ov = post_view(out);
@@ -8738,10 +8743,15 @@ static TexBackend *dlaa_run(VkCommandBuffer cb, TexBackend *b, VkImageView src) 
         const char *e = getenv("SAVAGEWIND_DLSS_JITTER");
         sx = e && e[0] == '-' ? -1 : 1, sy = e && e[0] && e[1] == '-' ? -1 : 1;
     }
+    // (upscaling: NGX's mode for the one chosen, the motion vectors at the input's size, in its pixels)
+    bool up = ow != w || oh != h;
+    int dm = g_settings.dlss_mode;
+    int quality = !up ? SWDLSS_DLAA : dlss_upscaling() && dm > DLQ_DLAA && dm < DLQ_COUNT ? dm : SWDLSS_QUALITY;
     DlssOp op = {.cb = cb, .c = {b->image, src, b->format, w, h}, .d = {taa.depth->image, dv, taa.depth->format, w, h},
-                 .m = {mv->image, mvv, mv->format, w, h}, .o = {out->image, ov, out->format, w, h},
-                 .jx = (float)sx * taa.jx, .jy = (float)sy * taa.jy, .reset = taa.frames == 0 || !taa.have_prev};
-    gp_mark(cb, "dlaa: DLSS %ux%u", w, h);
+                 .m = {mv->image, mvv, mv->format, w, h}, .o = {out->image, ov, out->format, ow, oh},
+                 .jx = (float)sx * taa.jx, .jy = (float)sy * taa.jy, .reset = taa.frames == 0 || !taa.have_prev,
+                 .quality = quality, .flags = up ? SWDLSS_MV_LOW_RES : 0};
+    gp_mark(cb, "dlaa: DLSS %ux%u -> %ux%u", w, h, ow, oh);
     if (!vkq_custom(dlss_replay, &op, sizeof op)) dlss_replay(&op);
     vk_dyn_forget();  // (DLSS binds its own pipelines and sets)
     vk_full_barrier(cb);
@@ -8782,6 +8792,7 @@ static void scene_post(Prog *pr, CmdRec *r) {
         TexBackend *b = vk_tex(t, false);
         if (!b->image || b->layers != 1 || b->samples != 1 || b->depth != 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
         bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
+        bool dsr = dlaa && dlss_upscaling() && (ow > b->width + 1 || oh > b->height + 1);  // (DLSS the upscaler)
         if (!up && !cas && !dlaa) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
@@ -8792,7 +8803,10 @@ static void scene_post(Prog *pr, CmdRec *r) {
         VkImageView src = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
         uint32_t w = b->width, h = b->height;
         TexBackend *out = NULL;
-        if (dlaa && (out = dlaa_run(cb, b, src))) src = post_view(out), scene_up.dlaa = true;
+        if (dlaa && (out = dlaa_run(cb, b, src, dsr ? ow : w, dsr ? oh : h))) {
+            src = post_view(out), scene_up.dlaa = true;
+            w = out->width, h = out->height;
+        }
         if (!out && !up && !cas) return;
         if (up) {
             TexBackend *e = post_image(5, ow, oh, b->format), *o = post_image(6, ow, oh, b->format);
@@ -8822,7 +8836,8 @@ static void scene_post(Prog *pr, CmdRec *r) {
         static uint32_t lw, lh, low, loh;
         static int lcas = -1;
         if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas)
-            LOG("[post] scene %ux%u%s -> %ux%u%s (format %d)\n", b->width, b->height, up ? " fsr1" : "", w, h,
+            LOG("[post] scene %ux%u%s -> %ux%u%s (format %d)\n", b->width, b->height,
+                up ? " fsr1" : scene_up.dlaa ? (w != b->width || h != b->height ? " dlss" : " dlaa") : "", w, h,
                 cas ? " cas" : "", b->format);
         lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening;
         return;

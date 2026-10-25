@@ -3,9 +3,10 @@
 #include <stdbool.h>
 
 // Upscalers (Video > Upscaler; runtime/nvn/output_scale.c): Off renders at the window's size; the others render
-// smaller by their quality mode's factor and scale up to the window. FSR 3 and DLSS are listed as coming later.
+// smaller by their quality mode's factor and scale up to the window. FSR 3 is listed as coming later.
 enum { UPSCALE_OFF = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /* AMD FSR 1, Vulkan */,
-       UPSCALE_FSR3 = 3 /* AMD FSR 3: not yet */, UPSCALE_DLSS = 4 /* NVIDIA DLSS: not yet */, UPSCALE_COUNT };
+       UPSCALE_FSR3 = 3 /* AMD FSR 3: not yet */, UPSCALE_DLSS = 4 /* NVIDIA DLSS, Vulkan on RTX (vulkan/dlss.c) */,
+       UPSCALE_COUNT };
 #ifdef __APPLE__
 #define UPSCALE_SPATIAL UPSCALE_METALFX  // each OS's spatial upscaler
 #define UPSCALE_DEFAULT UPSCALE_METALFX  // (Metal has no internal resolution yet: MetalFX scales the image to the window)
@@ -15,6 +16,9 @@ enum { UPSCALE_OFF = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /* AMD
 #endif
 // quality modes, AMD's scale factors (per axis): Ultra Quality 1.3, Quality 1.5, Balanced 1.7, Performance 2.0
 enum { UPQ_ULTRA = 0, UPQ_QUALITY = 1, UPQ_BALANCED = 2, UPQ_PERFORMANCE = 3, UPQ_COUNT };
+// DLSS's own modes, NVIDIA's scale factors (per axis): DLAA 1 (the window's resolution), Quality 1.5, Balanced 1.72,
+// Performance 2, Ultra Performance 3; in the order of the DLSS bridge's quality values (vulkan/dlss/swdlss.h)
+enum { DLQ_DLAA = 0, DLQ_QUALITY = 1, DLQ_BALANCED = 2, DLQ_PERFORMANCE = 3, DLQ_ULTRA_PERF = 4, DLQ_COUNT };
 enum { AA_OFF = 0, AA_SMAA = 1, AA_DLAA = 2 };  // (OFF: the game's own FXAA only; DLAA: NVIDIA DLSS at native size, exec.c)
 // Shadow resolution (Video > Shadow resolution; runtime/nvn/output_scale.c shadow_map_size): the sun's shadow maps at
 // the console's size (BOTW: 896 x 896) or made bigger, for sharper shadows at some GPU time.
@@ -35,6 +39,7 @@ typedef struct {
     int window_w, window_h;  // Video > Window size, pixels (0: not chosen; runtime/window_size.c)
     int upscaler;        // UPSCALE_*: Off (render at the window's size), or render smaller and scale up
     int upscale_quality; // UPQ_*: the upscaler's mode (how much smaller it renders)
+    int dlss_mode;       // DLQ_*: DLSS's mode, in place of upscale_quality while the upscaler is DLSS
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     int anisotropy;      // texture filtering: 0 the game's own, 1..4 = 2x, 4x, 8x, 16x (vulkan/textures.c)
     int sharpening;      // AMD CAS sharpening of the 3D image, 0 (off) .. 10 (100%) (vulkan/exec.c scene_post)

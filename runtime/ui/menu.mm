@@ -603,7 +603,14 @@ static void tab_display(void) {
         // The modes wait for render-target scaling (upscale_modes_available): until then the upscaler brings the
         // game's own 1920 x 1080 image to a bigger window.
         std::string fsr3 = std::string(tr("FSR 3")) + " " + tr("(coming soon)");
-        std::string dlss = std::string(tr("DLSS")) + " " + tr(renderer_gpu_rtx() ? "(coming soon)" : "(NVIDIA RTX only)");
+#ifndef __APPLE__
+        bool dlss_ok = dlss_available();
+#else
+        bool dlss_ok = false;
+#endif
+        // (DLSS: an RTX GPU, and NVIDIA's nvngx_dlss.dll with the bridge swdlss.dll next to the program: vulkan/dlss.c)
+        std::string dlss = dlss_ok ? std::string(tr("DLSS"))
+                                   : std::string(tr("DLSS")) + " " + tr(renderer_gpu_rtx() ? "(not installed)" : "(NVIDIA RTX only)");
 #ifdef __APPLE__
         const char *ups[] = {"Off", "MetalFX"};
         static const int ups_value[] = {UPSCALE_OFF, UPSCALE_METALFX};
@@ -613,10 +620,15 @@ static void tab_display(void) {
 #else
         const char *ups[] = {"Off", "AMD FSR 1", fsr3.c_str(), dlss.c_str()};
         static const int ups_value[] = {UPSCALE_OFF, UPSCALE_FSR1, UPSCALE_FSR3, UPSCALE_DLSS};
-        const char *ud = "Off: the 3D image renders at the window's resolution. AMD FSR 1: it renders smaller (the mode "
-                         "below), then FSR 1's edge-aware upscaling and sharpening bring it to the window. The HUD and "
-                         "menus always render at the window's resolution.\n\nAMD FSR 3 and NVIDIA DLSS (NVIDIA RTX "
-                         "graphics cards) are coming in a later version.";
+        const char *ud = dlss_ok
+            ? "Off: the 3D image renders at the window's resolution. AMD FSR 1: it renders smaller (the mode below), then "
+              "FSR 1's edge-aware upscaling and sharpening bring it to the window. NVIDIA DLSS: it renders smaller (DLSS's "
+              "own modes below), then DLSS rebuilds the detail from the frames before and anti-aliases it. The HUD and "
+              "menus always render at the window's resolution.\n\nAMD FSR 3 is coming in a later version."
+            : "Off: the 3D image renders at the window's resolution. AMD FSR 1: it renders smaller (the mode "
+              "below), then FSR 1's edge-aware upscaling and sharpening bring it to the window. The HUD and "
+              "menus always render at the window's resolution.\n\nAMD FSR 3 and NVIDIA DLSS (NVIDIA RTX "
+              "graphics cards) are coming in a later version.";
 #endif
         enum { NU = sizeof ups_value / sizeof ups_value[0] };
         bool avail[NU];
@@ -629,14 +641,18 @@ static void tab_display(void) {
         int udef = 0;  // (the reset value: UPSCALE_DEFAULT)
         for (int i = 0; i < NU; i++) if (ups_value[i] == UPSCALE_DEFAULT) udef = i;
         if (opt_choice_avail("Upscaler", &ui, &shown, ups, avail, NU, udef, ud)) g_settings.upscaler = ups_value[ui];
-        // its mode (AMD's scale factors), one step in; greyed when the upscaler is off
+        // its mode, one step in (AMD's scale factors; DLSS: NVIDIA's own modes, g_settings.dlss_mode); greyed when the
+        // upscaler is off
         static const char *const modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
-        bool modes_ok = upscale_modes_available();
-        std::string mode_names[UPQ_COUNT];
-        const char *mn[UPQ_COUNT];
-        bool mavail[UPQ_COUNT];
-        for (int i = 0; i < UPQ_COUNT; i++) {
-            mode_names[i] = modes_ok ? tr(modes[i]) : std::string(tr(modes[i])) + " " + tr("(coming soon)");
+        static const char *const dlss_modes[] = {"DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+        bool modes_ok = upscale_modes_available(), dl = g_settings.upscaler == UPSCALE_DLSS;
+        int nmodes = dl ? DLQ_COUNT : UPQ_COUNT;
+        std::string mode_names[DLQ_COUNT];
+        const char *mn[DLQ_COUNT];
+        bool mavail[DLQ_COUNT];
+        for (int i = 0; i < nmodes; i++) {
+            const char *m = dl ? dlss_modes[i] : modes[i];
+            mode_names[i] = modes_ok ? tr(m) : std::string(tr(m)) + " " + tr("(coming soon)");
             mn[i] = mode_names[i].c_str();
             mavail[i] = modes_ok;
         }
@@ -644,15 +660,20 @@ static void tab_display(void) {
         renderer_get_scene_scale(&sx, &sy);
         char rendering[100];
         snprintf(rendering, sizeof rendering, tr("Rendering at %.0f x %.0f."), 1600.0 * sx, 900.0 * sy);
-        std::string md = std::string(tr("How much smaller the game renders before the upscaler brings it to the window, "
-                                        "on each side: Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance "
-                                        "2x. Smaller is faster and softer.")) +
+        std::string md = std::string(dl ? tr("How much smaller the game renders before DLSS brings it to the window, on "
+                                             "each side: DLAA 1x (the window's resolution, anti-aliasing only), Quality "
+                                             "1.5x, Balanced 1.72x, Performance 2x, Ultra Performance 3x. Smaller is "
+                                             "faster and softer.")
+                                        : tr("How much smaller the game renders before the upscaler brings it to the window, "
+                                             "on each side: Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance "
+                                             "2x. Smaller is faster and softer.")) +
                          "\n\n" + (modes_ok ? rendering : tr("Coming in a later version."));
         opt_indent(1);
         if (g_settings.upscaler == UPSCALE_OFF) opt_disable_next();
-        static int mshown = -1;
-        opt_choice_avail("Upscaler mode", &g_settings.upscale_quality, &mshown, mn, mavail, UPQ_COUNT, UPQ_QUALITY,
-                         md.c_str());
+        static int mshown = -1, dshown = -1;
+        if (dl) opt_choice_avail("Upscaler mode", &g_settings.dlss_mode, &dshown, mn, mavail, DLQ_COUNT, DLQ_QUALITY, md.c_str());
+        else opt_choice_avail("Upscaler mode", &g_settings.upscale_quality, &mshown, mn, mavail, UPQ_COUNT, UPQ_QUALITY,
+                              md.c_str());
         opt_indent(-1);
     }
     static const char *aa[] = {"FXAA (the game's)", "SMAA", "DLAA"};  // (AA_*; DLAA only with DLSS: vulkan/dlss.c)
@@ -660,6 +681,9 @@ static void tab_display(void) {
     int naa = dlss_available() ? 3 : 2;
 #else
     int naa = 2;
+#endif
+#ifndef __APPLE__
+    if (g_settings.upscaler == UPSCALE_DLSS && dlss_available()) opt_disable_next();  // (DLSS anti-aliases the image itself)
 #endif
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, naa, AA_OFF,
                "Smooths jagged edges. FXAA: the game's own. SMAA: finds the edges and blends only along them. DLAA: "

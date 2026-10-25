@@ -1515,22 +1515,34 @@ static struct { NvnSamplerDesc key; VkSampler s; } *g_samplers;
 static int g_nsamplers, g_cap_samplers;
 static pthread_mutex_t g_sampler_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso);
+static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso, float bias);
+
+// DLSS rendering smaller (Video > Upscaler): the samplers anisotropic filtering's override may apply to (mipmapped
+// textures in opaque draws: aniso_ok) take NVIDIA's texture LOD bias, log2(render size / output size), so the
+// textures keep the detail of the output's resolution. SAVAGEWIND_DLSS_NO_LOD_BIAS=1: the game's own.
+double upscale_factor(void);  // (runtime/nvn/output_scale.c: the upscaler's factor in use)
+static float dlss_lod_bias(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_DLSS_NO_LOD_BIAS") != NULL;
+    if (off || g_settings.upscaler != UPSCALE_DLSS || !dlss_available()) return 0;
+    double f = upscale_factor();
+    return f > 1.0 ? (float)-log2(f) : 0.0f;
+}
 
 VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok) {
-    float an = sampler_aniso(d, aniso_ok);
+    float an = sampler_aniso(d, aniso_ok), bias = aniso_ok && d->min_filter > 1 ? dlss_lod_bias() : 0;
     void **slot = aniso_ok ? &d->backend : &d->backend_plain;
     float *slot_aniso = aniso_ok ? &d->backend_aniso : &d->backend_plain_aniso;
-    if (*slot && *slot_aniso == an) return (VkSampler)*slot;
+    if (*slot && *slot_aniso == an && (!aniso_ok || d->backend_bias == bias)) return (VkSampler)*slot;
     NvnSamplerDesc key = *d;
     key.backend = key.backend_plain = NULL;
-    key.backend_aniso = an, key.backend_plain_aniso = 0;
+    key.backend_aniso = an, key.backend_plain_aniso = 0, key.backend_bias = bias;
     pthread_mutex_lock(&g_sampler_lock);
     VkSampler s = VK_NULL_HANDLE;
     for (int i = 0; i < g_nsamplers && !s; i++)
         if (!memcmp(&g_samplers[i].key, &key, sizeof key)) s = g_samplers[i].s;
     if (!s) {
-        s = sampler_create(d, an);
+        s = sampler_create(d, an, bias);
         if (g_nsamplers == g_cap_samplers) {
             g_cap_samplers = g_cap_samplers ? g_cap_samplers * 2 : 256;
             g_samplers = realloc(g_samplers, g_cap_samplers * sizeof *g_samplers);
@@ -1546,10 +1558,11 @@ VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok) {
     pthread_mutex_unlock(&g_sampler_lock);
     *slot = (void *)s;
     *slot_aniso = an;
+    if (aniso_ok) d->backend_bias = bias;
     return s;
 }
 
-static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso) {
+static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso, float bias) {
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = d->mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     uint32_t mf = d->min_filter;
@@ -1572,7 +1585,7 @@ static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso) {
     si.maxLod = d->lod_max > 1000 ? VK_LOD_CLAMP_NONE : d->lod_max;
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
-    si.mipLodBias = d->lod_bias;
+    si.mipLodBias = d->lod_bias + bias;
     if (aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = aniso; }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("SAVAGEWIND_LOD_MIN") ? (float)atof(getenv("SAVAGEWIND_LOD_MIN")) : 0;

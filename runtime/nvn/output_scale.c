@@ -9,7 +9,11 @@
 //                  game's composite (vulkan/exec.c scene_upscale)
 //   MetalFX        (macOS) metal.m has no scene / final split yet: the modes stay greyed there, and MetalFX scales the
 //                  game's image to a bigger window
-//   FSR 3, DLSS    listed as coming later (temporal: they need motion vectors, which the game has none of)
+//   NVIDIA DLSS    (RTX, with swdlss.dll and nvngx_dlss.dll next to the program: vulkan/dlss.c) the 3D scene renders
+//                  smaller by its own mode's factor (g_settings.dlss_mode, NVIDIA's: DLAA 1, Quality 1.5, Balanced
+//                  1.72, Performance 2, Ultra Performance 3); DLSS brings it to its size in the final image from the
+//                  jittered frames (vulkan/exec.c dlaa_run, the camera's motion vectors)
+//   FSR 3          listed as coming later
 // The window size itself is Video > Window size (runtime/window_size.c). On a window that isn't 16:9, Video > Fill wide
 // screens widens the game's views to it (rt_persp, below) and its 16:9 render targets with them; off, the 16:9 image
 // is fitted into the window with bars. Video > Field of view scales the world's camera in play (rt_persp).
@@ -28,17 +32,26 @@
 #define MAX_TEX 16384.0
 #define SCENE_LINES 900.0  // the height of the game's 3D scene targets (docked)
 
+#ifndef __APPLE__
+bool dlss_available(void);  // (vulkan/dlss.c: the bridge loaded, NGX up on an RTX GPU)
+#endif
+
 bool upscaler_available(int u) {
 #ifdef __APPLE__
     return u == UPSCALE_OFF || u == UPSCALE_METALFX;
 #else
-    return u == UPSCALE_OFF || u == UPSCALE_FSR1;
+    return u == UPSCALE_OFF || u == UPSCALE_FSR1 || (u == UPSCALE_DLSS && dlss_available());
 #endif
 }
 
 double upscale_mode_factor(int q) {
     static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0};
     return q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;
+}
+
+double dlss_mode_factor(int m) {  // (NVIDIA's: 100%, 66.7%, 58%, 50%, 33.3% of the output per axis)
+    static const double f[DLQ_COUNT] = {1.0, 1.5, 1.0 / 0.58, 2.0, 3.0};
+    return m >= 0 && m < DLQ_COUNT ? f[m] : 1.5;
 }
 
 // Rendering below the window's size: the 3D scene's render targets at their own scale (vulkan/textures.c). Metal has
@@ -55,8 +68,8 @@ bool upscale_modes_available(void) {
 
 double upscale_factor(void) {
     int u = g_settings.upscaler;
-    return u != UPSCALE_OFF && upscaler_available(u) && upscale_modes_available()
-               ? upscale_mode_factor(g_settings.upscale_quality) : 1.0;
+    if (u == UPSCALE_OFF || !upscaler_available(u) || !upscale_modes_available()) return 1.0;
+    return u == UPSCALE_DLSS ? dlss_mode_factor(g_settings.dlss_mode) : upscale_mode_factor(g_settings.upscale_quality);
 }
 
 // The window's shape over 16:9 while the game's views are widened to fill it, else 1; the field of view's factor in
