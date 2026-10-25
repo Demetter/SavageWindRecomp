@@ -15,6 +15,7 @@
 // is fitted into the window with bars. Video > Field of view scales the world's camera in play (rt_persp).
 // Test overrides: SAVAGEWIND_SCALE=<f> (render height = 1080 x f), SAVAGEWIND_WIDE_TEST=<f> (forced shape).
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,10 +138,35 @@ float output_view_shape(void) { return g_view_shape; }
 // the middle. The field of view scales the world's
 // camera only: its far plane is 25000 (its near plane moves with the camera's distance), the HUD's layers', the
 // menus' 3D models' and the start screen's are 10000. SAVAGEWIND_LOG_PROJ=1: each kind of view the first time.
+//
+// The world's camera (far plane over 10000) also gets the widened values written back into its projection: widening
+// only the matrix left tan(fovy / 2) and the aspect there 16:9 (and at the game's field of view), and the game's own
+// uses of them - the sun's shadow cascades are fitted to that view - saw a narrower view than the one drawn. On an
+// ultrawide window the shadows outside the 16:9 middle were missing or in the wrong place and slid as the camera
+// turned (issue #103). What the game set is kept per projection (wide_cam), so the next build, a change of the window
+// or of the field of view, and the screen-to-camera loads (tools/patches.py _persp_unproject) start from it again
+// instead of widening twice. SAVAGEWIND_NO_WIDE_CAMERA_FIX=1: the matrix only, as before.
+static struct { uint64_t proj; uint32_t set_t, set_a, wrote_t, wrote_a; } wide_cam[16];
+static unsigned wide_cam_next;
+static pthread_mutex_t wide_cam_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void rt_persp(uint64_t proj, uint32_t *tan_fovy, uint32_t *aspect) {
     float t, a, nf[2];
-    memcpy(&t, tan_fovy, 4), memcpy(&a, aspect, 4);
     memcpy(nf, (const void *)(uintptr_t)(proj + 0x98), 8);
+    static int wide_fix = -1;
+    if (wide_fix < 0) wide_fix = getenv("SAVAGEWIND_NO_WIDE_CAMERA_FIX") == NULL;
+    bool world = nf[1] > 10001;
+    if (world) {  // (values this wrote back: the game's own instead)
+        pthread_mutex_lock(&wide_cam_lock);
+        for (unsigned i = 0; i < 16; i++)
+            if (wide_cam[i].proj == proj && wide_cam[i].wrote_t == *tan_fovy && wide_cam[i].wrote_a == *aspect) {
+                *tan_fovy = wide_cam[i].set_t, *aspect = wide_cam[i].set_a;
+                break;
+            }
+        pthread_mutex_unlock(&wide_cam_lock);
+    }
+    uint32_t set_t = *tan_fovy, set_a = *aspect;
+    memcpy(&t, tan_fovy, 4), memcpy(&a, aspect, 4);
     static int log = -1;
     if (log < 0) log = getenv("SAVAGEWIND_LOG_PROJ") != NULL;
     if (log) {  // (by what it is, not where: many are copies on a stack)
@@ -160,6 +186,17 @@ void rt_persp(uint64_t proj, uint32_t *tan_fovy, uint32_t *aspect) {
     if (fov != 1 && nf[1] > 10001) t = tanf(fminf(atanf(t) * fov, 1.4f));  // (under 160 degrees)
     a *= shape;
     memcpy(tan_fovy, &t, 4), memcpy(aspect, &a, 4);
+    if (world && wide_fix && (*tan_fovy != set_t || *aspect != set_a)) {  // (the world's camera: written back)
+        memcpy((void *)(uintptr_t)(proj + 0xac), tan_fovy, 4), memcpy((void *)(uintptr_t)(proj + 0xb0), aspect, 4);
+        pthread_mutex_lock(&wide_cam_lock);
+        unsigned k = 16;
+        for (unsigned i = 0; i < 16 && k == 16; i++)
+            if (wide_cam[i].proj == proj) k = i;
+        if (k == 16) k = wide_cam_next++ & 15;
+        wide_cam[k].proj = proj, wide_cam[k].set_t = set_t, wide_cam[k].set_a = set_a;
+        wide_cam[k].wrote_t = *tan_fovy, wide_cam[k].wrote_a = *aspect;
+        pthread_mutex_unlock(&wide_cam_lock);
+    }
 }
 
 // The game's frustum views (tools/patches.py _frustum_load: sead's FrustumProjection; left, right at +0xa8 / +0xac,
