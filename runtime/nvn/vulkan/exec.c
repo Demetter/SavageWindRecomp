@@ -5076,6 +5076,45 @@ void vk_exec_reset(void) {
 static struct { NvnTexture *t; TexBackend *img; float sx, sy; bool dlaa; } scene_up;
 static void scene_post(Prog *pr, CmdRec *r);
 
+// (SAVAGEWIND_SHADOW_COPY_SCALE=2, textures.c vk_shadow_copy_mode) the cascades the game last made its half-size shadow
+// copy from in this frame: its pass draws into the copy and samples them, a depth 2D array of 3 layers twice the copy's
+// size. The copy's readers compare against them instead, at normalized coordinates and the same layers, so neither a
+// scaled copy nor its depth mirror is made. Matched by storage address: the render target and a pool entry can be
+// different host objects for one image.
+static struct { uint64_t copy_addr; NvnTexture *src; uint64_t frame; } shadow_src;
+
+static void shadow_copy_note(const ShaderInfo *fi) {
+    NvnTexture *copy = st.rt.ncolor > 0 ? st.rt.color[0] : NULL;
+    if (vk_shadow_copy_mode() != 2 || !vk_depth_mirror_enabled || !vk_is_shadow_copy(copy) || !copy->addr || !st.tpool)
+        return;
+    for (int i = 0; i < fi->ntex; i++) {
+        int slot = ((int)fi->tex[i].handle_offset - 0x20) / 8;
+        uint64_t h = slot >= 0 && slot < 32 ? st.tex[1][slot] : 0;
+        uint32_t tic = h & 0xfffff;
+        if (!h || tic >= (uint32_t)st.tpool->count) continue;
+        NvnTexture *t = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+        if (t && t->target == 4 && t->depth == 3 && renderer_format_is_depth(t->format) && t->width == 2 * copy->width &&
+            t->height == 2 * copy->height) {
+            if (shadow_src.src != t || shadow_src.copy_addr != copy->addr) {
+                static int nlog;
+                if (nlog++ < 4) LOG("[shadow-copy] readers of the %ux%ux3 copy compare against the %ux%ux3 cascades\n",
+                                    copy->width, copy->height, t->width, t->height);
+            }
+            shadow_src.copy_addr = copy->addr, shadow_src.src = t, shadow_src.frame = vk_frame_counter();
+            return;
+        }
+    }
+}
+
+// The cascades to compare against in place of t, if t is that copy and this frame's pass named them; else NULL (the copy
+// and its depth mirror, as before)
+static NvnTexture *shadow_copy_source(const NvnTexture *t) {
+    return vk_shadow_copy_mode() == 2 && t && shadow_src.src && shadow_src.frame == vk_frame_counter() &&
+                   t->addr == shadow_src.copy_addr && vk_is_shadow_copy(t)
+               ? shadow_src.src
+               : NULL;
+}
+
 static void prepare_depth_comparisons(int stage, const ShaderInfo *si) {
     if (!vk_depth_mirror_enabled) return;
     for (int i = 0; i < si->ntex; i++) {
@@ -5087,7 +5126,7 @@ static void prepare_depth_comparisons(int stage, const ShaderInfo *si) {
         if (!h || !st.tpool || !st.spool || tic >= (uint32_t)st.tpool->count || tsc >= (uint32_t)st.spool->count) continue;
         if (!((NvnSamplerDesc *)st.spool->entries)[tsc].compare_mode) continue;
         NvnTexture *t = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
-        if (t && (t->format == 0x06 || t->format == 0x0a)) vk_depth_mirror_prepare(t);
+        if (t && (t->format == 0x06 || t->format == 0x0a) && !shadow_copy_source(t)) vk_depth_mirror_prepare(t);
     }
 }
 
@@ -5181,7 +5220,9 @@ static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptor
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
             if (vk_depth_mirror_enabled && st_->shadow) {
-                VkImageView depth_view = vk_depth_mirror_view(et,&e->view,e->has_view,st_->type);
+                NvnTexture *cascades = shadow_copy_source(et);  // (the copy's readers: the cascades themselves)
+                VkImageView depth_view = cascades ? vk_view(cascades, &e->view, e->has_view, false, st_->type)
+                                                  : vk_depth_mirror_view(et,&e->view,e->has_view,st_->type);
                 if (depth_view) { view = depth_view; layout = VK_IMAGE_LAYOUT_GENERAL; }
             }
         }
@@ -7140,6 +7181,7 @@ static void draw_(CmdRec *r, bool indexed) {
         uint32_t cbufs[6] = {pr->vi->cbuf_mask, pr->fi->cbuf_mask, sm & 4 ? all : 0, sm & 8 ? all : 0, sm & 16 ? all : 0, 0};
         gw_check(cbufs, true, indexed ? r->x[3] : 0, indexed ? (uint64_t)r->x[2] * 4 : 0);
     }
+    shadow_copy_note(pr->fi);
     if (!material) {
         prepare_depth_comparisons(0,pr->vi);
         prepare_depth_comparisons(1,pr->fi);

@@ -155,6 +155,8 @@ void vk_depth_mirror_invalidate(NvnTexture *t);  // NULL: unknown image write; a
 bool vk_depth_mirror_prepare(NvnTexture *t);    // outside the next draw/dispatch, may end the preceding pass
 void vk_depth_mirror_mark(VkCommandBuffer cb, uint32_t width, uint32_t height, uint32_t layers, bool done);
 VkImageView vk_depth_mirror_view(NvnTexture *t, const NvnTextureView *v, bool has_view, int type);
+bool vk_is_shadow_copy(const NvnTexture *t);  // the sun cascades' half-size R16 copy (textures.c)
+int vk_shadow_copy_mode(void);                // SAVAGEWIND_SHADOW_COPY_SCALE: 0 game size, 1 scaled, 2 readers use the cascades
 VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v);  // (a colour texture's, sampled)
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);

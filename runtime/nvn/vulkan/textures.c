@@ -199,6 +199,31 @@ static bool rs_stale(const TexBackend *b) {
 // flag; shadow maps are square depth render targets, 512 or more (BOTW's sun cascades; its 192x192 depth target is no
 // shadow map). Everything else keeps its guest size: LUTs, cubemaps, the small odd-sized steps of the bloom and
 // exposure chains (sampled with normalized coordinates, they work at any size). SAVAGEWIND_NO_SCALE=1: none scaled.
+// The sun cascades' half-size copy (R16 2D array of 3 layers, square, 256 or more: 448x448x3 in BOTW): a pass takes
+// the max of each 2x2 of the cascades into it, and water, terrain, grass and the other forward-shaded surfaces do their
+// shadow comparisons on it.
+bool vk_is_shadow_copy(const NvnTexture *t) {
+    return t && t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 &&
+           t->depth == 3;
+}
+
+// What the copy is at Video > Shadow resolution above the console's (SAVAGEWIND_SHADOW_COPY_SCALE):
+//   0: the game's size, made into a depth image every frame for the comparisons (the depth mirror), as before #118;
+//   1 (default): scaled with the cascades (#118): at Extreme 4096x4096x3, made and mirrored every frame (~1.7 ms GPU on
+//      an RTX 5090 at 5120x2160);
+//   2: the game's size, and its readers compare against the cascades themselves (exec.c shadow_copy_source): already a
+//      depth image, already at the chosen size, so neither the scaled copy nor its mirror is made. Sharper than the
+//      copy, without its 2x2 max: worth an image check on water.
+int vk_shadow_copy_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("SAVAGEWIND_SHADOW_COPY_SCALE");
+        mode = e ? atoi(e) : 1;
+        if (mode < 0 || mode > 2) mode = 1;
+    }
+    return mode;
+}
+
 static uint8_t tex_scale_group(const NvnTexture *t) {
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_NO_SCALE") == NULL;
@@ -208,15 +233,9 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
         return RS_SHADOW;
     // (the cascades' half-size copy, R16 448x448x3, the max of each 2x2: water and the other forward-shaded surfaces
     // take their shadows from it, issue #101. Exactly 3 layers: a looser rule also took a 1024x1024x8 R16 array filled
-    // once at load, which a change of the setting then made again empty, and the terrain went).
-    // SAVAGEWIND_SHADOW_COPY_SCALE=0: the copy stays at the game's size, as before (A/B of its GPU cost at Extreme,
-    // where it is 4096x4096x3)
-    static int copy_scale = -1;
-    if (copy_scale < 0)
-        copy_scale = !getenv("SAVAGEWIND_SHADOW_COPY_SCALE") || atoi(getenv("SAVAGEWIND_SHADOW_COPY_SCALE")) != 0;
-    if (copy_scale && t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 &&
-        t->depth == 3)
-        return RS_SHADOW;
+    // once at load, which a change of the setting then made again empty, and the terrain went). Scaled in mode 1 only
+    // (vk_shadow_copy_mode).
+    if (vk_shadow_copy_mode() == 1 && vk_is_shadow_copy(t)) return RS_SHADOW;
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || t->width < 32 || t->height < 16) return RS_NONE;
     if (!(t->flags & 9)) {
         // BOTW's quarter-size R8 target (400x225, no flags) is its sun's shadow mask: drawn from the half-size scene
