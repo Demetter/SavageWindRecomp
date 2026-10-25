@@ -175,6 +175,9 @@ static int cur_sub;
 static uint64_t submit_seq;  // last submitted
 static uint64_t fx_seq;      // the last submission that touches guest memory (fx_mark)
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t deferred_seq;  // (seq_lock; renderer_wait_seq, GPU_OVERLAP) a fence the game was told is done whose
+                               // submission wasn't waited for
+static uint64_t oneshot_seq;   // (seq_lock) the latest submission with a one-off readback: a wait on it is never deferred
 static bool in_pass;
 static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
 static uint32_t chunk_passes; // passes begun since the last submission
@@ -497,6 +500,9 @@ void renderer_flush(void) {
     pthread_mutex_unlock(&seq_lock);
     gpu_unlock();
     vk_wait_seq(s);
+    pthread_mutex_lock(&seq_lock);
+    if (deferred_seq <= s) deferred_seq = 0;  // (GPU_OVERLAP: everything submitted so far is done)
+    pthread_mutex_unlock(&seq_lock);
 }
 
 void renderer_sync(void) {
@@ -504,6 +510,9 @@ void renderer_sync(void) {
     uint64_t s = submit_seq;
     pthread_mutex_unlock(&seq_lock);
     vk_wait_seq(s);
+    pthread_mutex_lock(&seq_lock);
+    if (deferred_seq <= s) deferred_seq = 0;
+    pthread_mutex_unlock(&seq_lock);
 }
 
 // A fence the game waits on (nvnSyncWait) stands for the GPU work before it that touches guest memory: the game waits
@@ -562,16 +571,85 @@ void renderer_survey_frame_fence(uint64_t chosen) {
     pthread_mutex_unlock(&seq_lock);
 }
 
+// CPU / GPU overlap (upstream PR #122, as LAS Recomp 3fc84bd on Metal, 13398126d66a on Vulkan). BOTW's main thread
+// records frame N+1 while frame N is translated, then waits in nvnSyncWait for frame N's GPU work, and only then lets
+// the render thread submit N+1: the GPU sat idle from the end of each frame until the first piece of the next one was
+// translated (~5 ms of ~22 in the open world on a Radeon 660M, which also let the driver lower its clock). The wait is
+// taken one fence late: waiting for fence N waits for the fence deferred last time and returns, so at most two frames
+// of GPU work are queued and a fence already reached is never deferred. What the game writes meanwhile is its next
+// frame's data, which a game built to overlap on the console double-buffers; constant buffers are copied at
+// translation. The render targets the CPU reads back (readback_schedule) arrive a frame later, except a one-off one
+// (a photo): a wait on its submission is never deferred. Here default off: SAVAGEWIND_GPU_OVERLAP=1 turns it on;
+// SAVAGEWIND_GPU_OVERLAP_AB=1 alternates OFF/ON/ON/OFF in ten-second blocks from 45 s after the first frame, logged
+// as [overlap-toggle]. (seq_lock held: the deferral's state changes with it.)
+static bool gpu_overlap(void) {
+    static int on = -1, ab, shown = -2;
+    static uint64_t t0;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_GPU_OVERLAP_AB");
+        ab = e && atoi(e);
+        e = getenv("SAVAGEWIND_GPU_OVERLAP");
+        on = e && atoi(e);
+        if (on || ab) LOG("[vk] GPU overlap %s (the game's frame fence waited one frame late)\n", ab ? "AB" : "on");
+    }
+    if (!ab) return on;
+    uint64_t now = plat_now_ns();
+    if (!t0) {
+        if (!renderer_present_count()) return false;
+        t0 = now;
+    }
+    uint64_t sec = (now - t0) / 1000000000ull;
+    int block = sec < 45 ? -1 : (int)((sec - 45) / 10);
+    bool b = block >= 0 && (block % 4 == 1 || block % 4 == 2);
+    if (block != shown) {
+        shown = block;
+        LOG("[overlap-toggle] ns %llu frame %llu block %d on %d\n", (unsigned long long)now,
+            (unsigned long long)renderer_present_count(), block, b);
+    }
+    return b;
+}
+
 void renderer_wait_seq(uint64_t seq) {
     if (!seq) return;
     pthread_mutex_lock(&seq_lock);
     uint64_t s = submit_seq;
-    pthread_mutex_unlock(&seq_lock);
     if (perf_survey_mode == SURVEY_FENCE_FLAGS)
         TRACE_LOG("[survey-wait-seq] %llu block %d requested %llu submitted %llu waited %llu\n",
             (unsigned long long)plat_now_ns(), atomic_load(&perf_survey_block), (unsigned long long)seq,
             (unsigned long long)s, (unsigned long long)(seq > s ? s : seq));
-    vk_wait_seq(seq > s ? s : seq);  // not submitted yet (other thread): everything submitted so far
+    if (seq > s) seq = s;  // not submitted yet (other thread): everything submitted so far
+    bool overlap = gpu_overlap();
+    if (!overlap) deferred_seq = 0;  // (switched off mid-run: this wait covers the deferred one)
+    if (overlap && oneshot_seq && oneshot_seq <= seq && oneshot_seq > vk_completed_seq()) {
+        deferred_seq = 0;  // (a one-off readback in what this waits for: everything up to it, now)
+        pthread_mutex_unlock(&seq_lock);
+        static int nlog;
+        if (nlog < 20) { nlog++; LOG("[vk] GPU overlap: a one-off readback, wait on submission %llu not deferred\n", (unsigned long long)seq); }
+        vk_wait_seq(seq);
+        return;
+    }
+    if (overlap) {
+        if (vk_completed_seq() >= seq) {
+            if (seq >= deferred_seq) deferred_seq = 0;  // (in order: the older one is done too)
+            pthread_mutex_unlock(&seq_lock);
+            readbacks_apply();
+            return;
+        }
+        uint64_t prev = deferred_seq;
+        if (seq > prev) {  // a newer fence: the deferred one is waited for now, this one at the next call
+            deferred_seq = seq;
+            pthread_mutex_unlock(&seq_lock);
+            if (!prev) return;
+            seq = prev;
+        } else {  // the deferred fence again, or an older one: a real wait on it
+            if (seq == prev) deferred_seq = 0;
+            pthread_mutex_unlock(&seq_lock);
+        }
+        vk_wait_seq(seq);
+        return;
+    }
+    pthread_mutex_unlock(&seq_lock);
+    vk_wait_seq(seq);
 }
 
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
@@ -1512,6 +1590,23 @@ static void readback_schedule(VkCommandBuffer cb, NvnTexture *t, const NvnTextur
     gcp_result(GCP_READBACK, r->seq, renderer_present_count(), r->fs, r->addr, stride * (h - 1) + row, (uint64_t)row * h);
     gcp_layout(r->addr, row, h, stride, r->fs);
     nreadbacks++;
+    {   // (GPU_OVERLAP) a target not read back within the last 16 frames (a photo; not the sky / exposure ones, read
+        // every frame or in turns: 8 128x128 targets one after another): the wait on this submission is a real one,
+        // so the game reads this frame's pixels
+        extern uint64_t vk_frame_counter(void);
+        static struct { uint64_t addr, frame; } last[64];
+        uint64_t fr = vk_frame_counter();
+        int k = 0;
+        while (k < 63 && last[k].addr && last[k].addr != r->addr) k++;
+        bool streaming = last[k].addr == r->addr && last[k].frame + 16 >= fr;
+        last[k].addr = r->addr;
+        last[k].frame = fr;
+        if (!streaming) {
+            pthread_mutex_lock(&seq_lock);
+            if (r->seq > oneshot_seq) oneshot_seq = r->seq;
+            pthread_mutex_unlock(&seq_lock);
+        }
+    }
     int m = linear_mem_find(r->addr, stride * h);
     if (m >= 0) linear_mem[m].pending++;
     pthread_mutex_unlock(&readback_lock);
