@@ -16,12 +16,14 @@ static uint32_t perfx_ab, perfx_ab_start = 3000;
 
 void perfx_list_begin(void) { atomic_store_explicit(&g_perfx_list, atomic_load(&g_perfx), memory_order_relaxed); }
 
-// (PERFX_SMT) one logical processor per physical core for the whole process, or all of them back: the game's critical
-// threads then never share a core with a spinning helper. Changed at once, from any thread.
+// One logical processor per physical core for the whole process (or all of them back): the game's main thread and the
+// render thread then never share a core with another of the game's busy threads, or a helper spinning for work.
+// Great Plateau 4.46 -> 4.24 ms a frame, Kakariko 4.06 -> 3.90 (Ryzen 7 7800X3D, 8 cores, in-launch A/B). With fewer
+// cores than the ~8 busy threads (main, two job workers, render, recording, descriptor, write watch, audio) they would
+// queue instead, so by default only with SMT and 8 or more physical cores. SAVAGEWIND_ONE_PER_CORE=1: always, 0: never.
 #ifdef _WIN32
-
 #include <windows.h>
-static void perfx_smt(bool one_per_core) {
+static void one_per_core(bool on) {
     static DWORD_PTR all, one;
     if (!all) {
         DWORD_PTR sys;
@@ -38,12 +40,31 @@ static void perfx_smt(bool one_per_core) {
             }
         free(buf);
         if (!one) one = all;
-        LOG("[perfx] logical processors %#llx, one per core %#llx\n", (unsigned long long)all, (unsigned long long)one);
     }
-    SetProcessAffinityMask(GetCurrentProcess(), one_per_core ? one : all);
+    SetProcessAffinityMask(GetCurrentProcess(), on ? one : all);
+}
+static void one_per_core_init(void) {
+    DWORD_PTR all, sys;
+    GetProcessAffinityMask(GetCurrentProcess(), &all, &sys);
+    int logical = __builtin_popcountll((unsigned long long)all), cores = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    char *buf = malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len))
+        for (DWORD o = 0; o < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)(buf + o);
+            if (e->Processor.GroupMask[0].Group == 0 && (e->Processor.GroupMask[0].Mask & all)) cores++;
+            o += e->Size;
+        }
+    free(buf);
+    const char *x = getenv("SAVAGEWIND_ONE_PER_CORE");
+    bool on = x ? atoi(x) != 0 : cores >= 8 && logical > cores;
+    LOG("[cpu] %d cores, %d logical processors: %s\n", cores, logical, on ? "one logical processor per core" : "all logical processors");
+    if (on) one_per_core(true);
 }
 #else
-static void perfx_smt(bool one_per_core) { (void)one_per_core; }
+static void one_per_core(bool on) { (void)on; }
+static void one_per_core_init(void) {}
 #endif
 
 void perf_survey_init(void) {
@@ -56,7 +77,8 @@ void perf_survey_init(void) {
     atomic_store(&g_perfx, perfx_ab ? 0 : g_perfx_mask);
     atomic_store(&g_perfx_list, atomic_load(&g_perfx));
     if (g_perfx_mask) LOG("[perfx] mask %#x%s\n", g_perfx_mask, perfx_ab ? ", alternating" : "");
-    if ((g_perfx_mask & PERFX_SMT) && !perfx_ab) perfx_smt(true);
+    if (g_perfx_mask & PERFX_SMT) one_per_core(!perfx_ab);  // (on trial: from the start, or in the blocks below)
+    else one_per_core_init();
     const char *v = getenv("SAVAGEWIND_SURVEY");
     if (!v || !*v) return;
     for (int i = 1; i <= SURVEY_SAFE_OVERLAP; i++) if (!strcmp(v, names[i])) perf_survey_mode = i;
@@ -91,7 +113,7 @@ void perf_survey_present(void) {
         if (b != last) {
             bool on = b >= 0 && (b % 4 == 1 || b % 4 == 2);
             atomic_store(&g_perfx, on ? g_perfx_mask : 0);
-            if (g_perfx_mask & PERFX_SMT) perfx_smt(on);
+            if (g_perfx_mask & PERFX_SMT) one_per_core(on);
             LOG("[perfx] frame %llu block %d %s\n", (unsigned long long)f, b, on ? "on" : "off");
             last = b;
         }

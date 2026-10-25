@@ -239,9 +239,9 @@ void vk_wait_seq(uint64_t seq) {
 
 uint64_t vk_pending_seq(void) { return t_seq ? t_seq : submit_seq + 1; }
 
-static Sub *sub(void) {
-    Sub *s = &subs[cur_sub];
-    if (s->seq != submit_seq + 1) {  // slot reused: its previous submission must be done
+// (out of line: its ~8 KB stack frame was allocated and probed on every sub() call, several a draw)
+__attribute__((noinline)) static void sub_recycle(Sub *s) {
+    {
         vk_wait_seq(s->seq);
         vk_timing_retire((unsigned)cur_sub);
         bc_snapshot_retire((unsigned)cur_sub);
@@ -262,6 +262,11 @@ static Sub *sub(void) {
         atomic_store_explicit(&s->fxr, 0, memory_order_relaxed);
         s->geometry = s->writes_heap = false;
     }
+}
+
+static Sub *sub(void) {
+    Sub *s = &subs[cur_sub];
+    if (s->seq != submit_seq + 1) sub_recycle(s);  // slot reused: its previous submission must be done
     return s;
 }
 
@@ -6947,7 +6952,13 @@ static void *draw_worker(void *arg) {
                 continue;
             }
             bool got = false;
-            for (int i = 0; i < 200 && !got; i++) {  // (a short spin: then sleep, not to take cycles from the game's threads)
+            // A spin before sleeping: the producer's next job is usually microseconds away, and waking a sleeping worker
+            // cost the producer a ReleaseSemaphore each time. 2000 pauses (~25 us) against 200: the Great Plateau 4.05 ->
+            // 3.86 ms a frame (in-launch A/B, one logical processor per core). SAVAGEWIND_DJ_SPIN=<pauses>.
+            static int spin_n = -1;
+            if (spin_n < 0) spin_n = getenv("SAVAGEWIND_DJ_SPIN") ? atoi(getenv("SAVAGEWIND_DJ_SPIN")) : 2000;
+            int spin = perfx_trial(PERFX_DJSPIN) ? (perfx(PERFX_DJSPIN) ? 2000 : 200) : spin_n;
+            for (int i = 0; i < spin && !got; i++) {
                 __builtin_ia32_pause();
                 got = atomic_load_explicit(&dj_put, memory_order_acquire) > k;
             }
@@ -7207,8 +7218,9 @@ static void draw_(CmdRec *r, bool indexed) {
             last_fs = fs;
             // (by code address, like the program table: 512 bytes hashed byte by byte at every fragment shader change
             // cost 1% of the translation)
-            static struct { uint64_t fs, hash; } memo[512];
-            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 55);  // (code addresses are 256-aligned)
+            static struct { uint64_t fs, hash; } memo[4096];
+            bool big = perfx_trial(PERFX_MICRO) ? perfx(PERFX_MICRO) : true;  // (512 entries missed often: a hash costs ~1 us)
+            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> (big ? 52 : 55));  // (code addresses are 256-aligned)
             if (fs && memo[ms].fs == fs) last_hash = memo[ms].hash;
             else {
                 last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
@@ -7252,7 +7264,9 @@ static void draw_(CmdRec *r, bool indexed) {
             LOG("%s\n", buf);
         }
     }
-    {   // (SAVAGEWIND_TRACE_TEX) a draw into a traced texture: its fragment shader and the textures it samples
+    static int trace_any = -1;
+    if (trace_any < 0) trace_any = getenv("SAVAGEWIND_TRACE_TEX") != NULL;
+    if (trace_any) {   // (SAVAGEWIND_TRACE_TEX) a draw into a traced texture: its fragment shader and the textures it samples
         bool any = false;
         for (int i = 0; i < st.rt.ncolor && i < 8 && !any; i++) any = vk_trace_tex(st.rt.color[i]);
         if (any) {
@@ -7320,7 +7334,10 @@ static void draw_(CmdRec *r, bool indexed) {
     if (material) { nfeedback = 0; draw_feedback = false; }
     else resolve_feedback(pr);
     taa_note_draw();
-    scene_post(pr, r);
+    if ((perfx_trial(PERFX_MICRO) && !perfx(PERFX_MICRO)) || g_settings.upscaler == UPSCALE_FSR1 || g_settings.sharpening > 0 ||
+        dlaa_wanted())
+        scene_post(pr, r);
+    else scene_up.t = NULL, scene_up.dlaa = false;  // (what scene_post does with nothing to post-process)
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
@@ -7568,7 +7585,7 @@ have_pipe:
         vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
     }
     PROFD_ADD(prof_sets);
-    VkDescriptorImageInfo fii_data[64];
+    static VkDescriptorImageInfo fii_data[64];  // (static: draw_'s frame stays under a page, no stack probe a draw)
     const VkDescriptorImageInfo *fii = material ? material->ii[1] : fii_data;
     uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
     sdw_fix.s = 0;
