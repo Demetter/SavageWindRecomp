@@ -4996,6 +4996,14 @@ static void prepare_depth_comparisons(int stage, const ShaderInfo *si) {
     }
 }
 
+// SAVAGEWIND_ANISO_ALL=<presented frame>: from then on every texture takes Video > Anisotropic filtering's override,
+// as before texture_info left some out (same-view A/B in one run)
+static bool aniso_all(void) {
+    static long long at = -1;
+    if (at < 0) at = getenv("SAVAGEWIND_ANISO_ALL") ? atoll(getenv("SAVAGEWIND_ANISO_ALL")) : 0;
+    return at && renderer_present_count() >= (uint64_t)at;
+}
+
 static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
@@ -5004,12 +5012,16 @@ static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptor
     VkSampler smp = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
+    // (vk_sampler's Video > Anisotropic filtering: not for textures with one mip level - the render targets BOTW reads
+    // back - nor in blended draws - particles, effects, decals - whose quads' square edges it brought out)
+    bool all = aniso_all(), aniso_ok = all || !(st.color_state[0] & 1);
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         NvnTexture *et = e->tex;  // (a finalized one too: textures.c gives it the image of its memory and shape)
         if (et) {
+            aniso_ok = aniso_ok && (all || (e->has_view && (e->view.setmask & 1) ? e->view.num_levels : et->levels) > 1);
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
             // destroyed (eviction, image re-created) bumps vk_view_gen. SAVAGEWIND_VK_NO_TEX_MEMO=1 disables.
@@ -5079,7 +5091,7 @@ static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptor
             }
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
+    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok);
     if (!view) view = vk_dummy_view(st_->type), layout = VK_IMAGE_LAYOUT_GENERAL;
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, layout};
@@ -5116,17 +5128,19 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     typedef struct {
         NvnDescPool *tp, *sp;
         uint64_t handle, trev, srev, frame;
-        uint32_t gen, type;
+        uint32_t gen, type, blend;  // blend: the draw blends into its first target (the sampler's anisotropy depends on it)
         VkDescriptorImageInfo info;
         float scale[2]; uint32_t extent[2];
     } Binding;
     static Binding cache[4096];
     static uint64_t hits, misses, verified, last_report;
     uint64_t frame = vk_frame_counter(), tr = st.tpool ? st.tpool->revision : 0, sr = st.spool ? st.spool->revision : 0;
-    uint64_t key = h * 0x9e3779b97f4a7c15ull ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool >> 7) ^ (uint64_t)s->type * 71;
+    uint32_t blend = st.color_state[0] & 1;
+    uint64_t key = h * 0x9e3779b97f4a7c15ull ^ ((uintptr_t)st.tpool >> 4) ^ ((uintptr_t)st.spool >> 7) ^ (uint64_t)s->type * 71 ^ blend;
     Binding *b = &cache[(key ^ (key >> 32)) & 4095];
     if (b->info.imageView && b->handle == h && b->tp == st.tpool && b->sp == st.spool &&
-        b->trev == tr && b->srev == sr && b->frame == frame && b->gen == vk_view_gen && b->type == (uint32_t)s->type) {
+        b->trev == tr && b->srev == sr && b->frame == frame && b->gen == vk_view_gen && b->type == (uint32_t)s->type &&
+        b->blend == blend) {
         *out = b->info;
         memcpy(sc, b->scale, sizeof b->scale); memcpy(wh, b->extent, sizeof b->extent);
         if (mode == 2) {
@@ -5142,7 +5156,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     } else {
         texture_info_uncached(stage, si, i, out, sc, wh);
         *b = (Binding){.tp = st.tpool, .sp = st.spool, .handle = h, .trev = tr, .srev = sr,
-                       .frame = frame, .gen = vk_view_gen, .type = (uint32_t)s->type, .info = *out};
+                       .frame = frame, .gen = vk_view_gen, .type = (uint32_t)s->type, .blend = blend, .info = *out};
         memcpy(b->scale, sc, sizeof b->scale); memcpy(b->extent, wh, sizeof b->extent);
         misses++;
     }
