@@ -108,7 +108,7 @@ GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h)
 GENARCH_COMPAT ?= -march=x86-64-v2  # CPUs without them (GAMELIB_ID_COMPAT below)
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -l:libz.a \
+            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -l:libz.a \
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> savagewind.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
@@ -148,7 +148,7 @@ GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h
 GAMELIB_SRCS += tools/layout.py tools/game_sites.py
-GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(strip $(GENFLAGS))'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 # Never mix native objects and ThinLTO bitcode after a flag/ABI change (including
 # switching back). Each game library identity owns its complete object set.
 GEN_OBJDIR := $(B)/obj-$(GAMELIB_ID)
@@ -160,7 +160,7 @@ GEN_OBJ := $(patsubst %.c,$(GEN_OBJDIR)/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $
 ifneq ($(strip $(GENARCH)),)
 ifneq ($(strip $(GENARCH_COMPAT)),)
 GENFLAGS_COMPAT := $(subst $(strip $(GENARCH)),$(strip $(GENARCH_COMPAT)),$(GENFLAGS))
-GAMELIB_ID_COMPAT := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS_COMPAT)'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GAMELIB_ID_COMPAT := $(shell (cat $(GAMELIB_SRCS); echo '$(strip $(GENFLAGS_COMPAT))'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 GAMELIB_TARGETS := -DGAMELIB_ARCH='"$(strip $(GENARCH))"' -DGAMELIB_ARCH_COMPAT='"$(strip $(GENARCH_COMPAT))"' \
                    -DGAMELIB_ID_COMPAT='"$(GAMELIB_ID_COMPAT)"'
 endif
@@ -185,7 +185,7 @@ $(GEN_OBJDIR)/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h run
 	@$(CC) $(GENFLAGS) -c $< -o $@
 $(GEN_OBJDIR)/layout.o: runtime/gamelib.h
 
-$(GEN_OBJDIR)/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS)
+$(GEN_OBJDIR)/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) Makefile  # (the id: the flags are in here too)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -c $< -o $@
 $(B)/rt/nvn/maxwell/translate.o: RTFLAGS += -DTRANSLATOR_ID='"$(TRANSLATOR_ID)"'
