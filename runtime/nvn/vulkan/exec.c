@@ -1534,6 +1534,56 @@ static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void stage_layouts(StageBuild *b, int stage);
 
+// BOTW's distance blur (fs f7731492223eb16a): a half-size copy of the scene (fs 72cae01700's pass) is blended over the
+// distant pixels by their depth, read at each pixel's own place, bilinearly. Where a castle or a ridge meets what is
+// behind it, that read mixes both sides: a light rim inside the silhouette and a dark band outside it, the same at
+// the game's own size (three pixels there) and, with everything else sharp, plain to see at high resolutions. The
+// read takes the copy's four texels around the place weighted by how near their depth (the shader's own depth texture
+// at each texel's centre) is to the pixel's: the blur stays, the other side's colour doesn't come in. Found by its translated source (the two reads and the sky test), compiled as
+// a copy: the translation and its caches are untouched, and with another translation the blur is left as it is.
+// SAVAGEWIND_NO_BLUR_EDGE_FIX=1: the game's own read.
+#define BLUR_READ "textureLod(t1, vec2(uintBitsToFloat(r4), uintBitsToFloat(r5)), uintBitsToFloat(r7))"
+static char *blur_edge_source(const ShaderInfo *si, int stage) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_NO_BLUR_EDGE_FIX") == NULL;
+    if (!on || stage != STAGE_FRAGMENT || !si->msl || si->ntex != 2) return NULL;
+    const char *s = si->msl, *read = strstr(s, BLUR_READ), *body = strstr(s, "void main()");
+    if (!read || !body || strstr(read + 1, BLUR_READ) ||
+        !strstr(s, "texture(t0, vec2(uintBitsToFloat(r4), uintBitsToFloat(r5)))") ||
+        !strstr(s, ">= uintBitsToFloat(cb3[0][2])") || !strstr(s, "uniform sampler2D t1;"))
+        return NULL;
+    static const char fn[] =
+        "// (SavageWind: the half-size copy's four texels around uv, weighted by their depth's nearness to this pixel's)\n"
+        "vec4 sw_blur_read(vec2 uv, float lod) {\n"
+        "  vec2 hs = vec2(textureSize(t1, 0)), p = uv * hs - 0.5, f = fract(p), base = (floor(p) + 0.5) / hs;\n"
+        "  float d0 = textureLod(t0, uv, 0.0).x;\n"
+        "  vec4 acc = vec4(0.0);\n"
+        "  float wsum = 0.0;\n"
+        "  for (int j = 0; j < 2; j++)\n"
+        "    for (int i = 0; i < 2; i++) {\n"
+        "      vec2 q = base + vec2(float(i), float(j)) / hs;\n"
+        "      float r = abs(textureLod(t0, q, 0.0).x - d0) / max(d0, 1e-6) / 0.03;\n"
+        "      float w = (i == 1 ? f.x : 1.0 - f.x) * (j == 1 ? f.y : 1.0 - f.y) / (1.0 + r * r);\n"
+        "      acc += w * textureLod(t1, q, lod);\n"
+        "      wsum += w;\n"
+        "    }\n"
+        "  return wsum > 1e-5 ? acc / wsum : textureLod(t1, uv, lod);\n"
+        "}\n";
+    size_t n = strlen(s), nr = strlen(BLUR_READ), nfn = sizeof fn - 1;
+    const char *call = "sw_blur_read(vec2(uintBitsToFloat(r4), uintBitsToFloat(r5)), uintBitsToFloat(r7))";
+    char *o = malloc(n + nfn + strlen(call) + 1);
+    if (!o) return NULL;
+    size_t a = (size_t)(body - s), b = (size_t)(read - s);
+    memcpy(o, s, a);
+    memcpy(o + a, fn, nfn);
+    memcpy(o + a + nfn, body, b - a);
+    strcpy(o + nfn + b, call);
+    strcat(o + nfn + b, read + nr);
+    static int nlog;
+    if (nlog++ < 2) LOG("[blur] distance blur's half-size read made depth-aware\n");
+    return o;
+}
+
 static StageBuild *stage_build(const ShaderInfo *si, int stage, const char *name) {
     uint32_t slot = (uint32_t)(((uintptr_t)si >> 4) * 0x9E3779B1u) & (STAGE_TAB - 1);
     pthread_mutex_lock(&stage_lock);
@@ -1541,7 +1591,9 @@ static StageBuild *stage_build(const ShaderInfo *si, int stage, const char *name
         if (stage_tab[slot]->si == si) { StageBuild *b = stage_tab[slot]; pthread_mutex_unlock(&stage_lock); return b; }
     pthread_mutex_unlock(&stage_lock);
     size_t n = 0;
-    uint32_t *spv = vk_glsl_to_spirv(si->msl, stage, name, &n);
+    char *blur = blur_edge_source(si, stage);
+    uint32_t *spv = vk_glsl_to_spirv(blur ? blur : si->msl, stage, name, &n);
+    free(blur);
     if (!spv) return NULL;
     StageBuild *b = calloc(1, sizeof *b);
     b->si = si;
