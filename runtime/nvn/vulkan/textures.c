@@ -206,6 +206,11 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
     if ((t->target == 1 || t->target == 4) && t->samples <= 1 && (t->flags & 8) && renderer_format_is_depth(t->format) &&
         t->width == t->height && t->width >= 512)
         return RS_SHADOW;
+    // (the cascades' half-size copy, R16 448x448x3, the max of each 2x2: water and the other forward-shaded surfaces
+    // take their shadows from it, issue #101. Exactly 3 layers: a looser rule also took a 1024x1024x8 R16 array filled
+    // once at load, which a change of the setting then made again empty, and the terrain went)
+    if (t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 && t->depth == 3)
+        return RS_SHADOW;
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || t->width < 32 || t->height < 16) return RS_NONE;
     if (!(t->flags & 9)) {
         // BOTW's quarter-size R8 target (400x225, no flags) is its sun's shadow mask: drawn from the half-size scene
@@ -322,7 +327,8 @@ void vk_collect_dead(void) {
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
     b->scalable = b->rs_group != RS_NONE;
-    b->guest_w = t->width;
+    // (RS_SHADOW: the cascades' width, also for their half-size copy, so that both grow by the same factor)
+    b->guest_w = b->rs_group == RS_SHADOW && !renderer_format_is_depth(t->format) ? t->width * 2 : t->width;
     b->sx = rs_want(b, 0);
     b->sy = rs_want(b, 1);
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
