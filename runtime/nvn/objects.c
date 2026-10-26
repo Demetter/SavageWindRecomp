@@ -782,9 +782,9 @@ static uint64_t g_tex_inits, g_tex_reused, g_tex_hosts, g_tex_probe_frame;
 static bool texture_intern_on(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("SAVAGEWIND_TEXTURE_INTERN");
-        on = e && atoi(e) != 0;
-        if (on) LOG("[nvn] texture interning on\n");
+        const char *e = getenv("SAVAGEWIND_TEXTURE_INTERN");  // (default on; =0: a new host object per initialize)
+        on = !e || atoi(e) != 0;
+        if (!on) LOG("[nvn] texture interning off: host texture objects pile up until reboot\n");
     }
     return on;
 }

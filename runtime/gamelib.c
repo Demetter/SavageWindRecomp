@@ -154,14 +154,9 @@ bool gamelib_present(const char *game_dir) {
     return false;
 }
 
-#ifdef _WIN32
-static HMODULE g_lib;
-#endif
-
 static const GameLibTables *open_lib(const char *path) {
 #ifdef _WIN32
     HMODULE h = LoadLibraryA(path);
-    g_lib = h;
     if (!h) { snprintf(g_error, sizeof g_error, "can't load %s (error %lu)", path, GetLastError()); return NULL; }
     GameLibEntry entry = (GameLibEntry)(void *)GetProcAddress(h, GAMELIB_ENTRY);
 #else
@@ -215,16 +210,3 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
 }
 
 const GameLibTables *gamelib_tables(void) { return g_tables; }
-
-// (SAVAGEWIND_PGO_EXIT_AT, a profile-instrumented build: SW_PGO_GEN) the app's and the game library's profiles,
-// written before the app exits at once (a run that is stopped writes none)
-void gamelib_profile_write(void) {
-#ifdef SW_PGO_GEN
-    extern int __llvm_profile_write_file(void);
-    __llvm_profile_write_file();
-#endif
-#ifdef _WIN32
-    int (*w)(void) = g_lib ? (int (*)(void))(void *)GetProcAddress(g_lib, "swgame_profile_write") : NULL;
-    if (w) w();
-#endif
-}
