@@ -6941,11 +6941,15 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     if (gcp_active() && cp->si->uses_gmem) for(int i=0;i<16;i++){Range r=st.sbuf[5][i];if(r.addr&&r.size)gcp_gpu_use("gmem-bound-potential",vk_pending_seq(),vk_translate_id(cp->si),r.addr,r.size);}
     if (cp->si->uses_gmem) rdc_unknown_gmem();
-    if (g_debug_frame) {
-        LOG("[dispatch] %ux%ux%u cs %llx gmem %d cb %#x sbuf:", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr,
-            cp->si->uses_gmem, cp->si->cbuf_mask);
+    if (g_debug_frame || g_gpuprof_frame) {  // (the gpuprof frame too: buffer ranges beside the timings)
+        LOG("[dispatch] %ux%ux%u cs %llx (%016llx) gmem %d store %d cb %#x sbuf:", gx, gy, gz,
+            (unsigned long long)st.program->stages[5].code_addr, (unsigned long long)vk_translate_id(cp->si),
+            cp->si->uses_gmem, cp->si->writes_gmem, cp->si->cbuf_mask);
         for (int i = 0; i < 16; i++)
             if (st.sbuf[5][i].addr) LOG(" %d=%llx+%llu", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+        LOG(" ubuf:");
+        for (int i = 0; i < 16; i++)
+            if (st.ubuf[5][i].addr) LOG(" %d=%llx+%llu", i, (unsigned long long)st.ubuf[5][i].addr, (unsigned long long)st.ubuf[5][i].size);
         LOG("\n");
     }
     nfeedback = 0;
@@ -6953,6 +6957,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, dispatch_x, gy, gz);
+    // (gpuprof: a row lasts until the next mark, idle GPU included; this separates the dispatch from what follows. At
+    // Hyrule Castle, 27 Oct, cs ffe9487d2fdb1041 is 0.52 ms itself: 109 KB of straight-line code run by 44 warps, one
+    // an SM, its instruction fetches exposed; guest memory in VRAM, no textures or overlap with graphics didn't help.)
+    gp_mark(cb, "(after the dispatch: until the next mark)");
     if (bc_active && cp->si->writes_gmem && bc_supported(cp->si)) bc_writes = true;
     stat_dispatches++;
     chunk_draws++;
