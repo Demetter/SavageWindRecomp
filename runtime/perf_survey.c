@@ -62,9 +62,16 @@ static void one_per_core_init(void) {
     LOG("[cpu] %d cores, %d logical processors: %s\n", cores, logical, on ? "one logical processor per core" : "all logical processors");
     if (on) one_per_core(true);
 }
+int perf_usable_processors(void) {  // the logical processors the game may run on (after one_per_core_init)
+    DWORD_PTR all, sys;
+    GetProcessAffinityMask(GetCurrentProcess(), &all, &sys);
+    return __builtin_popcountll((unsigned long long)all);
+}
 #else
 static void one_per_core(bool on) { (void)on; }
 static void one_per_core_init(void) {}
+#include <unistd.h>
+int perf_usable_processors(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
 #endif
 
 void perf_survey_init(void) {

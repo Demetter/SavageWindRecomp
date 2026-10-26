@@ -18,7 +18,7 @@
     X(CmdSetPrimitiveTopology) X(CmdSetScissor) X(CmdSetStencilCompareMask) X(CmdSetStencilOp)                        \
     X(CmdSetStencilReference) X(CmdSetStencilTestEnable) X(CmdSetStencilWriteMask) X(CmdSetViewport)                  \
     X(CmdWriteTimestamp2) X(EndCommandBuffer) X(GetSemaphoreCounterValue) X(QueueSubmit2) X(ResetDescriptorPool)      \
-    X(UpdateDescriptorSets) X(WaitSemaphores)
+    X(UpdateDescriptorSets) X(WaitSemaphores) X(CmdExecuteCommands)
 
 #define VKD_DECLARE(n) extern PFN_vk##n vkd_##n;
 VKD_FUNCS(VKD_DECLARE)
@@ -77,4 +77,5 @@ void vkd_load(VkDevice dev);
 #define vkResetDescriptorPool vkd_ResetDescriptorPool
 #define vkUpdateDescriptorSets vkd_UpdateDescriptorSets
 #define vkWaitSemaphores vkq_WaitSemaphores
+#define vkCmdExecuteCommands vkd_CmdExecuteCommands  // (exec.c: on the recording thread only, in its own replay entries)
 #endif

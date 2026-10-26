@@ -142,9 +142,14 @@ typedef struct TexBackend {
     bool kept;                   // parked past PARK_FRAMES with its contents (textures.c idle_expire)
     uint64_t drawn_frame, prev_drawn;  // last two frames a pass drew into it (exec.c: one-shot draws)
     uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
+    uint64_t prep_frame;         // (parallel translation) the frame vk_tex_prepare last checked it
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
+// Parallel translation (exec.c): a translation worker only reads images (vk_tex_ro); the render thread prepares each
+// texture its draws sample first (vk_tex_prepare: made, uploaded, checked this frame).
+extern __thread bool vk_tex_ro;
+void vk_tex_prepare(NvnTexture *t);
 VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 // View of t (optionally through an NVN texture view) for rendering or sampling.
