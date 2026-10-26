@@ -51,9 +51,24 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 #define FPCR_DN (1u << 25)
 #define FPCR_FZ (1u << 24)
 #define FPCR_RM (3u << 22)
+// Host floating point (-DSIMD_FP_HOST, x86-64; BOTW-NATIVE-CODEGEN.md change 1): the thread's MXCSR follows FPCR's FZ
+// (FTZ, DAZ) and rounding mode (rt_fpcr_write), so the host's arithmetic, compares and conversions already flush and
+// round as the guest asks, and the plain ops are single host instructions with no checks. NaN payloads are the host's
+// (x86's default NaN is negative, and it keeps the first NaN operand's payload where ARM may pick another): a NaN is
+// still a NaN. Ops whose other results differ keep their exact paths: min/max, MULX/RECPS/RSQRTS (0 * inf), the
+// saturating conversions, the estimates.
+#if defined(__x86_64__) && defined(SIMD_FP_HOST)
+#define SIMD_HOST_FP 1
+#else
+#define SIMD_HOST_FP 0
+#endif
+// Ops whose fast result is checked (FBAD) and fixed: all of them, or with host FP only those with non-NaN differences
+#define FCHECK(op) (!SIMD_HOST_FP || (op) == FOP_MULX || (op) == FOP_RECPS || (op) == FOP_RSQRTS)
 // FPCR settings the fast paths below can't follow: they go through the slow ones. On x86-64 FZ isn't one of them: the
-// thread's MXCSR follows it (rt_fpcr_write, below).
-#if defined(__x86_64__)
+// thread's MXCSR follows it (rt_fpcr_write, below); with host FP the rounding mode isn't either.
+#if SIMD_HOST_FP
+#define FPCR_SLOW 0u
+#elif defined(__x86_64__)
 #define FPCR_SLOW FPCR_RM
 #else
 #define FPCR_SLOW (FPCR_FZ | FPCR_RM)
@@ -237,9 +252,11 @@ SI void simd_setround(int fe) { _mm_setcsr((_mm_getcsr() & ~0x6000u) | simd_rc(f
 // the open world). Each guest thread is a host thread of its own whose FP code is the guest's, and lifted FPCR writes
 // are the only ones (new threads start with FPCR 0 and the host's default MXCSR). The one difference: a result that
 // rounds up to the smallest normal may be kept, where ARM (tininess before rounding) flushes it.
+// With host FP the rounding mode goes there too (FPCR RN/RP/RM/RZ = MXCSR.RC 0/2/1/3).
 SI void rt_fpcr_write(Cpu *c, uint64_t v) {
     c->fpcr = v & 0x7c00000ull;
-    unsigned m = _mm_getcsr() & ~0x8040u;  // (FTZ bit 15, DAZ bit 6)
+    unsigned m = _mm_getcsr() & ~(SIMD_HOST_FP ? 0xe040u : 0x8040u);  // (FTZ bit 15, RC bits 13-14, DAZ bit 6)
+    if (SIMD_HOST_FP) m |= (unsigned)"\0\2\1\3"[(c->fpcr >> 22) & 3] << 13;
     _mm_setcsr(c->fpcr & FPCR_FZ ? m | 0x8040u : m);
 }
 #else

@@ -43,6 +43,10 @@ GENFLAGS_ZIG := -Xclang $(filter -O%,$(GENFLAGS)) -g0 -fomit-frame-pointer
 # FPCR.FZ is the thread's MXCSR DAZ / FTZ on x86-64 (simd.h, rt_fpcr_write): denormals can read as zero at run time, so
 # the compiler mustn't turn the integer denormal checks (simd_fp.h: flush, vfz) into float compares
 GENFLAGS += -fdenormal-fp-math=dynamic
+# Host floating point (simd.h SIMD_FP_HOST, BOTW-NATIVE-CODEGEN.md): MXCSR follows FPCR, plain FP ops without checks
+GENFLAGS += -DSIMD_FP_HOST
+# More game-library flags for a variant built side by side (e.g. GENFLAGS_EXTRA=-DGUEST_MEM_PLAIN: cpu.h); part of the id
+GENFLAGS += $(GENFLAGS_EXTRA)
 
 # The game code (made by `make gen` from your own game files) is its own library next to the app (runtime/gamelib.h);
 # the app itself holds none of it. $(GEN)/layout.c, then a folder per module (main, subsdk*, sdk)
@@ -145,7 +149,7 @@ endif
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
 # flags). A library with another id is rebuilt by the start screen, never loaded.
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
-                tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+                tools/simd_c.py tools/native.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h
 GAMELIB_SRCS += tools/layout.py tools/game_sites.py
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(strip $(GENFLAGS))'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)

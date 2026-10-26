@@ -77,14 +77,25 @@ typedef struct { uint8_t m; } __attribute__((packed)) GMem8;
 typedef struct { uint16_t m; } __attribute__((packed)) GMem16;
 typedef struct { uint32_t m; } __attribute__((packed)) GMem32;
 typedef struct { uint64_t m; } __attribute__((packed)) GMem64;
-#define LD8(a)  (((const volatile GMem8 *)(uintptr_t)(a))->m)
-#define LD16(a) (((const volatile GMem16 *)(uintptr_t)(a))->m)
-#define LD32(a) (((const volatile GMem32 *)(uintptr_t)(a))->m)
-#define LD64(a) (((const volatile GMem64 *)(uintptr_t)(a))->m)
-#define ST8(a, v)  (((volatile GMem8 *)(uintptr_t)(a))->m = (uint8_t)(v))
-#define ST16(a, v) (((volatile GMem16 *)(uintptr_t)(a))->m = (uint16_t)(v))
-#define ST32(a, v) (((volatile GMem32 *)(uintptr_t)(a))->m = (uint32_t)(v))
-#define ST64(a, v) (((volatile GMem64 *)(uintptr_t)(a))->m = (uint64_t)(v))
+// -DGUEST_MEM_PLAIN (BOTW-NATIVE-CODEGEN.md change 4): plain accesses, which the compiler may merge, forward and keep in
+// registers, and a compiler barrier where the generated code branches back (tools/gen.py: every loop, a spin loop's
+// too, reads memory again each time round). ARM reorders plain accesses itself, so guest code that is correct on the
+// console can't rely on more; its atomics (LDXR/STXR, LDAR/STLR) and barriers (DMB) stay what they are.
+#ifdef GUEST_MEM_PLAIN
+#define GMEM_V
+#define GUEST_LOOP_BARRIER() __asm__ volatile("" ::: "memory")
+#else
+#define GMEM_V volatile
+#define GUEST_LOOP_BARRIER() ((void)0)
+#endif
+#define LD8(a)  (((const GMEM_V GMem8 *)(uintptr_t)(a))->m)
+#define LD16(a) (((const GMEM_V GMem16 *)(uintptr_t)(a))->m)
+#define LD32(a) (((const GMEM_V GMem32 *)(uintptr_t)(a))->m)
+#define LD64(a) (((const GMEM_V GMem64 *)(uintptr_t)(a))->m)
+#define ST8(a, v)  (((GMEM_V GMem8 *)(uintptr_t)(a))->m = (uint8_t)(v))
+#define ST16(a, v) (((GMEM_V GMem16 *)(uintptr_t)(a))->m = (uint16_t)(v))
+#define ST32(a, v) (((GMEM_V GMem32 *)(uintptr_t)(a))->m = (uint32_t)(v))
+#define ST64(a, v) (((GMEM_V GMem64 *)(uintptr_t)(a))->m = (uint64_t)(v))
 
 // ---- exclusive monitor (emulated with compare-and-swap)
 #define EXCL(N, T)                                                                         \
@@ -135,47 +146,55 @@ EXCL(64, uint64_t)
 #define MKFLAGS(n, z, cy, v) \
     (((uint64_t)(n) << 31) | ((uint64_t)(z) << 30) | ((uint64_t)(cy) << 29) | ((uint64_t)(v) << 28))
 
-static inline uint64_t adds64(Cpu *c, uint64_t a, uint64_t b) {
-    uint64_t r = a + b;
-    c->nzcv = MKFLAGS(r >> 63, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 63);
-    return r;
-}
-static inline uint64_t subs64(Cpu *c, uint64_t a, uint64_t b) {
-    uint64_t r = a - b;
-    c->nzcv = MKFLAGS(r >> 63, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 63);
-    return r;
-}
-static inline uint32_t adds32(Cpu *c, uint32_t a, uint32_t b) {
-    uint32_t r = a + b;
-    c->nzcv = MKFLAGS(r >> 31, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 31);
-    return r;
-}
-static inline uint32_t subs32(Cpu *c, uint32_t a, uint32_t b) {
-    uint32_t r = a - b;
-    c->nzcv = MKFLAGS(r >> 31, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 31);
-    return r;
-}
-static inline uint64_t logic64(Cpu *c, uint64_t r) { c->nzcv = MKFLAGS(r >> 63, r == 0, 0, 0); return r; }
-static inline uint32_t logic32(Cpu *c, uint32_t r) { c->nzcv = MKFLAGS(r >> 31, r == 0, 0, 0); return r; }
+// The flag-setting ops, for the Cpu's flags (adds64(c, ...)) and for a function's own (nadds64(&fl, ...): native
+// functions keep the flags in a local NFlags, tools/gen.py, BOTW-NATIVE-CODEGEN.md). COND_*/FLAG_* take either.
+typedef struct { uint64_t nzcv; } NFlags;
+#define FLAG_OPS(P, T)                                                                            \
+    static inline uint64_t P##adds64(T *c, uint64_t a, uint64_t b) {                              \
+        uint64_t r = a + b;                                                                       \
+        c->nzcv = MKFLAGS(r >> 63, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 63);                     \
+        return r;                                                                                 \
+    }                                                                                             \
+    static inline uint64_t P##subs64(T *c, uint64_t a, uint64_t b) {                              \
+        uint64_t r = a - b;                                                                       \
+        c->nzcv = MKFLAGS(r >> 63, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 63);                    \
+        return r;                                                                                 \
+    }                                                                                             \
+    static inline uint32_t P##adds32(T *c, uint32_t a, uint32_t b) {                              \
+        uint32_t r = a + b;                                                                       \
+        c->nzcv = MKFLAGS(r >> 31, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 31);                     \
+        return r;                                                                                 \
+    }                                                                                             \
+    static inline uint32_t P##subs32(T *c, uint32_t a, uint32_t b) {                              \
+        uint32_t r = a - b;                                                                       \
+        c->nzcv = MKFLAGS(r >> 31, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 31);                    \
+        return r;                                                                                 \
+    }                                                                                             \
+    static inline uint64_t P##logic64(T *c, uint64_t r) { c->nzcv = MKFLAGS(r >> 63, r == 0, 0, 0); return r; } \
+    static inline uint32_t P##logic32(T *c, uint32_t r) { c->nzcv = MKFLAGS(r >> 31, r == 0, 0, 0); return r; }
+FLAG_OPS(, Cpu)
+FLAG_OPS(n, NFlags)
 
-#define ADC_IMPL(N, S)                                                                     \
-    static inline uint##N##_t adc##N(Cpu *c, uint##N##_t a, uint##N##_t b) {               \
+#define ADC_IMPL(N, P, T)                                                                  \
+    static inline uint##N##_t P##adc##N(T *c, uint##N##_t a, uint##N##_t b) {              \
         return a + b + (uint##N##_t)FLAG_C(c);                                             \
     }                                                                                      \
-    static inline uint##N##_t sbc##N(Cpu *c, uint##N##_t a, uint##N##_t b) {               \
+    static inline uint##N##_t P##sbc##N(T *c, uint##N##_t a, uint##N##_t b) {              \
         return a - b - 1 + (uint##N##_t)FLAG_C(c);                                         \
     }                                                                                      \
-    static inline uint##N##_t adcs##N(Cpu *c, uint##N##_t a, uint##N##_t b) {              \
+    static inline uint##N##_t P##adcs##N(T *c, uint##N##_t a, uint##N##_t b) {             \
         uint##N##_t cin = FLAG_C(c), r = a + b + cin;                                      \
         int carry = cin ? r <= a : r < a;                                                  \
         c->nzcv = MKFLAGS(r >> (N - 1), r == 0, carry, ((a ^ r) & (b ^ r)) >> (N - 1));    \
         return r;                                                                          \
     }                                                                                      \
-    static inline uint##N##_t sbcs##N(Cpu *c, uint##N##_t a, uint##N##_t b) {              \
-        return adcs##N(c, a, (uint##N##_t)~b);                                             \
+    static inline uint##N##_t P##sbcs##N(T *c, uint##N##_t a, uint##N##_t b) {             \
+        return P##adcs##N(c, a, (uint##N##_t)~b);                                          \
     }
-ADC_IMPL(64, )
-ADC_IMPL(32, )
+ADC_IMPL(64, , Cpu)
+ADC_IMPL(32, , Cpu)
+ADC_IMPL(64, n, NFlags)
+ADC_IMPL(32, n, NFlags)
 
 // ---- bit ops
 #define ROR64(v, r) ((uint64_t)(v) >> ((r) & 63) | (uint64_t)(v) << ((64 - ((r) & 63)) & 63))

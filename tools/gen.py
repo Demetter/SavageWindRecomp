@@ -38,6 +38,7 @@ import layout
 # which every indirect call shared.
 SITE_CALL = '{ static const DispatchEnt *ds; rt_dispatch_site(c, &ds)(c); }'
 SITE_TAIL = '{ static const DispatchEnt *ds; __attribute__((musttail)) return rt_dispatch_site(c, &ds)(c); }'
+import native
 import patches
 from analyze import eh_frame_extents, eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
@@ -91,6 +92,8 @@ class Module:
         self.jt_cache = {}
         self.setjmps = self.setjmp_targets()
         self.sites, self.patches = {}, {}  # (main: tools/game_sites.py, tools/patches.py)
+        self.native = {}  # entry -> True: registers x19-x29, sp and flags in locals (tools/native.py, --native)
+        self.hle = {}
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -442,7 +445,9 @@ class Module:
 
     def _emit_body(self, entry, end, labels, tables, refs, mode):
         """One C function for entry..end. mode: 'plain' (the all-instruction fallback inside when it has tables),
-        'fast' (a table miss goes on in <name>_r) or 'resume' (<name>_r: from c->pc, through that fallback)."""
+        'fast' (a table miss goes on in <name>_r) or 'resume' (<name>_r: from c->pc, through that fallback).
+        A native function (self.native, tools/native.py) keeps x19-x29, sp and the flags in locals: its lifted code
+        is rewritten to them, and its calls, jumps and returns hand them over as native.py's placeholders say."""
         if mode == 'resume':
             # (optnone: optimized, its switch made the copy as slow to build as the function used to be, and it is
             # never run in practice. Unoptimized, its frame can reach ~250 KB: guest threads have 256 MB host stacks)
@@ -452,6 +457,15 @@ class Module:
             # (host memory), so the registers stay in host registers across them instead of being reloaded after
             # each store
             out = [f'void {fname(entry)}(Cpu *restrict c) {{', f'    FN_ENTER({hx(entry)});']
+        nat = mode != 'resume' and self.native.get(entry, False)
+        rw = native.rewrite if nat else (lambda s: s)
+
+        def ph(p):  # (a placeholder of a native function's, nothing otherwise)
+            return p if nat else ''
+
+        def native_callee(t):
+            return self.native.get(t, False) or t in self.hle
+
         batch = []
 
         def flush():
@@ -459,18 +473,20 @@ class Module:
                 out.append('    ' + emit_asm_batch(batch))
                 batch.clear()
 
-        def jump(t):
+        def jump(t, frm=None):  # (frm: the branch's address; going back there, a loop: memory is read again, cpu.h)
             if entry <= t < end:
-                return f'goto L_{t:x};'
+                return f'GUEST_LOOP_BARRIER(); goto L_{t:x};' if frm is not None and t <= frm else f'goto L_{t:x};'
             if not self.in_text(t):
-                return f'c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
+                return f'{ph(native.PRE_LEGACY)}c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
             refs.add(t)
-            return f'__attribute__((musttail)) return {fname(t)}(c);'
+            pre = ph(native.PRE_TAIL if native_callee(t) else native.PRE_LEGACY)
+            return f'{pre}__attribute__((musttail)) return {fname(t)}(c);'
 
         all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
         if all_labels:
             labels = set(range(entry, end, 4))
-        miss = f'__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast' else 'goto L_dispatch;'
+        miss = (f'{ph(native.PRE_LEGACY)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
+                else 'goto L_dispatch;')
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
@@ -497,11 +513,14 @@ class Module:
                 continue
             flush()
             if k == 'op' or k == 'trap':
-                out.append('    ' + ins.code)
+                code = rw(ins.code)
+                if nat and 'rt_svc(' in code:  # (the kernel reads sp: thread creation, its own frames)
+                    code = native.PRE_SVC + code + native.POST_SVC
+                out.append('    ' + code)
             elif k == 'b':
-                out.append('    ' + jump(ins.target))
+                out.append('    ' + jump(ins.target, a))
             elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+                out.append(f'    if ({rw(ins.cond)}) {{ {jump(ins.target, a)} }}')
             elif k == 'bl':
                 t = ins.target
                 if t in self.setjmps:
@@ -509,36 +528,39 @@ class Module:
                     out.append('    ' + setjmp_call(t, a + 4))
                 elif self.in_text(t):
                     refs.add(t)
-                    out.append(f'    c->x[30] = {hx(a + 4)}; {fname(t)}(c);')
+                    pre, post = ((native.PRE_CALL, native.POST_CALL) if native_callee(t)
+                                 else (native.PRE_LEGACY, native.POST_LEGACY))
+                    out.append(f'    c->x[30] = {hx(a + 4)}; {ph(pre)}{fname(t)}(c);{ph(post)}')
                 else:
-                    out.append(f'    c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);')
-            elif k == 'blr':
-                out.append(f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {SITE_CALL}')
+                    out.append(f'    c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; {ph(native.PRE_LEGACY)}rt_dispatch(c);'
+                               f'{ph(native.POST_LEGACY)}')
+            elif k == 'blr':  # (a function pointer or a virtual call: a function made as the convention says)
+                out.append(f'    c->pc = {rw(ins.target)}; c->x[30] = {hx(a + 4)}; {ph(native.PRE_CALL)}{SITE_CALL}'
+                           f'{ph(native.POST_CALL)}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
                     out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
                     continue
                 if jt:
-                    cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
-                    out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {ins.target}; {miss}')
+                    cases = ' '.join(f'case {hx(t)}: {jump(t, a)}' for t in jt)
+                    out.append(f'    switch ({rw(ins.target)}) {{ {cases} default: break; }}')
+                    out.append(f'    c->pc = {rw(ins.target)}; {miss}')
                     continue
-                out.append(f'    c->pc = {ins.target}; {SITE_TAIL}')
+                out.append(f'    c->pc = {rw(ins.target)}; {ph(native.PRE_LEGACY)}{SITE_TAIL}')
             elif k == 'ret':
-                out.append('    return;')
+                out.append(f'    {ph(native.PRE_RET)}return;')
             last = k
         flush()
         if last not in ('b', 'br', 'ret', 'trap'):
             out.append('    ' + jump(end) if end < self.hi else f'    rt_udf(c, {hx(end)});')
         if all_labels:
-            out.append('L_dispatch:')
+            out.append('L_dispatch: GUEST_LOOP_BARRIER();')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             out.append('    __attribute__((musttail)) return rt_dispatch(c);')
         out.append('}')
-        return out
-
+        return native.finish(out) if nat else out
 
 def write_if_changed(path, text):
     """Leaves unchanged chunks untouched so make only recompiles what a patch affected."""
@@ -589,6 +611,7 @@ def discover(m, starts):
                 t = adrp_regs[rn][0] + ((w >> 10) & 0xFFF)
                 if m.in_text(t) and not own_label(pc, t):
                     start_set.add(t)
+    called = set(start_set)  # (what is called or has its address taken: a function, with a prologue if it saves)
     scanned = {}
     rounds = 0
     while True:
@@ -613,6 +636,7 @@ def discover(m, starts):
         for t in tables.values():
             m.stats['br_all_labels' if t == 'all' else 'jumptables'] += 1
         m.stats['br_dispatch'] += sum(m.lift(x).kind == 'br' for x in range(a, end, 4)) - len(tables)
+    m.called = called
     return entries, rounds
 
 
@@ -640,6 +664,34 @@ def generate(name, nso, base, outdir, opts, sites=None):
     entries, rounds = discover(m, starts)
     print(f'{name}: {len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
           f'{time.time() - t0:.0f}s', file=sys.stderr)
+    m.hle = hle
+    if opts.native:  # (tools/native.py: which functions keep x19-x29, sp and the flags in locals)
+        t1, why = time.time(), Counter()
+        patched = sorted(m.patches)
+        functions = m.called  # (unwind info, symbols, relocations, calls, taken addresses: not split pieces)
+        extra = set()
+        for a, (end, labels, tables) in entries.items():
+            if a in hle:
+                continue
+            i = bisect.bisect_left(patched, a)
+            if i < len(patched) and patched[i] < end:
+                why['hand-written patch'] += 1
+                continue
+            if m.calls_setjmp(a, end):
+                why['calls setjmp'] += 1
+                continue
+            r = native.analyze(m, a, end, tables, a in functions)
+            if r.ok:
+                m.native[a] = True
+            else:
+                why[re.sub(r'x[\d,]+', 'x..', r.why)] += 1
+            if r.extra_results:  # (a caller reads more of their registers than x0-x1: they keep them in the Cpu)
+                extra |= set(r.calls)
+        for t in extra:
+            if m.native.pop(t, False):
+                why['callers read more results'] += 1
+        print(f'{name}: native {len(m.native)} of {len(entries) - len(set(hle) & set(entries))} functions, '
+              f'{dict(why)}, {time.time() - t1:.0f}s', file=sys.stderr)
 
     os.makedirs(outdir, exist_ok=True)
     order = sorted(entries)
@@ -715,6 +767,8 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--any-version', action='store_true')  # (a main module of a version not supported yet)
     ap.add_argument('--no-sites', action='store_true')  # (made-up modules, tools/test_layout.py: no sites, no patches)
+    # (registers x19-x29, sp and flags in locals where the calling convention allows it: tools/native.py)
+    ap.add_argument('--no-native', dest='native', action='store_false')
     ap.add_argument('--simd', choices=('asm', 'c'),
                     default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
     args = ap.parse_args()
