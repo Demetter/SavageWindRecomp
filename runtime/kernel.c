@@ -948,6 +948,18 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         t->handle = kernel_new_handle(&t->obj);
         LOG("[kernel] CreateThread entry=%llx stack=%llx prio=%d core %d -> %x\n", x[1], x[3], (int)x[4], (int)(int32_t)x[5],
             t->handle);
+        static int callers = -1;  // (research) SAVAGEWIND_LOG_THREAD_CALLERS=1: the code addresses on the creator's stack
+        if (callers < 0) callers = getenv("SAVAGEWIND_LOG_THREAD_CALLERS") != NULL;
+        if (callers) {
+            char line[512];
+            int len = snprintf(line, sizeof line, "[kernel] CreateThread %x arg %llx lr %llx stack:", t->handle,
+                               (unsigned long long)x[2], (unsigned long long)c->x[30]);
+            const uint64_t *sp = (const uint64_t *)(uintptr_t)c->sp;
+            for (int i = 0, n = 0; i < 160 && n < 10 && len < (int)sizeof line - 20; i++)
+                if (sp[i] >= 0x7000000000ull && sp[i] < 0x7003200000ull && !(sp[i] & 3))
+                    len += snprintf(line + len, sizeof line - len, " %llx", (unsigned long long)sp[i]), n++;
+            LOG("%s\n", line);
+        }
         x[0] = R_OK;
         x[1] = t->handle;
         break;
