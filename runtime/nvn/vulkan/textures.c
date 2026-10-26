@@ -351,11 +351,13 @@ void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags as
 typedef struct { VkImage img; VmaAllocation mem; VkImageView view; uint64_t seq; VkBuffer buffer; } Dead;
 static Dead *dead;
 static int ndead, cap_dead;
+static pthread_mutex_t dead_lock = PTHREAD_MUTEX_INITIALIZER;  // (translation workers evict views too: vk_image_view)
 static void views_forget(TexBackend *b);
 
 void vk_collect_dead(void) {
     uint64_t done = vk_completed_seq();
     int k = 0;
+    pthread_mutex_lock(&dead_lock);
     for (int i = 0; i < ndead; i++) {
         if (dead[i].seq > done) { dead[k++] = dead[i]; continue; }
         if (dead[i].view) vkDestroyImageView(g_vk.dev, dead[i].view, NULL);
@@ -363,6 +365,7 @@ void vk_collect_dead(void) {
         else vmaDestroyImage(g_vk.vma, dead[i].img, dead[i].mem);
     }
     ndead = k;
+    pthread_mutex_unlock(&dead_lock);
 }
 
 static void create_image(NvnTexture *t, TexBackend *b) {
@@ -493,10 +496,15 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     }
 }
 
+uint64_t vk_latest_seq(void);  // (exec.c: the submission the render thread records now)
 static void defer(Dead d) {
+    // (a worker's own submission can be older than the render thread's, which may hold the object still: the later)
+    uint64_t seq = vk_pending_seq(), latest = vk_latest_seq();
+    d.seq = seq > latest ? seq : latest;
+    pthread_mutex_lock(&dead_lock);
     if (ndead == cap_dead) { cap_dead = cap_dead ? cap_dead * 2 : 256; dead = realloc(dead, cap_dead * sizeof *dead); }
-    d.seq = vk_pending_seq();
     dead[ndead++] = d;
+    pthread_mutex_unlock(&dead_lock);
 }
 
 void vk_defer_image(VkImage img, VmaAllocation mem) { defer((Dead){.img = img, .mem = mem}); }
@@ -689,8 +697,18 @@ static void zombies_expire(void) {  // (gpu lock held)
     }
 }
 
+__thread bool vk_tex_ro;  // (vk.h) this thread only reads textures' images: a translation worker
+static TexBackend tex_none;  // (what a worker gets for a texture nobody made an image for: no image)
+static uint64_t tex_ro_misses;
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
+    if (vk_tex_ro) {  // (vk_tex_prepare missed it: a gap in the render thread's preparation, logged)
+        if (b && !rs_stale(b)) return b;
+        uint64_t n = __atomic_fetch_add(&tex_ro_misses, 1, __ATOMIC_RELAXED);
+        if (n < 8 || !(n & 4095)) LOG("[par] worker found texture #%llu %ux%u unprepared (%llu so far)\n",
+                                      (unsigned long long)t->debug_id, t->width, t->height, (unsigned long long)n + 1);
+        return b ? b : &tex_none;
+    }
     if (b) {
         if (t->finalized) t->backend_used_frame = b->used_frame = renderer_present_count();
         if (rs_stale(b)) {  // output resolution changed: reallocate
@@ -1160,6 +1178,7 @@ void vk_trace_dump(NvnTexture *t) {
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
+    if (vk_tex_ro) return b;  // (a worker: uploads and checks were made by the render thread, vk_tex_prepare)
     if (!for_render && !b->gpu_owned && vk_trace_tex(t))  // (CPU-owned: guest memory is uploaded when it changed)
         vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->uploaded, b->dynamic);
     if (b->pending_rgba) upload_pending(b);
@@ -1183,6 +1202,19 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
         if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
     }
     return b;
+}
+
+// (parallel translation, the render thread) for a texture a worker's draw samples: what the worker's lookups would do
+// that changes anything - its image made or remade, uploads, the frame's change check (vk_tex) - done now, in list order,
+// once a frame unless something came up since (pixels from the CPU, written levels, new button icons)
+void vk_tex_prepare(NvnTexture *t) {
+    TexBackend *b = t->backend;
+    uint64_t frame = vk_frame_counter();
+    if (b && b->prep_frame == frame && !b->pending_rgba && !__atomic_load_n(&t->cpu_levels, __ATOMIC_ACQUIRE) &&
+        (!b->glyph_gen || b->glyph_gen == glyphs_generation()))
+        return;
+    b = vk_tex(t, false);
+    b->prep_frame = frame;
 }
 
 void renderer_mark_gpu_owned(NvnTexture *t) {
@@ -1337,10 +1369,14 @@ static ViewEnt view_tab[VIEW_TAB];
 // Views may still be referenced by submitted or pending work: destroyed once that has completed.
 void vk_views_forget(TexBackend *b) { views_forget(b); }
 uint32_t vk_view_gen;  // bumped whenever a cached view may be destroyed (exec.c's per-frame texture memo)
+static pthread_mutex_t view_lock = PTHREAD_MUTEX_INITIALIZER;  // (the table: every translating thread)
+uint64_t vk_view_lock_ns, vk_view_lock_waits;  // (exec.c's SAVAGEWIND_VK_PAR_PROBE) time lookups waited for it
 static void views_forget(TexBackend *b) {
-    vk_view_gen++;
+    pthread_mutex_lock(&view_lock);
+    __atomic_fetch_add(&vk_view_gen, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < VIEW_TAB; i++)
         if (view_tab[i].b == b) { defer((Dead){.view = view_tab[i].view}); view_tab[i].b = NULL; view_tab[i].view = VK_NULL_HANDLE; }
+    pthread_mutex_unlock(&view_lock);
 }
 
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
@@ -1349,9 +1385,15 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     uint64_t k2 = (uint64_t)ly0 | (uint64_t)nly << 16 | (uint64_t)sw.r << 32 | (uint64_t)sw.g << 40 | (uint64_t)sw.b << 48 | (uint64_t)sw.a << 56;
     uint64_t h = ((uint64_t)(uintptr_t)b * 0x9E3779B97F4A7C15ull) ^ (k1 * 0xC2B2AE3D27D4EB4Full) ^ (k2 * 0x165667B19E3779F9ull);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VIEW_TAB - 1);
+    if (pthread_mutex_trylock(&view_lock)) {  // (taken: the wait counted, SAVAGEWIND_VK_PAR_PROBE)
+        uint64_t t0 = SDL_GetTicksNS();
+        pthread_mutex_lock(&view_lock);
+        __atomic_fetch_add(&vk_view_lock_ns, SDL_GetTicksNS() - t0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&vk_view_lock_waits, 1, __ATOMIC_RELAXED);
+    }
     for (int probe = 0; probe < 16; probe++, slot = (slot + 1) & (VIEW_TAB - 1)) {
         ViewEnt *e = &view_tab[slot];
-        if (e->b == b && e->k1 == k1 && e->k2 == k2) return e->view;
+        if (e->b == b && e->k1 == k1 && e->k2 == k2) { VkImageView v = e->view; pthread_mutex_unlock(&view_lock); return v; }
         if (!e->b) break;
     }
     extern uint64_t prof_views_created;
@@ -1362,11 +1404,13 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &v) != VK_SUCCESS) {
         static int nfail;
         if (nfail++ < 20) LOG("[vk] view failed: type %d fmt %d (image fmt %d) levels %u+%u layers %u+%u\n", type, fmt, b->format, lv0, nlv, ly0, nly);
+        pthread_mutex_unlock(&view_lock);
         return VK_NULL_HANDLE;
     }
     ViewEnt *e = &view_tab[slot];
-    if (e->b) { defer((Dead){.view = e->view}); vk_view_gen++; }  // evict (16 probes taken)
+    if (e->b) { defer((Dead){.view = e->view}); __atomic_fetch_add(&vk_view_gen, 1, __ATOMIC_RELAXED); }  // evict (16 probes taken)
     *e = (ViewEnt){b, k1, k2, v};
+    pthread_mutex_unlock(&view_lock);
     return v;
 }
 
@@ -1408,6 +1452,7 @@ VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v) {
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
     TexBackend *b = vk_tex(t, render);
+    if (vk_tex_ro && !b->image) return VK_NULL_HANDLE;  // (a worker's unprepared texture: tex_backend)
     if (!has_view) v = NULL;
     VkFormat fmt = b->format;
     if (v && (v->setmask & 4) && !(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {

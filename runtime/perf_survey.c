@@ -62,10 +62,30 @@ static void one_per_core_init(void) {
     LOG("[cpu] %d cores, %d logical processors: %s\n", cores, logical, on ? "one logical processor per core" : "all logical processors");
     if (on) one_per_core(true);
 }
+void perf_thread_priority(int p) { SetThreadPriority(GetCurrentThread(), p); }  // (Windows' steps: -1 below normal)
+uint64_t perf_process_cycles(void) { ULONG64 c = 0; QueryProcessCycleTime(GetCurrentProcess(), &c); return c; }
+uint64_t perf_thread_cycles(void) { ULONG64 c = 0; QueryThreadCycleTime(GetCurrentThread(), &c); return c; }
+uint64_t perf_process_cpu_ns(void) {  // user + kernel time of all the process's threads
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
+    return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+}
+int perf_usable_processors(void) {  // the logical processors the game may run on (after one_per_core_init)
+    DWORD_PTR all, sys;
+    GetProcessAffinityMask(GetCurrentProcess(), &all, &sys);
+    return __builtin_popcountll((unsigned long long)all);
+}
 #else
 static void one_per_core(bool on) { (void)on; }
 static void one_per_core_init(void) {}
+#include <unistd.h>
+int perf_usable_processors(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
+uint64_t perf_process_cpu_ns(void) { return 0; }
+uint64_t perf_process_cycles(void) { return 0; }
+uint64_t perf_thread_cycles(void) { return 0; }
+void perf_thread_priority(int p) { (void)p; }
 #endif
+void perf_one_per_core(bool on) { one_per_core(on); }
 
 void perf_survey_init(void) {
     const char *x = getenv("SAVAGEWIND_PERFX");

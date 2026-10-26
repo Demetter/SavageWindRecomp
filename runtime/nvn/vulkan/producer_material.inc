@@ -37,7 +37,7 @@ static bool producer_material_allowed(Prog *pr) {
         }
         if (!enabled) return false;
     }
-    return material_mode && mt_list && vkq_on && !g_debug_frame && !uub_log_full &&
+    return material_mode && mt_list && !par_list && vkq_on && !g_debug_frame && !uub_log_full &&
         !stage_reuse_mode && !g_vk.native_multi_draw && draw_batch_probe_on <= 0 &&
         st.program->stage_mask == 3 && pr->vi->ntex <= DJ_TEX && pr->fi->ntex <= DJ_TEX &&
         in_pass && !st.rt_dirty && !pass_out && !pass_cube_layers &&

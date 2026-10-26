@@ -271,7 +271,12 @@ static void *queue_thread(void *arg) {
 }
 
 // (g_q_lock held; returns with it held) until done(): the guest thread's core let go meanwhile
+// (exec.c's SAVAGEWIND_VK_PAR_PROBE) time guest threads waited here: for operations run (nvnSyncWait, finishes), for room
+uint64_t plat_now_ns(void);
+_Atomic uint64_t nvn_queue_wait_ns, nvn_queue_room_ns;
+static bool q_room(uint64_t present);
 static void queue_block(bool (*done)(uint64_t), uint64_t arg) {
+    uint64_t t0 = done(arg) ? 0 : plat_now_ns();
     while (!done(arg)) {
         pthread_mutex_unlock(&g_q_lock);
         kernel_host_work_begin();
@@ -281,6 +286,8 @@ static void queue_block(bool (*done)(uint64_t), uint64_t arg) {
         kernel_host_work_end();  // (taking the core back without the queue's lock: its holder may be queueing)
         pthread_mutex_lock(&g_q_lock);
     }
+    if (t0) atomic_fetch_add_explicit(done == q_room ? &nvn_queue_room_ns : &nvn_queue_wait_ns, plat_now_ns() - t0,
+                                      memory_order_relaxed);
 }
 static bool q_reached(uint64_t k) { return g_q_done >= k; }
 static bool q_translated(uint64_t k) { return g_q_translated >= k; }
