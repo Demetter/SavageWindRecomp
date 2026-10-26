@@ -154,9 +154,12 @@ GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools
 GAMELIB_SRCS += tools/layout.py tools/game_sites.py
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(strip $(GENFLAGS))'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 # Never mix native objects and ThinLTO bitcode after a flag/ABI change (including
-# switching back). Each game library identity owns its complete object set.
-GEN_OBJDIR := $(B)/obj-$(GAMELIB_ID)
-GEN_OBJ := $(patsubst %.c,$(GEN_OBJDIR)/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(GEN_OBJDIR)/tools/gamelib_entry.o
+# switching back). Each set of compile flags (and generated tree) owns its complete object set. Not the generator's
+# own sources: gen.py rewrites only the files whose C changed (write_if_changed, plan_files), so after a generator
+# change make recompiles just those; the headers are every object's prerequisites.
+GEN_OBJ_ID := $(shell (echo '$(strip $(GENFLAGS))'; echo '$(GENFLAGS_ZIG)'; echo '$(GEN)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GEN_OBJDIR := $(B)/obj-$(GEN_OBJ_ID)
+GEN_OBJ := $(patsubst %.c,$(GEN_OBJDIR)/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(GEN_OBJDIR)/tools/gamelib_entry-$(GAMELIB_ID).o
 # The compatible target (#9): x86-64 CPUs without AVX2 / FMA / BMI2 get the game code built with GENARCH_COMPAT in
 # place of GENARCH (no -mfma: simd.h's fma is runtime/simd_softfma.h, slower). The start screen builds the one the CPU
 # runs (runtime/gamelib.h gamelib_compat); its id differs, so neither library is ever loaded in place of the other.
@@ -189,7 +192,9 @@ $(GEN_OBJDIR)/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h run
 	@$(CC) $(GENFLAGS) -c $< -o $@
 $(GEN_OBJDIR)/layout.o: runtime/gamelib.h
 
-$(GEN_OBJDIR)/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) Makefile  # (the id: the flags are in here too)
+# (named by the id: the object folder outlives a generator change, and a source edited during a build must not
+# leave an object with the old id that looks up to date)
+$(GEN_OBJDIR)/tools/gamelib_entry-$(GAMELIB_ID).o: tools/gamelib_entry.c $(GAMELIB_SRCS) Makefile  # (the id: the flags are in here too)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -c $< -o $@
 $(B)/rt/nvn/maxwell/translate.o: RTFLAGS += -DTRANSLATOR_ID='"$(TRANSLATOR_ID)"'

@@ -46,6 +46,8 @@ GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site);  // the function at 
 // A better thread waits for this thread's emulated core: an indirect call goes through rt_dispatch_site, whose
 // kernel_preempt hands it over (the generated code calls a site's cached target inline otherwise: tools/gen.py)
 #define RT_PREEMPT_DUE(c) ((c)->best_wait && *(c)->best_wait < (c)->prio)
+// (debugging, tools/native.py SW_NATIVE_CHECK) a native function left with sp or x19-x29 (reg 31: sp) not as at entry
+void rt_native_fail(uint64_t fn, int reg, uint64_t got, uint64_t want);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
 void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));

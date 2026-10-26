@@ -235,6 +235,13 @@ GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site) {
     return f;
 }
 
+void rt_native_fail(uint64_t fn, int reg, uint64_t got, uint64_t want) {
+    static int n;
+    if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 40)
+        LOG("[native-check] f_%llx leaves %s%d = %llx, entry %llx\n", (unsigned long long)fn, reg == 31 ? "sp" : "x",
+            reg == 31 ? 0 : reg, (unsigned long long)got, (unsigned long long)want);
+}
+
 void guest_call(Cpu *c, uint64_t addr) {
     uint64_t lr = c->x[30];
     c->x[30] = 0;

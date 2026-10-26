@@ -88,7 +88,7 @@ def sanitize(sym):
 
 class Module:
     def __init__(self, name, path, base, simd='asm'):
-        self.name = name
+        self.name, self.nso_path, self.simd = name, path, simd
         self.nso = Nso(path)
         self.base = base
         n = self.nso
@@ -108,6 +108,7 @@ class Module:
         self.sites, self.patches = {}, {}  # (main: tools/game_sites.py, tools/patches.py)
         self.native = {}  # entry -> True: registers x19-x29, sp and flags in locals (tools/native.py, --native)
         self.hle = {}
+        self.forwarders = set()  # functions that jump on to a target known only then (PLT stubs, thunks)
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -483,6 +484,9 @@ class Module:
         def native_callee(t):
             return self.native.get(t, False) or t in self.hle
 
+        def to_runtime(t):  # (may reach the runtime, which reads a caller's x19 / x29: native.PRE_RT)
+            return t in self.hle or t in self.forwarders
+
         batch = []
 
         def flush():
@@ -496,7 +500,7 @@ class Module:
             if not self.in_text(t):
                 return f'{ph(native.PRE_LEGACY)}{C}->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch({C});'
             refs.add(t)
-            pre = ph(native.PRE_TAIL if native_callee(t) else native.PRE_LEGACY)
+            pre = ph(native.PRE_LEGACY if not native_callee(t) else native.PRE_RT_TAIL if to_runtime(t) else native.PRE_TAIL)
             return f'{pre}__attribute__((musttail)) return {fname(t)}({C});'
 
         all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
@@ -545,14 +549,15 @@ class Module:
                     out.append('    ' + setjmp_call(t, a + 4))
                 elif self.in_text(t):
                     refs.add(t)
-                    pre, post = ((native.PRE_CALL, native.POST_CALL) if native_callee(t)
-                                 else (native.PRE_LEGACY, native.POST_LEGACY))
+                    pre, post = ((native.PRE_LEGACY, native.POST_LEGACY) if not native_callee(t) else
+                                 (native.PRE_RT, native.POST_CALL) if to_runtime(t) else (native.PRE_CALL, native.POST_CALL))
                     out.append(f'    {C}->x[30] = {hx(a + 4)}; {ph(pre)}{fname(t)}({C});{ph(post)}')
                 else:
                     out.append(f'    {C}->x[30] = {hx(a + 4)}; {C}->pc = {hx(t)}; {ph(native.PRE_LEGACY)}rt_dispatch({C});'
                                f'{ph(native.POST_LEGACY)}')
-            elif k == 'blr':  # (a function pointer or a virtual call: a function made as the convention says)
-                out.append(f'    {C}->pc = {rw(ins.target)}; {C}->x[30] = {hx(a + 4)}; {ph(native.PRE_CALL)}'
+            elif k == 'blr':  # (a function pointer or a virtual call: a function made as the convention says; or the
+                # runtime - NVN's procedures are called through a table, and nvnWindowSetPresentInterval reads x19)
+                out.append(f'    {C}->pc = {rw(ins.target)}; {C}->x[30] = {hx(a + 4)}; {ph(native.PRE_RT)}'
                            f'{site(SITE_CALL, C)}{ph(native.POST_CALL)}')
             elif k == 'br':
                 jt = tables.get(a)
@@ -664,6 +669,97 @@ def main_sites(nso, base, opts):
     return game_sites.for_module(nso, base, opts.any_version, lambda s: print(s, file=sys.stderr))
 
 
+# Bytes of C per byte of guest code that files are planned with (plan_files): about 18 on average, up to 30 in
+# stretches of SIMD code (1.9.0); 28 keeps 99% of files under --chunk-bytes, as many files as sizing by C gave.
+C_PER_GUEST = 28
+
+
+def plan_files(order, entries, opts):
+    """The functions of each C file: in address order, at most --chunk functions and about --chunk-bytes of C, a big
+    function (--big-fn) in a file of its own (they compile in parallel). Sized by guest code, not by the C generated,
+    so a file holds the same functions whatever the generator emits for them: after a generator change only the files
+    whose C changed are written (write_if_changed) and recompiled."""
+    files, cur, size = [], [], 0
+    for a in order:
+        n = (entries[a][0] - a) * C_PER_GUEST
+        if cur and (len(cur) >= opts.chunk or size + n > opts.chunk_bytes or n > opts.big_fn):
+            files.append(cur)
+            cur, size = [], 0
+        cur.append(a)
+        size += n
+        if n > opts.big_fn:
+            files.append(cur)
+            cur, size = [], 0
+    return files + [cur] if cur else files
+
+
+def emit_file(m, name, outdir, i, ents):
+    """Writes <outdir>/<name>_<i>.c: the functions ents (entry -> (end, labels, tables)). Returns their count."""
+    body, refs = [], set()
+    for a, (end, labels, tables) in ents.items():
+        body += m.emit_function(a, end, labels, tables, m.hle)
+        refs |= m._refs
+    text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+    if any('rt_setjmp_slot(' in l for l in body):
+        text += ['#include <setjmp.h>\njmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf);\n']
+    text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
+    text += [f'void {sanitize(m.hle[a])}(Cpu *c);\n' for a in sorted(set(m.hle) & set(ents))]
+    text += ['\n'.join(body), '\n']
+    write_if_changed(os.path.join(outdir, f'{name}_{i:03d}.c'), ''.join(text))
+    return len(ents)
+
+
+def slices(items, jobs):
+    """items in contiguous runs, a few per job (a process's lift cache stays on one stretch of code)."""
+    k = max(1, -(-len(items) // (jobs * 8)))
+    return [items[i:i + k] for i in range(0, len(items), k)]
+
+
+# --jobs: generate()'s per-function work in worker processes, each with its own copy of the module (built in a second,
+# Module), given the parent's results so far (sites, HLE functions, the native ones, the forwarders).
+_wm = None
+
+
+def _job_init(name, path, base, simd, sites, hle, native_fns, forwarders):
+    global _wm
+    _wm = Module(name, path, base, simd)
+    _wm.sites, _wm.patches = sites, patches.table(sites) if sites else {}
+    _wm.hle, _wm.native, _wm.forwarders = hle, native_fns, forwarders
+
+
+def _analyze(m, todo):
+    out = []
+    for a, end, tables, is_function in todo:
+        r = native.analyze(m, a, end, tables, is_function)
+        out.append((a, r.ok, r.why, r.extra_results, r.calls))
+    return out
+
+
+def _emit_file(m, args):
+    return emit_file(m, *args)
+
+
+def _job(fn, arg):
+    return fn(_wm, arg)
+
+
+def run_jobs(m, jobs, fn, work):
+    """fn(m, w) for each w of work: here (jobs 1) or in that many processes. Yields the results as they come; a list
+    result is yielded item by item."""
+    def each(results):
+        for r in results:
+            yield from r if isinstance(r, list) else (r,)
+    if jobs <= 1 or len(work) < 2:
+        yield from each(fn(m, w) for w in work)
+        return
+    import concurrent.futures
+    with concurrent.futures.ProcessPoolExecutor(
+            min(jobs, len(work)), initializer=_job_init,
+            initargs=(m.name, m.nso_path, m.base, m.simd, m.sites, m.hle, m.native, m.forwarders)) as ex:
+        futures = [ex.submit(_job, fn, w) for w in work]
+        yield from each(f.result() for f in concurrent.futures.as_completed(futures))
+
+
 def generate(name, nso, base, outdir, opts, sites=None):
     t0 = time.time()
     m = Module(name, nso, base, opts.simd)
@@ -682,11 +778,15 @@ def generate(name, nso, base, outdir, opts, sites=None):
     print(f'{name}: {len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
           f'{time.time() - t0:.0f}s', file=sys.stderr)
     m.hle = hle
+    for a, (end, labels, tables) in entries.items():  # (forwarders: a br the function doesn't resolve, gen.Module)
+        if any(m.lift(x).kind == 'br' and x not in tables for x in range(a, end, 4)):
+            m.forwarders.add(a)
     if opts.native:  # (tools/native.py: which functions keep x19-x29, sp and the flags in locals)
         t1, why = time.time(), Counter()
         patched = sorted(m.patches)
         functions = m.called  # (unwind info, symbols, relocations, calls, taken addresses: not split pieces)
         extra = set()
+        todo = []
         for a, (end, labels, tables) in entries.items():
             if a in hle:
                 continue
@@ -697,13 +797,14 @@ def generate(name, nso, base, outdir, opts, sites=None):
             if m.calls_setjmp(a, end):
                 why['calls setjmp'] += 1
                 continue
-            r = native.analyze(m, a, end, tables, a in functions)
-            if r.ok:
+            todo.append((a, end, tables, a in functions))
+        for a, ok, r_why, extra_results, calls in run_jobs(m, opts.jobs, _analyze, slices(todo, opts.jobs)):
+            if ok:
                 m.native[a] = True
             else:
-                why[re.sub(r'x[\d,]+', 'x..', r.why)] += 1
-            if r.extra_results:  # (a caller reads more of their registers than x0-x1: they keep them in the Cpu)
-                extra |= set(r.calls)
+                why[re.sub(r'x[\d,]+', 'x..', r_why)] += 1
+            if extra_results:  # (a caller reads more of their registers than x0-x1: they keep them in the Cpu)
+                extra |= set(calls)
         for t in extra:
             if m.native.pop(t, False):
                 why['callers read more results'] += 1
@@ -714,43 +815,14 @@ def generate(name, nso, base, outdir, opts, sites=None):
     order = sorted(entries)
     if opts.limit:
         order = order[:opts.limit]
-    nchunks = 0
-    ci = 0
-    pending = None  # (address, lines, refs) of a big function that starts the next file
-    while ci < len(order) or pending:
-        body, refs, size, fns = [], set(), 0, []
-        while (pending or ci < len(order)) and len(fns) < opts.chunk and size < opts.chunk_bytes:
-            if pending:
-                a, lines, r = pending
-                pending = None
-            else:
-                a = order[ci]
-                ci += 1
-                end, labels, tables = entries[a]
-                lines = m.emit_function(a, end, labels, tables, hle)
-                r = getattr(m, '_refs', set())
-                m._refs = set()
-            n = sum(len(l) + 1 for l in lines)
-            if n > opts.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
-                pending = (a, lines, r)
-                break
-            body += lines
-            size += n
-            fns.append(a)
-            refs |= r
-            if n > opts.big_fn:
-                break
-        path = os.path.join(outdir, f'{name}_{nchunks:03d}.c')
-        text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
-        if any('rt_setjmp_slot(' in l for l in body):
-            text += ['#include <setjmp.h>\njmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf);\n']
-        text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
-        text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
-        text += ['\n'.join(body), '\n']
-        write_if_changed(path, ''.join(text))
+    files = plan_files(order, entries, opts)
+    work = [(name, outdir, i, {a: entries[a] for a in fns}) for i, fns in enumerate(files)]
+    done = nchunks = 0
+    for n in run_jobs(m, opts.jobs, _emit_file, work):
+        done += n
         nchunks += 1
         # (the start screen's setup reads these for its progress bar: runtime/gamebuild.c)
-        print(f'{name}: progress {ci}/{len(order)} files {nchunks}', file=sys.stderr, flush=True)
+        print(f'{name}: progress {done}/{len(order)} files {nchunks}', file=sys.stderr, flush=True)
     for fn in os.listdir(outdir):  # an earlier run's extra chunks
         mm = re.fullmatch(re.escape(name) + r'_(\d{3})\.c', fn)
         if mm and int(mm.group(1)) >= nchunks:
@@ -786,6 +858,7 @@ def main():
     ap.add_argument('--no-sites', action='store_true')  # (made-up modules, tools/test_layout.py: no sites, no patches)
     # (registers x19-x29, sp and flags in locals where the calling convention allows it: tools/native.py)
     ap.add_argument('--no-native', dest='native', action='store_false')
+    ap.add_argument('--jobs', type=int, default=1)  # worker processes for the per-function work (generate)
     ap.add_argument('--simd', choices=('asm', 'c'),
                     default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
     args = ap.parse_args()
@@ -806,11 +879,21 @@ def main():
                 for n in layout.LOAD_ORDER:  # a module gone from the exefs: its old C would still be built in
                     if n not in present and os.path.isdir(os.path.join(outdir, n)):
                         shutil.rmtree(os.path.join(outdir, n))
-                hle = args.hle
+                procs = []
                 for n, base, size, build_id in lay:
-                    args.hle = hle if n != 'main' else None
-                    generate(n, os.path.join(exefs, n), base, os.path.join(outdir, n), args,
-                             sites if n == 'main' else None)
+                    opts = argparse.Namespace(**vars(args))
+                    opts.hle = args.hle if n != 'main' else None
+                    job = (n, os.path.join(exefs, n), base, os.path.join(outdir, n), opts, sites if n == 'main' else None)
+                    if args.jobs > 1:  # (all modules at once: main's discovery, one process's work, takes the longest)
+                        import multiprocessing
+                        procs.append((n, multiprocessing.get_context('spawn').Process(target=generate, args=job)))
+                        procs[-1][1].start()
+                    else:
+                        generate(*job)
+                for n, p in procs:
+                    p.join()
+                    if p.exitcode:
+                        sys.exit(f'gen.py: generating {n} failed')
             return
         lay = {n: (b, i) for n, b, s, i in layout.read(args.paths[0])}
         if args.name not in lay:

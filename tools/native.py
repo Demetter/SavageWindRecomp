@@ -20,6 +20,12 @@ NREG = 30  # x0-x29 (x30, the link register, stays in the Cpu: every call writes
 # instructions, not fewer: they are dead after every call anyway, and in call-free code the compiler kept c->x[] in
 # host registers already (the Cpu is restrict); 30 locals only made it spill more (f_7000267228: 3,068 -> 3,357).
 ALL_REGS = False
+# (bisecting) SW_NATIVE_VLOCAL=0: native functions keep V and FPCR in the Cpu
+import os
+V_LOCAL = os.environ.get('SW_NATIVE_VLOCAL', '1') != '0'
+# (debugging) SW_NATIVE_CHECK=1: each native function checks at its returns and tail calls that sp and x19-x29 are
+# what they were at entry (cpu.h rt_native_fail logs the first ones that aren't)
+CHECK = os.environ.get('SW_NATIVE_CHECK') == '1'
 CS = tuple(range(19, 30))  # x19-x28 callee-saved, x29 the frame pointer
 ARGS = tuple(range(0, 9))  # x0-x7 arguments, x8 the indirect result address
 RES = (0, 1)
@@ -217,6 +223,10 @@ def rewrite(code):
 # by then restored to what they were at entry (its epilogue loaded them back), so the caller finds its own.
 PRE_CALL, POST_CALL, PRE_SVC, POST_SVC, PRE_TAIL, PRE_LEGACY, POST_LEGACY, PRE_RET = (
     '/*@pre*/', '/*@post*/', '/*@presvc*/', '/*@postsvc*/', '/*@tail*/', '/*@spill*/', '/*@fill*/', '/*@ret*/')
+# PRE_RT / PRE_RT_TAIL: before a call or tail call that may reach the runtime (an HLE function, or a forwarder - a PLT
+# stub, a thunk - that jumps to one): the runtime reads a caller's x19 and x29 in places (nvnWindowSetPresentInterval:
+# x19 is the frame loop's framework; hle/input.c), so x19-x29 go to the Cpu too
+PRE_RT, PRE_RT_TAIL = '/*@prert*/', '/*@prerttail*/'
 RE_LOCAL = re.compile(r'\b(x(?:[0-9]|1[0-9]|2[0-9])|sp|fl)\b' if ALL_REGS else r'\b(x(?:19|2[0-9])|sp|fl)\b')
 
 
@@ -229,7 +239,13 @@ def finish(lines):
     # (its own Cpu, for V and FPCR: c named, or one of simd.h's macros that use c)
     has_v = re.search(r'(?<![\w>])c\b|\b(VU|VREG|VQ|VW|VS8|VS16|VS32|VS64|VSF32|VSF64|VHI64|VGET|VSETL|FP_SETS|FP_SETD|'
                       r'SV_FOP_S|SV_FOP_D)\(', re.sub(r'/\*@\w+\*/', '', body)) is not None
-    spills = PRE_LEGACY in body
+    # (it stores its own x19-x29 in the Cpu somewhere - for code keeping its registers there, or before a call that
+    # may reach the runtime: its returns and tail calls store them again, restored by then to their entry values)
+    spills = PRE_LEGACY in body or PRE_RT in body or PRE_RT_TAIL in body
+    if has_v and not V_LOCAL:  # (SW_NATIVE_VLOCAL=0: V and FPCR stay in the Cpu, c is cg)
+        has_v, alias_c = False, True
+    else:
+        alias_c = False
 
     def st(rs):
         return ''.join(f' cg->x[{r}] = x{r};' for r in xs if r in rs)
@@ -251,18 +267,32 @@ def finish(lines):
     # (after a call v0-v7 are loaded back, not only the results: the next call's stores of the ones not changed since
     # then are dropped)
     rep = {PRE_CALL: st(ARGS) + st((29,)) + st_sp + st_v(v_args), POST_CALL: ld(RES) + ld_fl + ld_v(v_args),
+           PRE_RT: st(ARGS) + st(CS) + st_sp + st_v(v_args),
+           PRE_RT_TAIL: st(ARGS) + st(CS) + st_sp + st_v(v_args) + (st_v(v_cs) if spills else ''),
            PRE_SVC: st(ARGS) + st_sp, POST_SVC: ld(range(8)) + ld_fl,
            PRE_TAIL: st(ARGS) + st(keep) + st_sp + st_v(v_args) + (st_v(v_cs) if spills else ''),
            PRE_LEGACY: st(range(NREG)) + st_sp + st_fl + st_v(v_all),
            POST_LEGACY: ld(range(NREG)) + ld_fl + ld_v(v_all),
-           PRE_RET: st(RES) + (st(CS) if spills else '') + st_sp + st_fl + st_v(v_res) +
+           # (x29 always: every call stored this function's frame pointer in the Cpu, where a caller that keeps its
+           # registers there has its own; by now it is the entry value again)
+           PRE_RET: st(RES) + (st(CS) if spills else st((29,))) + st_sp + st_fl + st_v(v_res) +
            (st_v(v_cs) if spills else '')}
+    if CHECK:
+        fn = re.search(r'FN_ENTER_N\((0x[0-9a-f]+)ull\)', lines[1]).group(1)
+        chk = (''.join(f' if (x{r} != x{r}_in) rt_native_fail({fn}, {r}, x{r}, x{r}_in);' for r in xs if r in CS) +
+               (f' if (sp != sp_in) rt_native_fail({fn}, 31, sp, sp_in);' if has_sp else ''))
+        for k in (PRE_RET, PRE_TAIL, PRE_RT_TAIL):
+            rep[k] = chk + rep[k]
     out = lines[:2]
     decl = [f'uint64_t x{r} = cg->x[{r}];' for r in xs]
+    if CHECK:
+        decl += [f'const uint64_t x{r}_in = x{r};' for r in xs if r in CS] + (['const uint64_t sp_in = cg->sp;'] if has_sp else [])
     if has_sp:
         decl.append('uint64_t sp = cg->sp;')
     if has_fl:
         decl.append('NFlags fl = {cg->nzcv};')
+    if alias_c:
+        decl.append('Cpu *const c = cg;')
     if has_v:
         decl.append('Cpu c_; Cpu *const restrict c = &c_; c_.fpcr = cg->fpcr;' +
                     ''.join(f' c_.v[{r}] = cg->v[{r}];' for r in v_all))
