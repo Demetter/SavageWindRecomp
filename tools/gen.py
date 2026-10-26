@@ -33,25 +33,17 @@ from unicorn import arm64_const as A
 import game_sites
 import layout
 
-# A guest indirect call (blr / br) through its call site's own cache of the last target (runtime/dispatch.c
-# rt_dispatch_site): the call happens here, a branch of its own for the CPU's predictor, instead of in rt_dispatch,
-# which every indirect call shared.
-# The site's cached target is checked inline, as a native indirect call is a load and a call: the runtime
-# (rt_dispatch_site) only on a miss, a site's other targets, or when a better thread waits for this one's emulated core
-# (cpu.h RT_PREEMPT_DUE: kernel_preempt's condition, two loads).
-SITE_CALL = ('{ static const DispatchEnt *ds; const DispatchEnt *de = __atomic_load_n(&ds, __ATOMIC_ACQUIRE); '
-             'if (__builtin_expect(de && de->pc == c->pc && !RT_PREEMPT_DUE(c), 1)) de->fn(c); '
-             'else rt_dispatch_site(c, &ds)(c); }')
-SITE_TAIL = ('{ static const DispatchEnt *ds; const DispatchEnt *de = __atomic_load_n(&ds, __ATOMIC_ACQUIRE); '
-             'if (__builtin_expect(de && de->pc == c->pc && !RT_PREEMPT_DUE(c), 1)) __attribute__((musttail)) return de->fn(c); '
-             '__attribute__((musttail)) return rt_dispatch_site(c, &ds)(c); }')
+# A guest indirect call (blr / br) as a native one is: the target's host function from the function table (cpu.h
+# rt_fn_at: a load, whatever the target - virtual calls with many targets too) and a call, here, a branch of its own for
+# the CPU's predictor. The runtime (rt_dispatch_at) only for an address no call reached yet, HLE functions, overrides,
+# or when a better thread waits for this one's emulated core (cpu.h RT_PREEMPT_DUE: kernel_preempt's condition).
+SITE_CALL = '{ GuestFn f_ = rt_fn_at(c); if (__builtin_expect(f_ != 0, 1)) f_(c); else rt_dispatch_at(c)(c); }'
+SITE_TAIL = ('{ GuestFn f_ = rt_fn_at(c); if (__builtin_expect(f_ != 0, 1)) __attribute__((musttail)) return f_(c); '
+             '__attribute__((musttail)) return rt_dispatch_at(c)(c); }')
 
 
 def site(s, ctx):  # (a native function's Cpu is cg: its c is the local one holding its V registers, tools/native.py)
-    if ctx == 'c':
-        return s
-    return (s.replace('(c, &ds)(c)', f'({ctx}, &ds)({ctx})').replace('de->fn(c)', f'de->fn({ctx})')
-            .replace('c->pc', f'{ctx}->pc').replace('RT_PREEMPT_DUE(c)', f'RT_PREEMPT_DUE({ctx})'))
+    return s if ctx == 'c' else s.replace('(c)', f'({ctx})')
 import native
 import patches
 from analyze import eh_frame_extents, eh_frame_functions
