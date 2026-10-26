@@ -9,8 +9,8 @@
 // it; 1: off) makes those
 // images N times as wide and as high (textures.c) and fills them from the game's own glyphs: the signed distance to
 // each glyph's edge, worked out from its anti-aliased coverage (the edge estimate of Gustavson & Strand's anti-aliased
-// Euclidean distance transform, 2011), is interpolated to the larger grid and made coverage again with an edge one new
-// texel wide. The letters keep their shapes and weights (the ink of a sheet stays within 1%), only their edges get
+// Euclidean distance transform, 2011), is interpolated to the larger grid and made coverage again with an edge 1.5 new
+// texels wide, moved out by 0.2 old texels to keep the strokes' weight (font_edge, font_bold). Only the edges get
 // finer; square corners round off by about a third of an original texel. Features too thin for an edge of their own
 // (no texel of theirs nearly covered) keep their coverage, interpolated. NormalS_00's outlined glyphs are two layers,
 // each with its edges. The game samples the sheets with normalized coordinates, so nothing else changes (texel
@@ -248,6 +248,24 @@ static void distance_row(Up *u, uint32_t y) {
     }
 }
 
+// How wide an edge is in the new sheet's texels: SAVAGEWIND_FONT_EDGE (default 1.5). One texel (a pixel at the text's
+// size on screen) made the outlined small print's band a hard, stair-stepped line; the game's own sheets have edges
+// one old texel (n new ones) wide.
+static float font_edge(void) {
+    static float e = -1;
+    if (e < 0) { const char *v = getenv("SAVAGEWIND_FONT_EDGE"); e = v && atof(v) > 0 ? (float)atof(v) : 1.5f; }
+    return e;
+}
+
+// How far out the edge moves, in the old texels: SAVAGEWIND_FONT_BOLD (default 0.2). The game's soft edges spread a
+// letter's ink about half a texel past its 50% line, which reads as weight; a sharp edge on that line looked thinner
+// (item descriptions at 3x, 27 Oct: 0.2 matches the game's stroke weight, 0.35 is bolder).
+static float font_bold(void) {
+    static float b = -100;
+    if (b == -100) { const char *v = getenv("SAVAGEWIND_FONT_BOLD"); b = v ? (float)atof(v) : 0.2f; }
+    return b;
+}
+
 static uint8_t texel(const Up *u, uint32_t ox, uint32_t oy) {  // the new sheet's texel (ox, oy)
     uint64_t w = u->w, r0 = u->y0[oy] * w, r1 = u->y1[oy] * w;
     int x0 = u->x0[ox], x1 = u->x1[ox];
@@ -260,7 +278,7 @@ static uint8_t texel(const Up *u, uint32_t ox, uint32_t oy) {  // the new sheet'
         float s = p->s * w00 + q->s * w10 + r->s * w01 + z->s * w11;
         float k = p->k * w00 + q->k * w10 + r->k * w01 + z->k * w11;
         float a = p->a * w00 + q->a * w10 + r->a * w01 + z->a * w11;
-        float edge = clampf(0.5f - s * (float)u->n, 0, 1);
+        float edge = clampf(0.5f - (s - font_bold()) * (float)u->n / font_edge(), 0, 1);
         v += clampf(a + k * (edge - a), 0, 1);
     }
     return (uint8_t)(v / u->layers * 255 + 0.5f);

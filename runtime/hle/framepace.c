@@ -32,6 +32,7 @@
 //   - steps the controllers' hold counters by the frame's length (CONTROLLER_STEP, below).
 // Test and debug switches:
 //   SAVAGEWIND_FPS=<n>             frame rate instead of the setting (0: no limit)
+//   SAVAGEWIND_BACKGROUND_FPS=<n>  frame rate at most while another window is in front (default 60; 0: no cap)
 //   SAVAGEWIND_FRAMEPACE=0         the game's own pacing and clock (its 30 / 20 fps, as before)
 //   SAVAGEWIND_MOVIE_FPS=<n>       frame rate while a movie plays (default: the chosen one, the pictures paced by
 //                                  their time; with SAVAGEWIND_MOVIE_PACE=0 the movie's own; 0: the chosen one)
@@ -128,6 +129,13 @@ int framepace_target(void) {
     }
     if (menu > 0 && (fps == 0 || fps > menu) && in_menu()) fps = menu;
     if (event > 0 && (fps == 0 || fps > event) && in_event()) fps = event;
+    // Another window in front: at most SAVAGEWIND_BACKGROUND_FPS (default 60; 0: no cap), as PC games do. Without a
+    // limit the game kept presenting 240-300 frames a second behind the desktop, which lagged (typing, windows).
+    // Hidden runs (SAVAGEWIND_HIDDEN, the measurements) never have the focus: no cap.
+    static int bg = -2;
+    if (bg == -2) bg = getenv("SAVAGEWIND_HIDDEN") ? 0 : env_int("SAVAGEWIND_BACKGROUND_FPS", 60);
+    extern bool input_window_focused(void);
+    if (bg > 0 && (fps == 0 || fps > bg) && !input_window_focused()) fps = bg;
     return fps;
 }
 

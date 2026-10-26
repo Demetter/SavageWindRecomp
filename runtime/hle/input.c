@@ -254,9 +254,17 @@ static void mouse_stick(int32_t *x, int32_t *y) {
 
 // Main thread, every window loop turn (runtime/nvn/vulkan/device.c ui_run): hold or free the cursor.
 extern bool menu_cursor_free(void);     // runtime/ui/menu.mm: Esc freed the cursor (a click in the window holds it)
-static bool win_focused = true;         // (main thread: window events and input_mouse_update)
+static volatile bool win_focused = true;  // (main thread: window events and input_mouse_update; framepace.c reads it)
+bool input_window_focused(void) { return win_focused; }
 void input_mouse_update(SDL_Window *w) {
     static bool cur;
+    if (w) {  // (the window's own state: one that never had the focus gets no focus events, and minimized counts as out)
+        SDL_WindowFlags f = SDL_GetWindowFlags(w);
+        bool now = (f & SDL_WINDOW_INPUT_FOCUS) && !(f & SDL_WINDOW_MINIMIZED);
+        static int logged = -1;
+        if (now != logged) LOG("[window] %s\n", now ? "in front" : "in the background (frame rate capped: SAVAGEWIND_BACKGROUND_FPS)");
+        win_focused = now, logged = now;
+    }
     bool want = w && win_focused && g_settings.mouse_camera && !menu_input_captured() && !menu_cursor_free() &&
                 !getenv("SAVAGEWIND_INPUT") && !getenv("SAVAGEWIND_HOST_INPUT");
     if (want == cur) return;
