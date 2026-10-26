@@ -9525,6 +9525,233 @@ void vk_list_stats_frame(void) {  // (device.c, each present)
     memset(&lsum, 0, sizeof lsum);
 }
 
+// The state records - bindings, render targets, fixed-function state - applied to the calling thread's state `st`.
+// One place for the translation (exec_list) and its pre-pass (scan_list), so the two never disagree. False: not a
+// state record.
+static bool state_apply(CmdRec *r, void *x) {
+    switch (r->op) {
+    case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
+    case CMD_BIND_BLEND: { uint8_t *b = x; if (memcmp(st.blend[b[0] & 7], b, 8)) memcpy(st.blend[b[0] & 7], b, 8), key_gen++; break; }
+    case CMD_BIND_CHANNEL_MASK: if (memcmp(&st.channel_mask, x, 4)) memcpy(&st.channel_mask, x, 4), key_gen++; break;
+    case CMD_BIND_COLOR: if (memcmp(st.color_state, x, 4)) memcpy(st.color_state, x, 4), key_gen++; break;
+    case CMD_BIND_DEPTH_STENCIL: memcpy(st.ds, x, 8); break;
+    case CMD_BIND_MULTISAMPLE: if (memcmp(st.ms, x, 0x18)) memcpy(st.ms, x, 0x18), key_gen++; break;
+    case CMD_BIND_POLYGON: if (memcmp(st.poly, x, 4)) memcpy(st.poly, x, 4), key_gen++; break;
+    case CMD_BIND_VERTEX_ATTRIB: {
+        int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+        if (n != st.nattrib || memcmp(st.attrib, x, n * 4)) st.nattrib = n, memcpy(st.attrib, x, n * 4), key_gen++, prog_gen++;
+        break;
+    }
+    case CMD_BIND_VERTEX_STREAM: {
+        int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+        if (n != st.nstream || memcmp(st.stream, x, n * 8)) st.nstream = n, memcpy(st.stream, x, n * 8), key_gen++;
+        break;
+    }
+    case CMD_BIND_VERTEX_BUFFERS:
+        for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
+        break;
+    case CMD_BIND_UNIFORM_BUFFERS:
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 18 && r->x[0] < 6; i++)
+            memcpy(&st.ubuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+        if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS")) {
+            LOG("[bind] ubuf stage %llu slots %llu+%llu:", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                (unsigned long long)r->x[2]);
+            for (uint64_t i = 0; i < r->x[2] && i < 18; i++) {
+                const uint64_t *rg = (const uint64_t *)((uint8_t *)x + i * 16);
+                LOG(" %llx+%llu", (unsigned long long)rg[0], (unsigned long long)rg[1]);
+            }
+            LOG("\n");
+        }
+        break;
+    case CMD_BIND_STORAGE_BUFFERS:
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
+            memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+        sbuf_gen++;  // (the driver constants' memo: cbuf_info)
+        break;
+    case CMD_BIND_TEXTURES:
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++) {
+            if (material_mode && r->x[0] < 2 && memcmp(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8)) material_tex_gen++;
+            memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+        }
+        if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS")) {
+            LOG("[bind] stage %llu slots %llu+%llu:", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                (unsigned long long)r->x[2]);
+            for (uint64_t i = 0; i < r->x[2] && i < 32; i++) {
+                uint64_t h;
+                memcpy(&h, (uint8_t *)x + i * 8, 8);
+                uint32_t tic = h & 0xFFFFF;
+                NvnTexture *t = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+                if (t) LOG(" %ux%u/t%u/f%#x", t->width, t->height, t->target, t->format);
+                else LOG(" %llx", (unsigned long long)h);
+            }
+            LOG("\n");
+        }
+        break;
+    case CMD_BIND_TEXTURES_DEFERRED:  // (stage, first, count, handles): the handles as they are now
+        if (r->x[3] >= GUEST_LO && r->x[3] + r->x[2] * 8 <= GUEST_HI)
+            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++) {
+                if (material_mode && r->x[0] < 2 && memcmp(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8)) material_tex_gen++;
+                memcpy(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8);
+            }
+        break;
+    case CMD_BIND_IMAGES:
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
+            memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+        break;
+    case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; material_tex_gen++; break;
+    case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; material_tex_gen++; break;
+    case CMD_SET_RENDER_TARGETS: {
+        const struct { uint64_t tex[8]; NvnTextureView views[8]; uint8_t has_view[8]; uint64_t depth;
+                       NvnTextureView dview; uint8_t has_dview; } *rt = x;
+        RtState prev = st.rt;  // the same targets again: keep the pass (a restart = full barrier + reload)
+        memset(&st.rt, 0, sizeof st.rt);
+        st.rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
+        for (int i = 0; i < st.rt.ncolor; i++) {
+            st.rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
+            st.rt.cview[i] = rt->views[i];
+            st.rt.has_cview[i] = rt->has_view[i];
+        }
+        st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
+        st.rt.dview = rt->dview;
+        st.rt.has_dview = rt->has_dview;
+        static int always = -1;
+        if (always < 0) always = getenv("SAVAGEWIND_VK_PASS_RESTART") != NULL;
+        if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true;
+        if (nfbrun && memcmp(&prev, &st.rt, sizeof prev)) fbdump_flush();
+        if (logfb > 0 && !fbskip && memcmp(&prev, &st.rt, sizeof prev))
+            LOG("[feedback] targets %d (%ux%u fmt %#x) depth %d after %u draws\n", st.rt.ncolor, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
+                st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->format : 0,
+                st.rt.depth != NULL, fb_draws);
+        break;
+    }
+    case CMD_SET_VIEWPORTS:
+        for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.viewport[r->x[0] + i], (uint8_t *)x + i * 16, 16);
+        break;
+    case CMD_SET_SCISSORS:
+        for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.scissor[r->x[0] + i], (uint8_t *)x + i * 16, 16);
+        break;
+    case CMD_SET_DEPTH_RANGES:
+        for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.depth_range[r->x[0] + i], (uint8_t *)x + i * 8, 8);
+        break;
+    case CMD_SET_BLEND_COLOR: memcpy(st.blend_color, x, 16); break;
+    case CMD_SET_STENCIL: {
+        int face = (int)r->x[0];
+        for (int f = 0; f < 2; f++) {
+            if (!(face & (1 << f))) continue;
+            if (r->x[6] == 0) st.stencil_ref[f] = (uint32_t)r->x[1];
+            else if (r->x[6] == 1) st.stencil_mask[f] = (uint32_t)r->x[1];
+            else st.stencil_vmask[f] = (uint32_t)r->x[1];
+        }
+        break;
+    }
+    case CMD_SET_LINE_WIDTH: st.line_width = r->f[0]; break;
+    case CMD_SET_DEPTH_CLAMP: {
+        // BOTW draws its sun shadow cascades (and its sun occlusion query) with depth clamp: casters nearer the
+        // light than a cascade's near plane (the cliff over the Shrine of Resurrection, tree tops above the view)
+        // are flattened onto it, not clipped. Clipped, the sun lit cave interiors, and what got clipped changed
+        // with the cascades as the camera turned (tree shadows). Pipeline state (PipeState.depth_clamp).
+        static int off = -1;  // SAVAGEWIND_NO_DEPTH_CLAMP=1: ignored (A/B tests)
+        if (off < 0) off = getenv("SAVAGEWIND_NO_DEPTH_CLAMP") != NULL;
+        static bool logged;
+        if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetDepthClamp on (depth clamp %s)\n", g_vk.depth_clamp ? "supported" : "not supported"); }
+        bool dcl = r->x[0] != 0 && !off;
+        if (dcl != st.depth_clamp) st.depth_clamp = dcl, key_gen++;
+        break;
+    }
+    case CMD_SET_RENDER_ENABLE: {
+        // The game's own switch for leaving draws out: it was recorded and never applied, so what the game
+        // turned off was drawn. SAVAGEWIND_NO_RENDER_ENABLE=1: ignored again (A/B).
+        static int off = -1;
+        if (off < 0) off = getenv("SAVAGEWIND_NO_RENDER_ENABLE") != NULL;
+        static bool logged;
+        if (!r->x[0] && !logged) { logged = true; LOG("[nvn] SetRenderEnable off: its draws are skipped\n"); }
+        st.render_off = !r->x[0] && !off;
+        break;
+    }
+    case CMD_SET_RASTERIZER_DISCARD: {
+        // Draws with the rasterizer off produce no pixels (no transform feedback here: the game binds none); they
+        // were drawn as ordinary geometry while this was ignored. Skipped in draw_ unless their shaders store to
+        // memory. SAVAGEWIND_NO_RASTER_DISCARD=1: ignored again (A/B).
+        static int off = -1;
+        if (off < 0) off = getenv("SAVAGEWIND_NO_RASTER_DISCARD") != NULL;
+        static bool logged;
+        if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetRasterizerDiscard on: its draws are skipped\n"); }
+        st.raster_discard = r->x[0] != 0 && !off;
+        break;
+    }
+    case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
+    case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
+    case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
+    default: return false;
+    }
+    return true;
+}
+
+// ---- Parallel translation, step 1: the state pre-pass (BOTW-CPU-RESTRUCTURE.md). Walks a frame's list as exec_list
+// does, applying only the state records (state_apply) to the calling thread's state - a scratch copy - and counts what
+// splitting the frame across threads would meet: draws, render passes (a change of targets before a draw), the calls
+// that could be split points, and the work records that stay in stream order on the render thread.
+// SAVAGEWIND_VK_SCAN=1: run before each list's translation and measured (nothing else changes).
+typedef struct { uint64_t records, state, draws, passes, calls, uub, serial[CMD_COUNT]; } ScanStats;
+static void scan_list(uint64_t handle, int depth, ScanStats *s) {
+    uint64_t p = handle;
+    for (int guard = 0; guard < 10000000; guard++) {
+        CmdRec *r = (CmdRec *)(uintptr_t)p;
+        void *x = nvn_cmd_extra(r);
+        s->records++;
+        switch (r->op) {
+        case CMD_END: return;
+        case CMD_JUMP: p = r->x[0]; continue;
+        case CMD_CALL: {
+            const uint64_t *h = x;
+            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) s->calls++, scan_list(h[i], depth + 1, s);
+            break;
+        }
+        case CMD_DRAW_ARRAYS: case CMD_DRAW_ELEMENTS:
+            s->draws++;
+            if (st.rt_dirty) s->passes++, st.rt_dirty = false;
+            break;
+        case CMD_UPDATE_UNIFORM_BUFFER: s->uub++; break;
+        default:
+            if (state_apply(r, x)) s->state++;
+            else if (r->op < CMD_COUNT) s->serial[r->op]++;
+        }
+        p += r->size;
+    }
+}
+static bool scan_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_SCAN") && atoi(getenv("SAVAGEWIND_VK_SCAN"));
+    return on;
+}
+static void scan_measure(uint64_t handle) {
+    static ScanStats sum;
+    static uint64_t frames, frame, ns, logged;
+    XState scratch = st, *saved = st_tls;  // (the state the list starts from)
+    st_tls = &scratch;
+    uint64_t t0 = plat_now_ns();
+    ScanStats s = {0};
+    scan_list(handle, 0, &s);
+    ns += plat_now_ns() - t0;
+    st_tls = saved;
+    uint64_t f = renderer_present_count();
+    if (f != frame) frame = f, frames++;
+    sum.records += s.records, sum.state += s.state, sum.draws += s.draws, sum.passes += s.passes, sum.calls += s.calls;
+    sum.uub += s.uub;
+    for (int i = 0; i < CMD_COUNT; i++) sum.serial[i] += s.serial[i];
+    if (frames < 300 || f < logged + 300) return;
+    char buf[512];
+    int o = 0;
+    for (int i = 0; i < CMD_COUNT && o < (int)sizeof buf - 32; i++)
+        if (sum.serial[i]) o += snprintf(buf + o, sizeof buf - o, " op%d %.1f", i, (double)sum.serial[i] / frames);
+    LOG("[scan] %llu frames: pre-pass %.3f ms/frame; per frame %.0f records, %.0f state, %.0f draws in %.1f passes, %.0f calls, "
+        "%.1f uniform updates; in-order work:%s\n", (unsigned long long)frames, ns / 1e6 / frames, (double)sum.records / frames,
+        (double)sum.state / frames, (double)sum.draws / frames, (double)sum.passes / frames, (double)sum.calls / frames,
+        (double)sum.uub / frames, buf);
+    memset(&sum, 0, sizeof sum);
+    frames = ns = 0, logged = f;
+}
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     if (lst_on < 0) lst_on = getenv("SAVAGEWIND_VK_LIST_STATS") != NULL;
@@ -9570,158 +9797,16 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         }
-        case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
-        case CMD_BIND_BLEND: { uint8_t *b = x; if (memcmp(st.blend[b[0] & 7], b, 8)) memcpy(st.blend[b[0] & 7], b, 8), key_gen++; break; }
-        case CMD_BIND_CHANNEL_MASK: if (memcmp(&st.channel_mask, x, 4)) memcpy(&st.channel_mask, x, 4), key_gen++; break;
-        case CMD_BIND_COLOR: if (memcmp(st.color_state, x, 4)) memcpy(st.color_state, x, 4), key_gen++; break;
-        case CMD_BIND_DEPTH_STENCIL: memcpy(st.ds, x, 8); break;
-        case CMD_BIND_MULTISAMPLE: if (memcmp(st.ms, x, 0x18)) memcpy(st.ms, x, 0x18), key_gen++; break;
-        case CMD_BIND_POLYGON: if (memcmp(st.poly, x, 4)) memcpy(st.poly, x, 4), key_gen++; break;
-        case CMD_BIND_VERTEX_ATTRIB: {
-            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            if (n != st.nattrib || memcmp(st.attrib, x, n * 4)) st.nattrib = n, memcpy(st.attrib, x, n * 4), key_gen++, prog_gen++;
+        case CMD_BIND_PROGRAM: case CMD_BIND_BLEND: case CMD_BIND_CHANNEL_MASK: case CMD_BIND_COLOR:
+        case CMD_BIND_DEPTH_STENCIL: case CMD_BIND_MULTISAMPLE: case CMD_BIND_POLYGON: case CMD_BIND_VERTEX_ATTRIB:
+        case CMD_BIND_VERTEX_STREAM: case CMD_BIND_VERTEX_BUFFERS: case CMD_BIND_UNIFORM_BUFFERS: case CMD_BIND_STORAGE_BUFFERS:
+        case CMD_BIND_TEXTURES: case CMD_BIND_TEXTURES_DEFERRED: case CMD_BIND_IMAGES: case CMD_SET_TEXTURE_POOL:
+        case CMD_SET_SAMPLER_POOL: case CMD_SET_RENDER_TARGETS: case CMD_SET_VIEWPORTS: case CMD_SET_SCISSORS:
+        case CMD_SET_DEPTH_RANGES: case CMD_SET_BLEND_COLOR: case CMD_SET_STENCIL: case CMD_SET_LINE_WIDTH:
+        case CMD_SET_DEPTH_CLAMP: case CMD_SET_RENDER_ENABLE: case CMD_SET_RASTERIZER_DISCARD: case CMD_SET_POLYGON_OFFSET:
+        case CMD_SET_PRIMITIVE_RESTART: case CMD_SET_COPY_STRIDES:
+            state_apply(r, x);
             break;
-        }
-        case CMD_BIND_VERTEX_STREAM: {
-            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            if (n != st.nstream || memcmp(st.stream, x, n * 8)) st.nstream = n, memcpy(st.stream, x, n * 8), key_gen++;
-            break;
-        }
-        case CMD_BIND_VERTEX_BUFFERS:
-            for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
-            break;
-        case CMD_BIND_UNIFORM_BUFFERS:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 18 && r->x[0] < 6; i++)
-                memcpy(&st.ubuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
-            if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS")) {
-                LOG("[bind] ubuf stage %llu slots %llu+%llu:", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
-                    (unsigned long long)r->x[2]);
-                for (uint64_t i = 0; i < r->x[2] && i < 18; i++) {
-                    const uint64_t *rg = (const uint64_t *)((uint8_t *)x + i * 16);
-                    LOG(" %llx+%llu", (unsigned long long)rg[0], (unsigned long long)rg[1]);
-                }
-                LOG("\n");
-            }
-            break;
-        case CMD_BIND_STORAGE_BUFFERS:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
-                memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
-            sbuf_gen++;  // (the driver constants' memo: cbuf_info)
-            break;
-        case CMD_BIND_TEXTURES:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++) {
-                if (material_mode && r->x[0] < 2 && memcmp(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8)) material_tex_gen++;
-                memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
-            }
-            if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS")) {
-                LOG("[bind] stage %llu slots %llu+%llu:", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
-                    (unsigned long long)r->x[2]);
-                for (uint64_t i = 0; i < r->x[2] && i < 32; i++) {
-                    uint64_t h;
-                    memcpy(&h, (uint8_t *)x + i * 8, 8);
-                    uint32_t tic = h & 0xFFFFF;
-                    NvnTexture *t = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
-                    if (t) LOG(" %ux%u/t%u/f%#x", t->width, t->height, t->target, t->format);
-                    else LOG(" %llx", (unsigned long long)h);
-                }
-                LOG("\n");
-            }
-            break;
-        case CMD_BIND_TEXTURES_DEFERRED:  // (stage, first, count, handles): the handles as they are now
-            if (r->x[3] >= GUEST_LO && r->x[3] + r->x[2] * 8 <= GUEST_HI)
-                for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++) {
-                    if (material_mode && r->x[0] < 2 && memcmp(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8)) material_tex_gen++;
-                    memcpy(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8);
-                }
-            break;
-        case CMD_BIND_IMAGES:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
-                memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
-            break;
-        case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; material_tex_gen++; break;
-        case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; material_tex_gen++; break;
-        case CMD_SET_RENDER_TARGETS: {
-            const struct { uint64_t tex[8]; NvnTextureView views[8]; uint8_t has_view[8]; uint64_t depth;
-                           NvnTextureView dview; uint8_t has_dview; } *rt = x;
-            RtState prev = st.rt;  // the same targets again: keep the pass (a restart = full barrier + reload)
-            memset(&st.rt, 0, sizeof st.rt);
-            st.rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
-            for (int i = 0; i < st.rt.ncolor; i++) {
-                st.rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
-                st.rt.cview[i] = rt->views[i];
-                st.rt.has_cview[i] = rt->has_view[i];
-            }
-            st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
-            st.rt.dview = rt->dview;
-            st.rt.has_dview = rt->has_dview;
-            static int always = -1;
-            if (always < 0) always = getenv("SAVAGEWIND_VK_PASS_RESTART") != NULL;
-            if (always || memcmp(&prev, &st.rt, sizeof prev)) st.rt_dirty = true;
-            if (nfbrun && memcmp(&prev, &st.rt, sizeof prev)) fbdump_flush();
-            if (logfb > 0 && !fbskip && memcmp(&prev, &st.rt, sizeof prev))
-                LOG("[feedback] targets %d (%ux%u fmt %#x) depth %d after %u draws\n", st.rt.ncolor, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
-                    st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->format : 0,
-                    st.rt.depth != NULL, fb_draws);
-            break;
-        }
-        case CMD_SET_VIEWPORTS:
-            for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.viewport[r->x[0] + i], (uint8_t *)x + i * 16, 16);
-            break;
-        case CMD_SET_SCISSORS:
-            for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.scissor[r->x[0] + i], (uint8_t *)x + i * 16, 16);
-            break;
-        case CMD_SET_DEPTH_RANGES:
-            for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(st.depth_range[r->x[0] + i], (uint8_t *)x + i * 8, 8);
-            break;
-        case CMD_SET_BLEND_COLOR: memcpy(st.blend_color, x, 16); break;
-        case CMD_SET_STENCIL: {
-            int face = (int)r->x[0];
-            for (int f = 0; f < 2; f++) {
-                if (!(face & (1 << f))) continue;
-                if (r->x[6] == 0) st.stencil_ref[f] = (uint32_t)r->x[1];
-                else if (r->x[6] == 1) st.stencil_mask[f] = (uint32_t)r->x[1];
-                else st.stencil_vmask[f] = (uint32_t)r->x[1];
-            }
-            break;
-        }
-        case CMD_SET_LINE_WIDTH: st.line_width = r->f[0]; break;
-        case CMD_SET_DEPTH_CLAMP: {
-            // BOTW draws its sun shadow cascades (and its sun occlusion query) with depth clamp: casters nearer the
-            // light than a cascade's near plane (the cliff over the Shrine of Resurrection, tree tops above the view)
-            // are flattened onto it, not clipped. Clipped, the sun lit cave interiors, and what got clipped changed
-            // with the cascades as the camera turned (tree shadows). Pipeline state (PipeState.depth_clamp).
-            static int off = -1;  // SAVAGEWIND_NO_DEPTH_CLAMP=1: ignored (A/B tests)
-            if (off < 0) off = getenv("SAVAGEWIND_NO_DEPTH_CLAMP") != NULL;
-            static bool logged;
-            if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetDepthClamp on (depth clamp %s)\n", g_vk.depth_clamp ? "supported" : "not supported"); }
-            bool dcl = r->x[0] != 0 && !off;
-            if (dcl != st.depth_clamp) st.depth_clamp = dcl, key_gen++;
-            break;
-        }
-        case CMD_SET_RENDER_ENABLE: {
-            // The game's own switch for leaving draws out: it was recorded and never applied, so what the game
-            // turned off was drawn. SAVAGEWIND_NO_RENDER_ENABLE=1: ignored again (A/B).
-            static int off = -1;
-            if (off < 0) off = getenv("SAVAGEWIND_NO_RENDER_ENABLE") != NULL;
-            static bool logged;
-            if (!r->x[0] && !logged) { logged = true; LOG("[nvn] SetRenderEnable off: its draws are skipped\n"); }
-            st.render_off = !r->x[0] && !off;
-            break;
-        }
-        case CMD_SET_RASTERIZER_DISCARD: {
-            // Draws with the rasterizer off produce no pixels (no transform feedback here: the game binds none); they
-            // were drawn as ordinary geometry while this was ignored. Skipped in draw_ unless their shaders store to
-            // memory. SAVAGEWIND_NO_RASTER_DISCARD=1: ignored again (A/B).
-            static int off = -1;
-            if (off < 0) off = getenv("SAVAGEWIND_NO_RASTER_DISCARD") != NULL;
-            static bool logged;
-            if (r->x[0] && !logged) { logged = true; LOG("[nvn] SetRasterizerDiscard on: its draws are skipped\n"); }
-            st.raster_discard = r->x[0] != 0 && !off;
-            break;
-        }
-        case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
-        case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
-        case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: {
             snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
@@ -9935,6 +10020,7 @@ void backend_execute(uint64_t handle) {
     mt_list = mt_on() > 0 && vkq_on;  // (the workers' jobs are bound by the recording thread)
     if (mt_list) { uub_log_reset(); fx_quiet = true; gmem_info(); fx_quiet = false; }  // (the last list's jobs were all bound: vkq_defer_end; the heap imported here)
     vram_sync();
+    if (scan_on()) scan_measure(handle);  // (parallel translation, step 1: measured only)
     exec_list(handle, 0);
     if (perf_survey_mode == SURVEY_STUB || perf_survey_mode == SURVEY_WAIT_JOBS) survey_list_work(survey_draws, survey_readbacks, false);
     if (compact_probe) {
