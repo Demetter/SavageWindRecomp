@@ -740,7 +740,7 @@ HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
 HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", hid_bind_style_event) {
     uint32_t w, r;
     KEvent *ev = kernel_create_event_pair(&w, &r);
-    pthread_mutex_lock(&g_klock);
+    klock();
     kernel_signal(ev);
     pthread_mutex_unlock(&g_klock);
     uint64_t clear_mode = c->x[2];
