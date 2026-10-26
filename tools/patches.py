@@ -357,6 +357,21 @@ def _cam_reverse(axis):
 
 
 # tools/game_sites.py site -> its patch
+# BOTW's streaming Yaz0 decoder (1.9.0 0x700131d674; x0 its state, x1/w2 the input chunk): in native code
+# (runtime/hle/yaz0.c rt_yaz0, which declines the first call of a stream, the one that reads its header). Its return
+# instruction checks the native result against the game's code with SAVAGEWIND_YAZ0=2.
+def _yaz0_stream(gen, a):
+    assert _word(gen, a) == 0xa9bd7bfd, hex(_word(gen, a))  # stp x29, x30, [sp, #-0x30]!
+    return ('{ extern int rt_yaz0(Cpu *); if (rt_yaz0(c)) return; '
+            'uint64_t ea = c->sp - 0x30; ST64(ea, c->x[29]); ST64(ea + 8, c->x[30]); c->sp = ea; }'
+            f'  /* {a:#x}: stp x29, x30, [sp, #-0x30]! (Yaz0 stream decoder) */')
+
+
+def _yaz0_stream_ret(gen, a):
+    assert _word(gen, a) == 0xd65f03c0, hex(_word(gen, a))  # ret
+    return '{ extern void rt_yaz0_done(Cpu *); rt_yaz0_done(c); return; }' + f'  /* {a:#x}: ret (Yaz0 stream decoder) */'
+
+
 PATCHES = {
     'pause_options_update': _pause_option_state,
     'opt_create_rows': _opt_rows,
@@ -374,6 +389,8 @@ PATCHES = {
     'title_button': _title_event,
     'msg_lookup': _title_msg,
     'frame_wait': _frame_wait,
+    'yaz0_stream': _yaz0_stream,
+    'yaz0_stream_ret': _yaz0_stream_ret,
     'vfr_ratio': _vfr_ratio,
     'gui_speed': _gui_speed,
     'persp_matrix': _persp_matrix,
