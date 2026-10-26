@@ -32,6 +32,12 @@ from unicorn import arm64_const as A
 
 import game_sites
 import layout
+
+# A guest indirect call (blr / br) through its call site's own cache of the last target (runtime/dispatch.c
+# rt_dispatch_site): the call happens here, a branch of its own for the CPU's predictor, instead of in rt_dispatch,
+# which every indirect call shared.
+SITE_CALL = '{ static const DispatchEnt *ds; rt_dispatch_site(c, &ds)(c); }'
+SITE_TAIL = '{ static const DispatchEnt *ds; __attribute__((musttail)) return rt_dispatch_site(c, &ds)(c); }'
 import patches
 from analyze import eh_frame_extents, eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
@@ -403,9 +409,9 @@ class Module:
                 return [f'c->x[30] = {hx(a + 4)}; {fname(t)}(c);']
             return [f'c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);']
         if k == 'blr':
-            return [f'c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);']
+            return [f'c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {SITE_CALL}']
         if k == 'br':
-            return [f'c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);']
+            return [f'c->pc = {ins.target}; {SITE_TAIL}']
         if k == 'ret':
             return ['return;']
         raise Unsupported(k)
@@ -507,7 +513,7 @@ class Module:
                 else:
                     out.append(f'    c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);')
             elif k == 'blr':
-                out.append(f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);')
+                out.append(f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {SITE_CALL}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -518,7 +524,7 @@ class Module:
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
                     out.append(f'    c->pc = {ins.target}; {miss}')
                     continue
-                out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
+                out.append(f'    c->pc = {ins.target}; {SITE_TAIL}')
             elif k == 'ret':
                 out.append('    return;')
             last = k

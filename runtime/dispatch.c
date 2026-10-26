@@ -180,6 +180,59 @@ void rt_dispatch(Cpu *c) {
     __attribute__((musttail)) return f(c);
 }
 
+// rt_dispatch's safe point and lookup, for an indirect call site that then calls the function itself: through the site's
+// last target (an immutable entry per target, *site) when it is the same. HLE stubs aren't remembered (dispatch_slow is
+// their reboot safe point). SAVAGEWIND_PERFX bit PERFX_DSITE on trial: off, the dcache every time.
+static pthread_mutex_t dent_lock = PTHREAD_MUTEX_INITIALIZER;
+static const DispatchEnt **dent_tab;
+static size_t dent_cap, dent_n;
+static const DispatchEnt *dent_get(uint64_t pc, GuestFn fn) {
+    pthread_mutex_lock(&dent_lock);
+    if (dent_n * 2 >= dent_cap) {  // (grow: rehash into twice the room)
+        size_t cap = dent_cap ? dent_cap * 2 : 16384;
+        const DispatchEnt **tab = calloc(cap, sizeof *tab);
+        if (!tab) FATAL("dispatch site table\n");
+        for (size_t i = 0; i < dent_cap; i++)
+            if (dent_tab[i]) {
+                size_t j = (size_t)((dent_tab[i]->pc >> 2) * 0x9E3779B97F4A7C15ull) & (cap - 1);
+                while (tab[j]) j = (j + 1) & (cap - 1);
+                tab[j] = dent_tab[i];
+            }
+        free(dent_tab);
+        dent_tab = tab, dent_cap = cap;
+    }
+    size_t j = (size_t)((pc >> 2) * 0x9E3779B97F4A7C15ull) & (dent_cap - 1);
+    while (dent_tab[j] && dent_tab[j]->pc != pc) j = (j + 1) & (dent_cap - 1);
+    if (!dent_tab[j]) {
+        DispatchEnt *e = malloc(sizeof *e);
+        if (!e) FATAL("dispatch site entry\n");
+        e->pc = pc, e->fn = fn;
+        dent_tab[j] = e;
+        dent_n++;
+    }
+    const DispatchEnt *r = dent_tab[j];
+    pthread_mutex_unlock(&dent_lock);
+    return r;
+}
+
+GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site) {
+    KThread *t = c->thread;  // (the same safe point as rt_dispatch: kernel_preempt)
+    if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held].v < t->prio, 0)) kernel_preempt(t);
+    if (perf_survey_mode == SURVEY_MAIN || perf_survey_mode == SURVEY_JOBS || perf_survey_mode == SURVEY_OVERLAP_SENSITIVITY || perf_survey_mode == SURVEY_WAIT_JOBS) {
+        static __thread uint64_t survey_seen;
+        uint64_t frame = atomic_load_explicit(&perf_survey_frame, memory_order_relaxed);
+        if (frame != survey_seen && t && t->core_held >= 0) { survey_seen = frame; perf_survey_guest(t); }
+    }
+    uint64_t pc = c->pc;
+    bool on = !perfx_trial(PERFX_DSITE) || perfx(PERFX_DSITE);
+    const DispatchEnt *e = __atomic_load_n(site, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(e && e->pc == pc, 1) && on) return e->fn;
+    unsigned h = dcache_index(pc);
+    GuestFn f = dcache[h].addr == pc ? dcache[h].fn : dispatch_slow(c);
+    if (on && !(pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE)) __atomic_store_n(site, dent_get(pc, f), __ATOMIC_RELEASE);
+    return f;
+}
+
 void guest_call(Cpu *c, uint64_t addr) {
     uint64_t lr = c->x[30];
     c->x[30] = 0;

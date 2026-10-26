@@ -31,6 +31,10 @@ typedef void (*GuestFn)(Cpu *);
 
 // ---- runtime services (runtime/*.c)
 void rt_dispatch(Cpu *c);                 // call function at c->pc
+// An indirect call site's own cache (generated code: blr / br): an entry for one target, never freed or changed, so a
+// site keeps a pointer to it and the call happens at the site (a branch of its own for the CPU's predictor).
+typedef struct DispatchEnt { uint64_t pc; GuestFn fn; } DispatchEnt;
+GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site);  // the function at c->pc, for the caller to call
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
 void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
