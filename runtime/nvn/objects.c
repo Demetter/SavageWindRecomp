@@ -779,6 +779,7 @@ void nvn_debug_textures_at(uint64_t a) {
 // one never reaches the other. SAVAGEWIND_TEXTURE_INTERN_PROBE=1 (either mode): counts every 600 frames.
 static TextureIntern g_tex_intern;  // (g_tex_lock)
 static uint64_t g_tex_inits, g_tex_reused, g_tex_hosts, g_tex_probe_frame;
+static uint64_t g_tex_forgotten;  // (host objects pushed out of a full entry: never freed)
 static bool texture_intern_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -829,15 +830,17 @@ NVN(nvnTextureInitialize) {
         *t = shape;
         t->debug_id = next_debug_id++;
         tex_set_put((uintptr_t)t);
+        if (e && e->n == TEXTURE_INTERN_WAYS) g_tex_forgotten++;
         texture_intern_add(e, t);
         g_tex_hosts++;
     }
     t->init_gen++;
     if (texture_intern_probe() && renderer_present_count() >= g_tex_probe_frame + 600) {
         g_tex_probe_frame = renderer_present_count();
-        LOG("[tex-intern] frame %llu on %d initializes %llu reused %llu host objects %llu guest objects %u\n",
+        LOG("[tex-intern] frame %llu on %d initializes %llu reused %llu host objects %llu guest objects %u forgotten %llu\n",
             (unsigned long long)g_tex_probe_frame, texture_intern_on(), (unsigned long long)g_tex_inits,
-            (unsigned long long)g_tex_reused, (unsigned long long)g_tex_hosts, g_tex_intern.count);
+            (unsigned long long)g_tex_reused, (unsigned long long)g_tex_hosts, g_tex_intern.count,
+            (unsigned long long)g_tex_forgotten);
     }
     pthread_mutex_unlock(&g_tex_lock);
     if (t->flags & 2)
