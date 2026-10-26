@@ -169,7 +169,7 @@ __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
     KThread *t = c->thread;  // (a better thread waiting for this one's core gets it: kernel.c kernel_preempt)
-    if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held] < t->prio, 0)) kernel_preempt(t);
+    if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held].v < t->prio, 0)) kernel_preempt(t);
     if (perf_survey_mode == SURVEY_MAIN || perf_survey_mode == SURVEY_JOBS || perf_survey_mode == SURVEY_OVERLAP_SENSITIVITY || perf_survey_mode == SURVEY_WAIT_JOBS) {
         static __thread uint64_t survey_seen;
         uint64_t frame = atomic_load_explicit(&perf_survey_frame, memory_order_relaxed);

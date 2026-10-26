@@ -65,7 +65,7 @@ static void scenario(int n, bool change_priority, bool stop, int iterations) {
         t[n - 1].prio = 1;
         if (core_direct_wake()) t[n - 1].core = 2;  // still waiting on core 0
         core_priority_changed(&t[n - 1]);
-        assert(g_core_best_wait[0] == 1);
+        assert(g_core_best_wait[0].v == 1);
     }
     if (stop) {
         pthread_mutex_lock(&g_cores[0].m);

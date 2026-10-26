@@ -231,7 +231,7 @@ static void core_preempt_point(KThread *t) {
 // the same core, which the main thread was waiting for, waited for the core (a ~10 ms longer frame every second).
 // dispatch.c calls this at every indirect call (a safe point: the guest state is all in Cpu).
 void kernel_preempt(KThread *t) {
-    if (t->core_held < 0 || __atomic_load_n(&g_core_best_wait[t->core_held], __ATOMIC_RELAXED) >= t->prio) return;
+    if (t->core_held < 0 || __atomic_load_n(&g_core_best_wait[t->core_held].v, __ATOMIC_RELAXED) >= t->prio) return;
     core_release(t);
     core_acquire(t);
 }

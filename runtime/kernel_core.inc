@@ -22,14 +22,17 @@ static int g_cores_on = -1;
 #endif
 // The best (lowest) priority among the threads waiting for each core, INT_MAX with none: what dispatch.c checks at every
 // indirect call (kernel_preempt). SAVAGEWIND_NO_PREEMPT=1: kept at INT_MAX (preemption at syscalls only, as before).
-volatile int g_core_best_wait[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+// One cache line per core, written only when it changes: every indirect call of every guest thread reads its core's
+// entry, and one shared line rewritten at each core hand-over missed in their caches (Kakariko 3.85 -> 3.82 ms a frame).
+CoreBestWait g_core_best_wait[4] = {{INT_MAX}, {INT_MAX}, {INT_MAX}, {INT_MAX}};
 static void core_best_update(Core *k) {  // (k->m held)
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_PREEMPT") != NULL;
     int best = INT_MAX;
     for (int i = 0; i < k->nwaiting && !off; i++)
         if (k->waiting[i]->prio < best) best = k->waiting[i]->prio;
-    __atomic_store_n(&g_core_best_wait[k - g_cores], best, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&g_core_best_wait[k - g_cores].v, __ATOMIC_RELAXED) != best)
+        __atomic_store_n(&g_core_best_wait[k - g_cores].v, best, __ATOMIC_RELAXED);
 }
 
 static bool cores_on(void) {
