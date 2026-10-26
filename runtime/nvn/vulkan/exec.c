@@ -9896,6 +9896,11 @@ static void survey_list_work(uint64_t draws_before, uint64_t readbacks_before, b
         (unsigned long long)(op_counts[CMD_DRAW_ARRAYS] + op_counts[CMD_DRAW_ELEMENTS] - draws_before),
         (unsigned long long)(op_counts[CMD_COPY_TEXTURE_TO_BUFFER] - readbacks_before));
 }
+static bool list_stats_on(void) {  // (SAVAGEWIND_LIST_STATS: backend_execute)
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_LIST_STATS") && atoi(getenv("SAVAGEWIND_LIST_STATS"));
+    return on;
+}
 void backend_execute(uint64_t handle) {
     uint64_t survey_draws = op_counts[CMD_DRAW_ARRAYS] + op_counts[CMD_DRAW_ELEMENTS];
     uint64_t survey_readbacks = op_counts[CMD_COPY_TEXTURE_TO_BUFFER];
@@ -9923,7 +9928,7 @@ void backend_execute(uint64_t handle) {
     if (gtl_on < 0) {
         gtl_on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) >= 2;
     }
-    uint64_t gtl_x0 = gtl_on ? plat_now_ns() : 0, gtl_first = submit_seq + 1, gtl_draws = cum_draws;
+    uint64_t gtl_x0 = gtl_on || list_stats_on() ? plat_now_ns() : 0, gtl_first = submit_seq + 1, gtl_draws = cum_draws;
     in_execute = true;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
     vkq_defer_begin();  // (its Vulkan commands recorded on the recording thread meanwhile: vkq.h)
@@ -9968,5 +9973,23 @@ void backend_execute(uint64_t handle) {
     if (td && mt_list && survey_downstream_waits()) survey_dj_drain_ns += trace_end - td;
     if (trace_begin) vk_frame_trace_event("Wait for Vulkan recorder", 1, trace_frame, submit_seq, td, trace_end, 0, 0);
     if (gtl_on) gtl_list(gtl_first, submit_seq, gtl_x0, cum_draws - gtl_draws);
+    {   // (research) SAVAGEWIND_LIST_STATS=1: per frame, the lists translated and their draws - how a frame's work could
+        // be split across threads (whole lists, or chunks of big ones)
+        if (list_stats_on()) {
+            static uint64_t frame, frames, lists, draws, big_lists, big_draws, max_draws, ns, logged;
+            uint64_t f = renderer_present_count(), d = cum_draws - gtl_draws, t = plat_now_ns() - gtl_x0;
+            if (f != frame) frame = f, frames++;
+            lists++, draws += d, ns += gtl_x0 ? t : 0;
+            if (d > 200) big_lists++, big_draws += d;
+            if (d > max_draws) max_draws = d;
+            if (frames >= 300 && f >= logged + 300) {
+                LOG("[list-stats] %llu frames: %.1f lists/frame, %.0f draws/frame, %.1f lists over 200 draws/frame holding "
+                    "%.0f%% of the draws, biggest list %llu draws, translation %.2f ms/frame\n", (unsigned long long)frames,
+                    (double)lists / frames, (double)draws / frames, (double)big_lists / frames,
+                    draws ? 100.0 * big_draws / draws : 0, (unsigned long long)max_draws, ns / 1e6 / frames);
+                logged = f, frames = lists = draws = big_lists = big_draws = max_draws = ns = 0;
+            }
+        }
+    }
     gpu_unlock();
 }
