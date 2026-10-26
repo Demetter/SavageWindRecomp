@@ -538,7 +538,7 @@ static void fx_mark_r(uint8_t why) {
     Sub *s = t_worker >= 0 ? &subs[t_sub] : sub();
     uint8_t prior = atomic_load_explicit(&s->fxr, memory_order_relaxed);
     if (t_worker >= 0 && verify_job_deps && (prior & why) != why)
-        FATAL("descriptor job introduced an unpublished guest-memory dependency %#x at submission %llu\n",
+        AUDIT_FAIL("descriptor job introduced an unpublished guest-memory dependency %#x at submission %llu\n",
               why, (unsigned long long)t_seq);
     if ((prior & why) != why) atomic_fetch_or_explicit(&s->fxr, why, memory_order_relaxed);
 }
@@ -1682,6 +1682,13 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+// (per-object motion vectors for DLSS: the section "per-object motion vectors" below) the velocity target added to the
+// pass in progress, when it is the scene's G-buffer pass: colour attachment rt, cleared at the frame's first such pass
+static struct { bool on; uint32_t rt; uint64_t frame; TexBackend *img; } vel;
+static bool mvo_wanted(void);
+static TexBackend *taa_image(int i, uint32_t w, uint32_t h, VkFormat f);
+static VkImageView post_view(TexBackend *d);
+
 static void begin_pass(bool cube_layers) {
     RtState cube_rt;
     if (cube_layers) {
@@ -1881,6 +1888,23 @@ static void begin_pass(bool cube_layers) {
         gp_mark(cb, "pass: %u color %ux%u fmt %#x, target #%llu mip %u layer %u%s", pass_ncolor, minw, minh,
                 t ? t->format : 0, (unsigned long long)(t ? t->debug_id : 0), v->base_level,
                 cube_layers ? 0 : v->min_layer, cube_layers ? "+6" : "");
+    }
+    // The scene's G-buffer pass (4+ colour targets of the scene's group, a depth of their size; not the half-size
+    // passes): the velocity target (RGBA16F at the pass's size: xy velocity, z previous / current distance, w 1 where an
+    // object's own motion was written) goes in as one more colour attachment, written by the velocity draws only (draw_)
+    vel.on = false;
+    if (mvo_wanted() && !cube_layers && pass_ncolor >= 4 && pass_ncolor < 8 && has_d && pass_samples == 1 && st.rt.color[0] &&
+        st.rt.depth && st.rt.depth->width >= 1000 && st.rt.depth->width == st.rt.color[0]->width &&
+        st.rt.depth->height == st.rt.color[0]->height && vk_texture_scale_group(st.rt.color[0]) == RS_SCENE) {
+        uint64_t fr = renderer_present_count();
+        TexBackend *v = taa_image(2, minw, minh, VK_FORMAT_R16G16B16A16_SFLOAT);
+        ca[pass_ncolor] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(v),
+                                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                                      .loadOp = vel.frame != fr ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+                                                      .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        pass_color[pass_ncolor] = VK_FORMAT_R16G16B16A16_SFLOAT;
+        vel.rt = pass_ncolor++;
+        vel.on = true, vel.frame = fr, vel.img = v;
     }
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = cube_layers ? 6 : 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
@@ -2575,6 +2599,7 @@ static void translate_program(void *arg) {
     p->vi = vk_translate_program(vcode, p->cmax[0], STAGE_VERTEX, &p->vkey, p->constants[0], p->constants_size[0], false);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
+        p->fkey.vel_vs = p->vi->vel;  // (the fragment side of the motion vectors only if the vertex side took)
         vk_key_normalize(fcode, STAGE_FRAGMENT, &p->fkey);
         p->fi = vk_translate_program(fcode, p->cmax[1], STAGE_FRAGMENT, &p->fkey, p->constants[1], p->constants_size[1], false);
     }
@@ -3950,6 +3975,223 @@ static VkDescriptorBufferInfo taa_cam_copy(uint64_t addr, uint64_t size) {
     return m.d;
 }
 
+// ---- per-object motion vectors for DLSS / DLAA (upstream PR #4's design, LGPE Recomp's before it). The camera's motion
+// alone (dlss_mv.comp from the depth) leaves what moves by itself - grass and leaves in the wind, Link, enemies - to
+// DLSS's guesswork: soft and shimmering. A velocity draw (ShaderKey.velocity: maxwell/translate.c) runs its vertex
+// shader a second time on the previous frame's copy of the same draw's constant buffers (bindings 100 + k) and writes
+// its own motion, the camera's included, into the velocity target added to the G-buffer pass (begin_pass); dlss_mv.comp
+// takes that where written. Each frame records the vertex cbufs 3+ of its velocity draws (at draw time, on this thread),
+// keyed by the draw: program, vertex stream 0, the draw's arguments, its occurrence in the frame. A mesh drawn many
+// times (grass, trees) is told apart by that order, which shifts as the camera culls; of the previous frame's
+// occurrences the one with the closest constants is taken. A draw without one, or whose words jump (another object, a
+// cut: a word changing by more than a quarter of its magnitude + 1 m; BOTW's terrain clipmap swaps levels between
+// frames), gets zeros: its velocity is unknown there (w 0) and the camera's is used. The copies the draw binds are
+// made here, at draw time: the descriptor worker builds its sets later (t_vel_prev).
+// On with DLAA or DLSS (user play test, 26 Oct: "working much better"); SAVAGEWIND_MV_OBJECTS=0: the camera's motion only.
+static bool mvo_wanted(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_MV_OBJECTS") ? atoi(getenv("SAVAGEWIND_MV_OBJECTS")) : 1;
+    return on && dlaa_wanted();
+}
+#define MVO_TAB (1u << 16)
+#define MVO_JUMP 1.0f
+#define MVO_JUMP_REL 0.25f
+typedef struct { uint64_t key; uint32_t off, size; } MvoEntry;
+typedef struct { MvoEntry *e; uint32_t n, cap; uint8_t *data; uint64_t used, dcap; uint32_t *tab; uint64_t frame; } MvoFrame;
+static MvoFrame mvo[2];
+static int mvo_cur;
+static uint64_t mvo_draw;  // this draw's key
+static uint64_t mvo_base;  // ... before its occurrence
+static uint32_t mvo_nth;   // ... its occurrence
+static uint64_t mvo_occ_key[MVO_TAB];
+static uint32_t mvo_occ[MVO_TAB];
+static uint64_t mvo_stats[3];  // cbufs: previous found, missing, rejected (a jump)
+static VkDescriptorBufferInfo mvo_prev_ubo[18];  // (this thread: the velocity draw's bindings 100 + k)
+static __thread const VkDescriptorBufferInfo *t_vel_prev;  // (stage_set: the draw's bindings 100 + k, NULL: none)
+
+// A draw's own arguments in its CmdRec.x (runtime/nvn/cmdbuf.c): elements - mode, index type, count, indices, base
+// vertex, base instance, instances; arrays - mode, first, count, base instance, instances
+static int draw_nargs(bool indexed) { return indexed ? 7 : 5; }
+static uint64_t mvo_mix(uint64_t h, uint64_t v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); return h * 0x100000001B3ull; }
+static uint64_t mvo_occ_draw(uint64_t base, uint32_t n) { uint64_t k = mvo_mix(base, n); return k ? k : 1; }
+
+static void mvo_frame_check(void) {
+    uint64_t fr = renderer_present_count();
+    MvoFrame *f = &mvo[mvo_cur];
+    if (f->frame == fr && f->tab) return;
+    mvo_cur ^= 1;
+    f = &mvo[mvo_cur];
+    if (!f->tab) f->tab = calloc(MVO_TAB, sizeof *f->tab);
+    else memset(f->tab, 0, MVO_TAB * sizeof *f->tab);
+    f->n = 0, f->used = 0, f->frame = fr;
+    memset(mvo_occ_key, 0, sizeof mvo_occ_key);
+    static uint64_t logged;
+    if (fr >= logged + 600) {
+        logged = fr;
+        LOG("[mv-objects] frame %llu: previous constants found %llu, missing %llu, rejected %llu\n", (unsigned long long)fr,
+            (unsigned long long)mvo_stats[0], (unsigned long long)mvo_stats[1], (unsigned long long)mvo_stats[2]);
+    }
+}
+
+static void mvo_draw_key(const CmdRec *r, bool indexed) {
+    mvo_frame_check();
+    uint64_t h = mvo_mix(0xcbf29ce484222325ull, (uint64_t)(uintptr_t)st.program);
+    h = mvo_mix(h, indexed);
+    h = mvo_mix(h, st.vbuf[0].addr);
+    for (int i = 0; i < draw_nargs(indexed); i++) h = mvo_mix(h, r->x[i]);
+    if (!h) h = 1;
+    uint32_t s = (uint32_t)(h ^ (h >> 29)) & (MVO_TAB - 1);
+    while (mvo_occ_key[s] && mvo_occ_key[s] != h) s = (s + 1) & (MVO_TAB - 1);
+    if (!mvo_occ_key[s]) { mvo_occ_key[s] = h; mvo_occ[s] = 0; }
+    mvo_base = h, mvo_nth = mvo_occ[s];
+    mvo_draw = mvo_occ_draw(h, mvo_occ[s]++);
+}
+
+static void mvo_record(int k, const void *src, uint32_t size) {
+    MvoFrame *f = &mvo[mvo_cur];
+    if (!f->tab || f->n >= MVO_TAB / 2) return;
+    if (f->n == f->cap) { f->cap = f->cap ? f->cap * 2 : 4096; f->e = realloc(f->e, f->cap * sizeof *f->e); }
+    if (f->used + size > f->dcap) { f->dcap = (f->used + size) * 2 + (1 << 20); f->data = realloc(f->data, f->dcap); }
+    if (!f->e || !f->data) return;
+    uint64_t key = mvo_mix(mvo_draw, (uint64_t)k);
+    memcpy(f->data + f->used, src, size);
+    f->e[f->n] = (MvoEntry){key, (uint32_t)f->used, size};
+    f->used += size;
+    uint32_t s = (uint32_t)(key ^ (key >> 31)) & (MVO_TAB - 1);
+    while (f->tab[s]) s = (s + 1) & (MVO_TAB - 1);
+    f->tab[s] = ++f->n;
+}
+
+static const MvoEntry *mvo_find(const MvoFrame *f, uint64_t draw, int k) {  // the previous frame's copy, or NULL
+    uint64_t key = mvo_mix(draw, (uint64_t)k);
+    uint32_t s = (uint32_t)(key ^ (key >> 31)) & (MVO_TAB - 1);
+    while (f->tab[s]) {
+        const MvoEntry *c = &f->e[f->tab[s] - 1];
+        if (c->key == key) return c;
+        s = (s + 1) & (MVO_TAB - 1);
+    }
+    return NULL;
+}
+static const MvoFrame *mvo_prev_frame(void) { return &mvo[mvo_cur ^ 1]; }
+static bool mvo_prev_ok(void) {
+    const MvoFrame *f = mvo_prev_frame();
+    return f->tab && f->frame + 1 == mvo[mvo_cur].frame;
+}
+
+// How far a previous copy is from this frame's data: the sum of the float words' differences, stopping past `limit`
+static float mvo_dist(const uint32_t *a, const uint32_t *b, uint32_t nw, float limit) {
+    float d = 0;
+    for (uint32_t i = 0; i < nw && d < limit; i++) {
+        if (a[i] == b[i] || ((a[i] >> 23) & 0xFF) == 0xFF || ((b[i] >> 23) & 0xFF) == 0xFF) continue;
+        float fa, fb;
+        memcpy(&fa, &a[i], 4), memcpy(&fb, &b[i], 4);
+        d += fabsf(fb - fa);
+    }
+    return d;
+}
+
+// Which of the previous frame's draws this one is: of its occurrences of the same draw, the one whose vertex cbufs 3+
+// are closest to this draw's (this occurrence first, kept unless another is closer)
+static uint64_t mvo_pick(const ShaderInfo *si) {
+    if (!mvo_prev_ok()) return mvo_draw;
+    const MvoFrame *f = mvo_prev_frame();
+    int k0 = -1;
+    for (int k = 3; k < 18 && k0 < 0; k++)
+        if ((si->cbuf_mask & (1u << k)) && st.ubuf[0][k - 3].addr) k0 = k;
+    if (k0 < 0 || !mvo_find(f, mvo_occ_draw(mvo_base, mvo_nth ? 0 : 1), k0)) return mvo_draw;  // (one occurrence: itself)
+    uint64_t pick = mvo_draw;
+    float best = INFINITY;
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint32_t n = i == 0 ? mvo_nth : i - 1 < mvo_nth ? i - 1 : i;  // (this occurrence first, then all the others)
+        uint64_t cand = mvo_occ_draw(mvo_base, n);
+        if (i > 0 && !mvo_find(f, cand, k0)) break;  // (past the previous frame's last occurrence)
+        float d = 0;
+        bool whole = true;
+        for (int k = k0; k < 18 && d < best; k++) {
+            if (!(si->cbuf_mask & (1u << k))) continue;
+            Range r = st.ubuf[0][k - 3];
+            const MvoEntry *e = mvo_find(f, cand, k);
+            if (!e || !r.addr) { whole = false; break; }
+            d += mvo_dist((const uint32_t *)(f->data + e->off), (const uint32_t *)(uintptr_t)r.addr,
+                          (uint32_t)((r.size < e->size ? r.size : e->size) / 4), best - d);
+        }
+        if (whole && d < best) best = d, pick = cand;
+        if (best == 0) break;
+    }
+    return pick;
+}
+
+// The previous frame's copy of the vertex cbuf k of draw `draw`, if usable (else NULL)
+static const void *mvo_prev(uint64_t draw, int k, uint32_t *size) {
+    const MvoFrame *f = mvo_prev_frame();
+    if (!mvo_prev_ok()) { mvo_stats[1]++; return NULL; }
+    const MvoEntry *e = mvo_find(f, draw, k);
+    Range r = st.ubuf[0][k - 3];
+    if (!e || !r.addr) { mvo_stats[1]++; return NULL; }
+    const uint32_t *a = (const uint32_t *)(f->data + e->off), *b = (const uint32_t *)(uintptr_t)r.addr;
+    uint32_t nw = (uint32_t)((r.size < e->size ? r.size : e->size) / 4);
+    for (uint32_t i = 0; i < nw; i++) {
+        if (a[i] == b[i]) continue;
+        uint32_t ea = (a[i] >> 23) & 0xFF, eb = (b[i] >> 23) & 0xFF;
+        if (ea == 0xFF || eb == 0xFF) continue;
+        float fa, fb;
+        memcpy(&fa, &a[i], 4), memcpy(&fb, &b[i], 4);
+        if (fabsf(fb - fa) > MVO_JUMP_REL * (fabsf(fa) + fabsf(fb)) + MVO_JUMP) { mvo_stats[2]++; return NULL; }
+    }
+    mvo_stats[0]++;
+    *size = e->size;
+    return f->data + e->off;
+}
+
+// Bytes of vertex cbuf k a draw needs: what the shader reads (its whole range if indexed), within the bound range
+static uint32_t mvo_cbuf_bytes(const ShaderInfo *si, int k, Range r) {
+    uint64_t n = si->cbuf_size[k] && !(si->cbuf_dynamic & (1u << k)) ? si->cbuf_size[k] : 0x10000;
+    if (r.size && n > r.size) n = r.size;
+    return (uint32_t)((n + 15) & ~15ull);
+}
+
+// A velocity draw, before its descriptors (draw_, this thread): the previous frame's copies of its vertex cbufs 3+ into
+// transient memory for bindings 100 + k (all or none: a draw missing one gets zeros for all, w 0, unknown), and this
+// frame's recorded for the next
+static void mvo_prepare(const ShaderInfo *si) {
+    static const uint8_t zeros[0x10000];
+    uint64_t prev = mvo_pick(si);
+    const void *pd[18] = {0};
+    uint32_t ps[18] = {0};
+    bool all = true;
+    for (int k = 3; k < 18; k++) {
+        if (!(si->cbuf_mask & (1u << k))) continue;
+        pd[k] = mvo_prev(prev, k, &ps[k]);
+        if (!pd[k]) all = false;
+    }
+    for (int k = 3; k < 18; k++) {
+        mvo_prev_ubo[k] = (VkDescriptorBufferInfo){0};
+        if (!(si->cbuf_mask & (1u << k))) continue;
+        Range r = st.ubuf[0][k - 3];
+        uint32_t need = mvo_cbuf_bytes(si, k, r);
+        if (all && pd[k] && ps[k] >= need)
+            mvo_prev_ubo[k] = ubo_span(vk_transient_copy(pd[k], ps[k], 256), ps[k]);
+        else
+            mvo_prev_ubo[k] = ubo_span(vk_transient_copy(zeros, need, 256), need);
+        if (r.addr) mvo_record(k, (const void *)(uintptr_t)r.addr, need);
+    }
+}
+
+// The program's velocity variant for colour target rt once it is built, else NULL (the draw keeps the camera's motion)
+static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
+static Prog *vel_program(Prog *base) {
+    static struct { Prog *base, *v; uint32_t rt; uint64_t gen; } m;
+    if (m.base != base || m.rt != vel.rt || m.gen != prog_gen) {
+        ShaderKey vk = base->vkey, fk = base->fkey;
+        vk.velocity = fk.velocity = 1;
+        vk.vel_rt = fk.vel_rt = (uint8_t)vel.rt;  // (in the vertex key too: the program's hash and memo read it whole)
+        m.v = get_program(st.program, &vk, &fk);
+        m.base = base, m.rt = vel.rt, m.gen = prog_gen;
+    }
+    Prog *v = m.v;
+    return v && atomic_load(&v->state) == 1 && v->vi->vel && v->fi->vel ? v : NULL;
+}
+
 // BOTW's deferred lighting on a scaled scene: the draws that bring its half-size buffers (lighting, the sun's shadow
 // mask) back to the full image pick, per pixel, the half-size texel whose depth is nearest (fs 966dae9aeabc743a and
 // its variants: textureGather of the half-size depth, then the sample point moved toward the best texel). The gather
@@ -4137,7 +4379,7 @@ static void uniform_copy_check(int stage, int k, uint64_t addr, VkSpan span, uin
     if (memcmp(want, got, size)) {
         uint64_t first = 0;
         while (first < size && want[first] == got[first]) first++;
-        FATAL("uniform audit mismatch frame %llu stage %d c%d addr %llx size %llu byte %llu expected %02x got %02x logpos %u",
+        AUDIT_FAIL("uniform audit mismatch frame %llu stage %d c%d addr %llx size %llu byte %llu expected %02x got %02x logpos %u",
               (unsigned long long)a->frame, stage, k, (unsigned long long)addr, (unsigned long long)size,
               (unsigned long long)first, want[first], got[first], t_uub_pos);
     }
@@ -5261,13 +5503,55 @@ static void shadow_copy_note(const ShaderInfo *fi) {
     }
 }
 
-// The cascades to compare against in place of t, if t is that copy and this frame's pass named them; else NULL (the copy
-// and its depth mirror, as before)
+// The cascades to compare against in place of t, if t is that copy and a pass named them recently enough; else NULL (the
+// copy and its depth mirror, as before). SAVAGEWIND_SHADOW_SRC_FRAMES=<n>: how many frames after the copy's pass its
+// cascades still stand in (default 0: the same frame only). On a frame the game makes no copy, the readers otherwise
+// fall back to the copy's mirror, half the resolution and the max of each 2x2: their shadows change for that frame.
 static NvnTexture *shadow_copy_source(const NvnTexture *t) {
-    return vk_shadow_copy_mode() == 2 && t && shadow_src.src && shadow_src.frame == vk_frame_counter() &&
-                   t->addr == shadow_src.copy_addr && vk_is_shadow_copy(t)
-               ? shadow_src.src
-               : NULL;
+    static int frames = -1;
+    if (frames < 0) frames = getenv("SAVAGEWIND_SHADOW_SRC_FRAMES") ? atoi(getenv("SAVAGEWIND_SHADOW_SRC_FRAMES")) : 0;
+    if (vk_shadow_copy_mode() != 2 || !t || !shadow_src.src || t->addr != shadow_src.copy_addr || !vk_is_shadow_copy(t))
+        return NULL;
+    NvnTexture *s = shadow_src.src;
+    if (vk_frame_counter() - shadow_src.frame > (uint64_t)frames) return NULL;
+    // (still the cascades: an object can be initialized again with another shape)
+    if (s->target != 4 || s->depth != 3 || !renderer_format_is_depth(s->format) || s->width != 2 * t->width) return NULL;
+    return s;
+}
+
+// (SAVAGEWIND_SHADOW_COPY_SCALE=2) the copy's readers fell back to its mirror: once a frame in the log, with how many
+// frames ago its pass last named the cascades
+static void shadow_copy_fallback(const NvnTexture *t) {
+    static uint64_t logged_frame, n;
+    uint64_t f = vk_frame_counter();
+    if (logged_frame == f) return;
+    logged_frame = f;
+    if (n++ < 200 || !(n & 255))
+        LOG("[shadow-copy] frame %llu: readers of the copy use its mirror (cascades last named %lld frames ago, copy %s; "
+            "%llu frames so far)\n", (unsigned long long)f,
+            shadow_src.src ? (long long)(f - shadow_src.frame) : -1LL,
+            t->addr == shadow_src.copy_addr ? "the same" : "another", (unsigned long long)n);
+}
+
+// (SAVAGEWIND_SHADOW_SRC_FILTER=1) the copy's sampler with a 2x2 filtered comparison, for its readers on the cascades:
+// they sample twice the copy's resolution, and one comparison a pixel stair-steps along moving leaves (shimmer)
+static VkSampler shadow_src_sampler(NvnSamplerDesc *d) {
+    static struct { NvnSamplerDesc lin; NvnSamplerDesc orig; } cache[8];
+    static int n;
+    size_t key = offsetof(NvnSamplerDesc, backend);
+    for (int i = 0; i < n; i++)
+        if (!memcmp(&cache[i].orig, d, key)) return vk_sampler(&cache[i].lin, false);
+    if (n == 8) return vk_sampler(d, false);
+    memset(&cache[n], 0, sizeof cache[n]);
+    memcpy(&cache[n].orig, d, key);
+    memcpy(&cache[n].lin, d, key);
+    cache[n].lin.mag_filter = 1, cache[n].lin.min_filter = 1;  // (linear, no mips: vk_sampler's mapping)
+    return vk_sampler(&cache[n++].lin, false);
+}
+static bool shadow_src_filter(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_SHADOW_SRC_FILTER") && atoi(getenv("SAVAGEWIND_SHADOW_SRC_FILTER"));
+    return on;
 }
 
 static void prepare_depth_comparisons(int stage, const ShaderInfo *si) {
@@ -5299,6 +5583,7 @@ static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptor
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
+    bool shadow_lin = false;  // (a reader of the shadow copy on the cascades, filtered: shadow_src_sampler)
     VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     // (vk_sampler's Video > Anisotropic filtering: not for textures with one mip level - the render targets BOTW reads
@@ -5376,13 +5661,17 @@ static void texture_info_uncached(int stage, ShaderInfo *si, int i, VkDescriptor
                 }
             if (vk_depth_mirror_enabled && st_->shadow) {
                 NvnTexture *cascades = shadow_copy_source(et);  // (the copy's readers: the cascades themselves)
+                if (!cascades && vk_shadow_copy_mode() == 2 && vk_is_shadow_copy(et)) shadow_copy_fallback(et);
                 VkImageView depth_view = cascades ? vk_view(cascades, &e->view, e->has_view, false, st_->type)
                                                   : vk_depth_mirror_view(et,&e->view,e->has_view,st_->type);
                 if (depth_view) { view = depth_view; layout = VK_IMAGE_LAYOUT_GENERAL; }
+                shadow_lin = cascades && shadow_src_filter();
             }
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok);
+    if (h && st.spool && tsc < (uint32_t)st.spool->count)
+        smp = shadow_lin ? shadow_src_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc])
+                         : vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok);
     if (!view) view = vk_dummy_view(st_->type), layout = VK_IMAGE_LAYOUT_GENERAL;
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, layout};
@@ -5439,7 +5728,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             texture_info_uncached(stage, si, i, &ref, rs, rw);
             if (ref.sampler != out->sampler || ref.imageView != out->imageView || ref.imageLayout != out->imageLayout ||
                 memcmp(rs, sc, sizeof rs) || memcmp(rw, wh, sizeof rw))
-                FATAL("native texture binding mismatch at frame %llu shader %016llx slot %d\n", (unsigned long long)frame,
+                AUDIT_FAIL("native texture binding mismatch at frame %llu shader %016llx slot %d\n", (unsigned long long)frame,
                       (unsigned long long)vk_translate_id(si), i);
             verified++;
         }
@@ -5575,6 +5864,17 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
+            w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding >= 100 && b->binding < 118) {
+            // (per-object motion vectors: the previous frame's cbuf k, made at draw time - mvo_prepare - or zeros)
+            int k = (int)b->binding - 100;
+            if (t_vel_prev && t_vel_prev[k].buffer) bi[n] = t_vel_prev[k];
+            else {
+                static const uint8_t zeros[0x10000];
+                uint64_t size = si->cbuf_size[k] && !(si->cbuf_dynamic & (1u << k)) ? si->cbuf_size[k] : 0x10000;
+                size = (size + 15) & ~15ull;
+                bi[n] = ubo_span(vk_transient_copy(zeros, size, 256), size);
+            }
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC && nd < 32) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
@@ -6717,6 +7017,8 @@ typedef struct {
     NativeDrawSlot native_slot;
     VkDescriptorBufferInfo bc_maps[2]; // immutable ownership maps for delayed workers
     const BcView *bc_view;
+    bool vel;                              // a velocity draw (per-object motion vectors): its bindings 100 + k
+    VkDescriptorBufferInfo vel_prev[18];
 } DrawJob;
 static DrawJob *djobs;
 static unsigned dj_allocated = DJ_N;
@@ -6854,7 +7156,7 @@ static VkDescriptorSet draw_job_stage(DrawJob *j, int stage, uint32_t *dyn, int 
                             (unsigned long long)m->audit->binding[i][2], (unsigned long long)m->audit->binding[i][3]);
                 for (int i = 0; i < ref_ndyn && i < m->ndyn; i++) if (ref_dyn[i] != m->dyn[i])
                     LOG("[stage-reuse-audit] dynamic %d ref %u cached %u\n", i, ref_dyn[i], m->dyn[i]);
-                FATAL("stage binding reuse mismatch stage %d seq %llu", stage, (unsigned long long)j->seq);
+                AUDIT_FAIL("stage binding reuse mismatch stage %d seq %llu", stage, (unsigned long long)j->seq);
             }
             checked++;
             if (!(checked & 0xffff)) LOG("[stage-reuse-audit] worker %d hits %llu misses %llu checked %llu; zero mismatches\n",
@@ -6897,6 +7199,7 @@ static void draw_job_run(DrawJob *j, XState *wst, NvnProgram *wprog) {
     t_seq = j->seq, t_sub = j->sub, t_uub_pos = j->uub_pos, t_sbuf_gen = j->sbuf_gen;
     t_direct_ubo = j->direct_ubo;
     t_direct_ubo_mask[0] = j->direct_ubo_mask[0], t_direct_ubo_mask[1] = j->direct_ubo_mask[1];
+    t_vel_prev = j->vel ? j->vel_prev : NULL;
     memcpy(wst->ubuf, j->ubuf, sizeof j->ubuf);
     memcpy(wst->sbuf, j->sbuf, sizeof j->sbuf);
     wprog->stages[0] = j->stages[0], wprog->stages[1] = j->stages[1];
@@ -6925,6 +7228,7 @@ static void draw_job_run(DrawJob *j, XState *wst, NvnProgram *wprog) {
     }
     j->ndyn = ndyn > 32 ? 32 : ndyn;
     if(j->native_slot.span.buf)native_draw_constants_fill(j);
+    t_vel_prev = NULL;
     t_uniform_audit = NULL;
     t_bc_maps=NULL;t_bc_view=NULL;
     t_seq = 0;
@@ -7359,6 +7663,18 @@ static void draw_(CmdRec *r, bool indexed) {
     begin_pass(cube_layers);
     // A dependency wait/pass restart can advance the submission after lookup.
     if (material && !producer_material_current(material, pr)) material = NULL;
+    // per-object motion vectors: the G-buffer's depth-tested draws that are opaque, or blended but writing depth, take the
+    // program's velocity variant once it is built (until then, and where it can't be made, the camera's motion)
+    bool wvel = false;
+    if (vel.on && st.ds[0] && (!(st.color_state[0] & 1) || st.ds[1]) && !stage_reuse_mode) {
+        Prog *pv = vel_program(pr);
+        if (pv) {
+            pr = pv, material = NULL, wvel = true;
+            mvo_draw_key(r, indexed);
+            mvo_prepare(pv->vi);
+        }
+    }
+    t_vel_prev = wvel ? mvo_prev_ubo : NULL;  // (the sets built on this thread; a job carries its own: draw_job_run)
     if (st.rt.depth && !depth_read_only()) pass_ds_written = true;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)
         if (st.rt.color[i] && draw_writes_color(pr, i)) {
@@ -7426,6 +7742,11 @@ static void draw_(CmdRec *r, bool indexed) {
             k.s.blend_on |= (uint8_t)(1u << i);
             memcpy(k.s.blend[i] + 1, st.blend[i] + 1, 6);  // (the factors and ops; 0 is the target index, 7 padding)
         }
+    }
+    if (vel.on && vel.rt < 8) {  // (the velocity target: written by the velocity draws only, never blended)
+        k.s.color[vel.rt] = VK_FORMAT_R16G16B16A16_SFLOAT;
+        k.s.write_mask[vel.rt] = wvel ? 0xF : 0;
+        k.s.blend_on &= (uint8_t)~(1u << vel.rt);
     }
     k.s.a2c = st.ms[0xC] != 0;
     k.s.topo_class = cls;
@@ -7721,6 +8042,8 @@ have_pipe:
             memcpy(job->wh[g], material->wh[g], (size_t)job->ntex[g] * sizeof job->wh[g][0]);
         }
         memcpy(job->rs0,rs0,sizeof rs0);memcpy(job->tint,tint,sizeof tint);
+        job->vel = wvel;
+        if (wvel) memcpy(job->vel_prev, mvo_prev_ubo, sizeof job->vel_prev);
         draw_job_dependencies(job);
     }
     bool native_draw=false;
@@ -8694,8 +9017,8 @@ bool dlss_create(VkCommandBuffer cb, uint32_t in_w, uint32_t in_h, uint32_t out_
 bool dlss_evaluate(VkCommandBuffer cb, const SwDlssImage *color, const SwDlssImage *depth, const SwDlssImage *mv, const SwDlssImage *out,
                    float jx, float jy, float mvx, float mvy, int reset);
 
-static TexBackend *taa_image(int i, uint32_t w, uint32_t h, VkFormat f) {  // 0: motion vectors, 1: DLSS's output
-    static TexBackend img[2];
+static TexBackend *taa_image(int i, uint32_t w, uint32_t h, VkFormat f) {  // 0: motion vectors, 1: DLSS's output, 2: velocity
+    static TexBackend img[3];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -8759,11 +9082,12 @@ static TexBackend *dlaa_run(VkCommandBuffer cb, TexBackend *b, VkImageView src, 
     static VkPipelineLayout layout;
     static VkDescriptorSetLayout set_layout;
     if (!pipe) {
-        VkDescriptorSetLayoutBinding sb[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-                                              {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
-        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = sb};
+        VkDescriptorSetLayoutBinding sb[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                              {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+                                              {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = sb};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &set_layout));
-        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 96};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &layout));
@@ -8789,20 +9113,28 @@ static TexBackend *dlaa_run(VkCommandBuffer cb, TexBackend *b, VkImageView src, 
             for (int k = 0; k < 4; k++) s += prev[r * 4 + k] * inv[k * 4 + c];
             m[r * 4 + c] = s;
         }
-    float pc[20];
+    float pc[24];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) pc[c * 4 + r] = (float)m[r * 4 + c];  // (GLSL: columns)
     pc[16] = (float)w, pc[17] = (float)h, pc[18] = 1.0f / (float)w, pc[19] = 1.0f / (float)h;
+    // (per-object motion vectors: the velocity target, if this frame's G-buffer wrote one at this size; its positions
+    // carry this frame's jitter - the camera buffer's copies are jittered, the previous frame's copies are not - which
+    // goes back out: + the jitter, in pixels)
+    bool velo = vel.img && vel.frame == taa.frame && vel.img->width == w && vel.img->height == h;
+    pc[20] = velo ? 1.0f : 0.0f, pc[21] = 0, pc[22] = taa.jx, pc[23] = taa.jy;
     vk_full_barrier(cb);
     gp_mark(cb, "dlaa: motion vectors %ux%u", w, h);
     VkDescriptorSet ds = vk_alloc_set(set_layout);
-    VkDescriptorImageInfo ii[2] = {{vk_default_sampler(false), dv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, mvv, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[2] = {
+    VkDescriptorImageInfo ii[3] = {{vk_default_sampler(false), dv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, mvv, VK_IMAGE_LAYOUT_GENERAL},
+                                   {vk_default_sampler(false), velo ? post_view(vel.img) : vk_dummy_view(TEXTYPE_2D), VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[3] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 1, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]}};
-    vkUpdateDescriptorSets(g_vk.dev, 2, wr, 0, NULL);
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 2, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[2]}};
+    vkUpdateDescriptorSets(g_vk.dev, 3, wr, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, NULL);
     vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);

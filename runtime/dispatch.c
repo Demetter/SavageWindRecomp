@@ -283,6 +283,12 @@ static const char *host_sym(uint64_t pc, uint64_t *offset) {
     return s ? s : rt_host_fn_name(pc, offset);
 }
 
+int rt_probe(void) {  // (rt.h AUDIT_FAIL)
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_PROBE") && atoi(getenv("SAVAGEWIND_PROBE"));
+    return on;
+}
+
 void rt_fatal_trace(void) {
     fprintf(stderr, "host backtrace (guest functions are f_<addr>):\n");
     plat_print_backtrace();

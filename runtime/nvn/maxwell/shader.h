@@ -46,6 +46,13 @@ typedef struct {
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint32_t shared_size;   // compute: shared memory bytes (from the program's control section)
+    // Per-object motion vectors (runtime/nvn/vulkan/exec.c, the scene's G-buffer pass; upstream PR #4's design): the
+    // vertex shader runs its body a second time on the previous frame's constant buffers (pcb<k>, bindings 100 + k, for
+    // k >= 3) and hands both clip positions to the fragment shader (varyings 30, 31), which writes the velocity to
+    // colour target vel_rt.
+    uint8_t velocity;
+    uint8_t vel_vs;         // fragment: the vertex shader provides the two positions
+    uint8_t vel_rt;         // fragment: the velocity's colour target
 } ShaderKey;
 
 typedef struct {
@@ -71,6 +78,7 @@ typedef struct {
     bool uses_tint;         // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
     bool uses_rscale;       // reads the resolution-scale table (fragment/compute buffer 18): float4 [0] = render
                             // target scale, [1 + i] = allocation scale of texture i
+    bool vel;               // ShaderKey.velocity took: vertex, both positions out; fragment, the velocity written
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
     char error[256];        // set when translation fails

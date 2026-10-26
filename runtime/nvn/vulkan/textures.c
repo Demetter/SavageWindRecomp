@@ -186,9 +186,25 @@ void renderer_set_shadow_size(uint32_t n) {  // (never past what the GPU can mak
     g_shadow_size = n < g_vk.props.limits.maxImageDimension2D ? n : g_vk.props.limits.maxImageDimension2D;
 }
 uint64_t renderer_present_count(void);
+// SAVAGEWIND_SHADOW_WHOLE=1: shadow maps grow by a whole factor of the game's size (Extreme: 9 x 896 = 8064, not 8192).
+// The game moves its cascades with the camera in steps of its own texels; at 9.14 of ours a step, each move lands
+// between our texels and every shadow edge comes out a little different: they crawl while the camera moves.
+// (=<n> above 1: from script frame n on, as SAVAGEWIND_SHOT_AT counts - a same-view A/B)
+static bool shadow_whole(void) {
+    static long from = -1;
+    if (from < 0) {
+        from = getenv("SAVAGEWIND_SHADOW_WHOLE") ? atol(getenv("SAVAGEWIND_SHADOW_WHOLE")) : 0;
+        if (from) LOG("[vk] shadow maps at a whole multiple of the game's size%s\n", from > 1 ? " (from a script frame on)" : "");
+    }
+    if (from <= 1) return from == 1;
+    extern uint64_t framepace_script_frame(uint64_t presented);
+    return (long)framepace_script_frame(renderer_present_count()) >= from;
+}
 static float rs_want(const TexBackend *b, int axis) {  // the scale a texture of b's group is wanted at now
     if (b->rs_group != RS_SHADOW) return g_rs[b->rs_group][axis];
-    return b->guest_w && g_shadow_size > b->guest_w ? (float)g_shadow_size / (float)b->guest_w : 1.0f;  // (square)
+    if (!b->guest_w || g_shadow_size <= b->guest_w) return 1.0f;
+    float f = (float)g_shadow_size / (float)b->guest_w;  // (square)
+    return shadow_whole() ? floorf(f) : f;
 }
 static bool rs_stale(const TexBackend *b) {
     return b->rs_group && (b->sx != rs_want(b, 0) || b->sy != rs_want(b, 1));
@@ -872,7 +888,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
             static uint64_t checks;
             uint64_t ref=fnv_sample(mem,total);
             if((sh==b->sample_hash)!=(ref==b->sample_hash_reference))
-                FATAL("texture sample hash change-decision mismatch texture %llu\n",(unsigned long long)t->debug_id);
+                AUDIT_FAIL("texture sample hash change-decision mismatch texture %llu\n",(unsigned long long)t->debug_id);
             if(!(++checks & 0xffff)) LOG("[texture-hash-audit] %llu decisions; zero mismatches\n",(unsigned long long)checks);
         }
         if (sh == b->sample_hash) return;

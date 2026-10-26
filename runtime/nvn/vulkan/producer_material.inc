@@ -74,7 +74,7 @@ static void producer_material_audit(const ProducerMaterial *m) {
             if (ref.sampler != m->ii[s][i].sampler || ref.imageView != m->ii[s][i].imageView ||
                 ref.imageLayout != m->ii[s][i].imageLayout || memcmp(scale, m->sc[s][i], sizeof scale) ||
                 memcmp(extent, m->wh[s][i], sizeof extent))
-                FATAL("producer material mismatch frame %llu stage %d texture %d\n",
+                AUDIT_FAIL("producer material mismatch frame %llu stage %d texture %d\n",
                       (unsigned long long)renderer_present_count(), s, i);
         }
     }

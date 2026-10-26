@@ -9,6 +9,11 @@
 
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
+// An audit's mismatch (the SAVAGEWIND_VK_*_AUDIT-style checks): fatal, or with SAVAGEWIND_PROBE=1 (a probe build played
+// for diagnosis) logged as "[audit-mismatch]" and the game goes on
+int rt_probe(void);
+#define AUDIT_FAIL(...) \
+    (rt_probe() ? (fprintf(stderr, "[audit-mismatch] " __VA_ARGS__), (void)fputc('\n', stderr)) : (void)FATAL(__VA_ARGS__))
 #ifdef _WIN32
 int plat_trace_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void plat_trace_flush(void);

@@ -889,16 +889,24 @@ static const char *builtin_src(const char *name, int *stage) {
     // motion alone. pc.m = last frame's view-projection x the inverse of this frame's (both unjittered), applied to the
     // pixel's NDC (GL depth: the depth buffer holds (z + 1) / 2; y up); pc.s = size, 1 / size. Out: last frame's
     // position - this one, in pixels (DLSS's convention).
+    // Per-object motion vectors (exec.c, the section of that name): where the G-buffer's velocity target has w = 1, an
+    // object's own motion, camera included: xy = (this NDC - last NDC) / 2, y up, its positions jittered by this frame's
+    // jitter (pc.o.zw, pixels), which goes back out. pc.o.x: the velocity target is this frame's.
     if (!strcmp(name, "dlss_mv.comp")) {
         *stage = STAGE_COMPUTE;
         return "#version 450\n"
                "layout(local_size_x = 8, local_size_y = 8) in;\n"
                "layout(set = 0, binding = 0) uniform sampler2D depth;\n"
                "layout(set = 0, binding = 1, rg16f) uniform writeonly image2D mv;\n"
-               "layout(push_constant) uniform P { mat4 m; vec4 s; } pc;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D vel;\n"
+               "layout(push_constant) uniform P { mat4 m; vec4 s; vec4 o; } pc;\n"
                "void main() {\n"
                "  ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
                "  if (p.x >= int(pc.s.x) || p.y >= int(pc.s.y)) return;\n"
+               "  if (pc.o.x > 0.5) {\n"
+               "    vec4 v = texelFetch(vel, p, 0);\n"
+               "    if (v.w > 0.5) { imageStore(mv, p, vec4(-v.x * pc.s.x + pc.o.z, v.y * pc.s.y + pc.o.w, 0.0, 0.0)); return; }\n"
+               "  }\n"
                "  vec2 uv = (vec2(p) + 0.5) * pc.s.zw;\n"
                "  float d = texelFetch(depth, p, 0).r;\n"
                "  vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);\n"
