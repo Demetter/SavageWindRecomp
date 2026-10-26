@@ -38,6 +38,40 @@ static uint32_t yaz0_run(uint8_t *s, uint8_t *dst, const uint8_t *src, uint32_t 
     *stored = false;
     if ((int32_t)x0 < 1) goto store;
     for (;;) {
+        // A whole group at once (flag byte and its 8 literals or copies) while neither the input nor the room left can
+        // run out inside it: a group takes at most 1 + 8 * 3 bytes and writes at most 8 * 0x111. It ends in the state
+        // the step-by-step loop below would be in: the flag bit used up (0), no copy half read (0), the group's flag
+        // byte, the last copy's first byte and distance.
+        while (x13 == 0 && x10 == 0 && x20 > 25 && (int32_t)x0 > 8 * 0x111) {
+            uint32_t hdr = *src++;
+            x20 -= 1;
+            if (hdr == 0xff) {  // 8 literals (most of a texture)
+                memcpy(x8, src, 8);
+                x8 += 8, src += 8, x20 -= 8, x0 -= 8;
+                x9 = hdr;
+                continue;
+            }
+            for (uint32_t bit = 0x80; bit; bit >>= 1) {
+                if (hdr & bit) {
+                    *x8++ = *src++;
+                    x20 -= 1, x0 -= 1;
+                    continue;
+                }
+                uint32_t b1 = src[0], n;
+                x11 = ((uint64_t)(b1 & 0xf) << 8 | src[1]) + 1;
+                if (b1 >> 4) n = (b1 >> 4) + 2, src += 2, x20 -= 2;
+                else n = (uint32_t)src[2] + 0x12, src += 3, x20 -= 3;
+                x12 = b1;
+                const uint8_t *from = x8 - x11;
+                // (a short copy as one 16-byte move: the bytes past n are inside the room left and written again later)
+                if (x11 >= 16 && n <= 16) memcpy(x8, from, 16), x8 += n;
+                else if (x11 >= n) memcpy(x8, from, n), x8 += n;
+                else if (x11 == 1) memset(x8, *from, n), x8 += n;
+                else { uint32_t k = n; do { *x8++ = *from++; } while (--k); }
+                x0 -= n;
+            }
+            x9 = hdr;
+        }
         if (x13 == 1) {  // a copy's second byte: the distance's low 8 bits
             uint32_t first = x12 & 0xff;
             x11 = ((uint64_t)(x12 & 0xf) << 8 | src[0]) + 1;
