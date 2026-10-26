@@ -247,7 +247,7 @@ class SimdC:
         if sz > 3:
             raise Unsupported('scalar dup size')
         d, n = bits(w, 0, 5), bits(w, 5, 5)
-        return f'c->v[{d}] = (({("uint8_t", "sa16", "sa32", "sa64")[sz]} *)&c->v[{n}])[{idx}];'
+        return f'c->v[{d}] = VV(VGET({vu(sz)}, {n}, {idx}));'
 
     def copy(self, w):
         Q, op, imm5, imm4 = bits(w, 30, 1), bits(w, 29, 1), bits(w, 16, 5), bits(w, 11, 4)
@@ -260,7 +260,7 @@ class SimdC:
             if not Q:
                 raise Unsupported('ins elem Q')
             idx2 = imm4 >> sz
-            return f'(({P} *)&c->v[{d}])[{idx}] = (({P} *)&c->v[{n}])[{idx2}];'
+            return f'VSETL({vu(sz)}, {d}, {idx}, VGET({vu(sz)}, {n}, {idx2}));'
         if imm4 == 0:  # DUP (element)
             if sz == 3 and not Q:
                 raise Unsupported('dup 1d')
@@ -273,16 +273,16 @@ class SimdC:
         if imm4 == 3:  # INS (general)
             if not Q:
                 raise Unsupported('ins Q')
-            return f'(({P} *)&c->v[{d}])[{idx}] = ({ut(sz)}){X(n)};'
+            return f'VSETL({vu(sz)}, {d}, {idx}, ({ut(sz)}){X(n)});'
         if imm4 == 5:  # SMOV
             if sz >= 2 + Q:
                 raise Unsupported('smov size')
             st = ('int8_t', 'int16_t', 'int32_t')[sz]
-            return set_reg(Q, d, f'(uint64_t)(int64_t)({st})(({P} *)&c->v[{n}])[{idx}]')
+            return set_reg(Q, d, f'(uint64_t)(int64_t)({st})VGET({vu(sz)}, {n}, {idx})')
         if imm4 == 7:  # UMOV
             if (Q and sz != 3) or (not Q and sz == 3):
                 raise Unsupported('umov size')
-            return set_reg(Q, d, f'(({P} *)&c->v[{n}])[{idx}]')
+            return set_reg(Q, d, f'VGET({vu(sz)}, {n}, {idx})')
         raise Unsupported('copy imm4')
 
     def permute(self, w):
@@ -423,15 +423,15 @@ class SimdC:
         sa, sb = f'(int64_t)VS64({n})', f'(int64_t)VS64({m})'
         x, y = (a, b) if U else (sa, sb)
         if opc == 6:
-            return f'c->v[{d}] = ({x} > {y}) ? ~0ull : 0;'
+            return f'c->v[{d}] = VV(({x} > {y}) ? ~0ull : 0);'
         if opc == 7:
-            return f'c->v[{d}] = ({x} >= {y}) ? ~0ull : 0;'
+            return f'c->v[{d}] = VV(({x} >= {y}) ? ~0ull : 0);'
         if opc in (8, 10):
             return same(lop('SHL' if opc == 8 else 'RSHL', U), 3, 1, d, n, m)
         if opc == 16:
-            return f'c->v[{d}] = (uint64_t)({a} {"-" if U else "+"} {b});'
+            return f'c->v[{d}] = VV((uint64_t)({a} {"-" if U else "+"} {b}));'
         if opc == 17:
-            return f'c->v[{d}] = ({a} == {b}) ? ~0ull : 0;' if U else f'c->v[{d}] = ({a} & {b}) ? ~0ull : 0;'
+            return f'c->v[{d}] = VV(({a} == {b}) ? ~0ull : 0);' if U else f'c->v[{d}] = VV(({a} & {b}) ? ~0ull : 0);'
         raise Unsupported('scalar 3same opcode')
 
     def three_same_fp(self, w, scalar):
@@ -444,8 +444,8 @@ class SimdC:
         if key in FCMP3:
             cop = FCMP3[key]
             if scalar:
-                return (f'c->v[{d}] = ({ut(2 + sz)})vcmp_{F}(c, {cop}, ({VT}){{{SF}({n})}}, '
-                        f'({VT}){{{SF}({m})}})[0];')
+                return (f'c->v[{d}] = VV(({ut(2 + sz)})vcmp_{F}(c, {cop}, ({VT}){{{SF}({n})}}, '
+                        f'({VT}){{{SF}({m})}})[0]);')
             return VWr(VU, Q, d, f'vcmp_{F}(c, {cop}, {VQ(VT, Q, n)}, {VQ(VT, Q, m)})')
         if scalar:
             if key not in ((0, 0, 0b11011), (0, 0, 0b11111), (0, 1, 0b11111), (1, 1, 0b11010)):
@@ -585,13 +585,13 @@ class SimdC:
             raise Unsupported('scalar misc size')
         a, sa = f'VS64({n})', f'(int64_t)VS64({n})'
         if opc == 8:
-            return f'c->v[{d}] = ({sa} {">=" if U else ">"} 0) ? ~0ull : 0;'
+            return f'c->v[{d}] = VV(({sa} {">=" if U else ">"} 0) ? ~0ull : 0);'
         if opc == 9:
-            return f'c->v[{d}] = ({sa} {"<=" if U else "=="} 0) ? ~0ull : 0;'
+            return f'c->v[{d}] = VV(({sa} {"<=" if U else "=="} 0) ? ~0ull : 0);'
         if opc == 10 and not U:
-            return f'c->v[{d}] = ({sa} < 0) ? ~0ull : 0;'
+            return f'c->v[{d}] = VV(({sa} < 0) ? ~0ull : 0);'
         if opc == 11:
-            return f'c->v[{d}] = (uint64_t)-{a};' if U else f'c->v[{d}] = ({sa} < 0) ? (uint64_t)-{a} : {a};'
+            return f'c->v[{d}] = VV((uint64_t)-{a});' if U else f'c->v[{d}] = VV(({sa} < 0) ? (uint64_t)-{a} : {a});'
         raise Unsupported('scalar misc opcode')
 
     def misc2_fp(self, w, scalar):
@@ -633,7 +633,7 @@ class SimdC:
                 a, b = f'({VT}){{{SF}({n})}}', f'({VT}){{}}'
                 if swap:
                     a, b = b, a
-                return f'c->v[{d}] = ({ut(2 + sz)})vcmp_{F}(c, {op}, {a}, {b})[0];'
+                return f'c->v[{d}] = VV(({ut(2 + sz)})vcmp_{F}(c, {op}, {a}, {b})[0]);'
             a, b = x, f'({VT}){{}}'
             if swap:
                 a, b = b, a
@@ -659,7 +659,7 @@ class SimdC:
         if opc in (0b11010, 0b11011) or (opc == 0b11100 and not a_):  # FCVT[NPMZA][SU]
             rm = {(0b11010, 0): 0, (0b11010, 1): 1, (0b11011, 0): 2, (0b11011, 1): 3, (0b11100, 0): 4}[(opc, a_)]
             if scalar:
-                return f'c->v[{d}] = ({ut(2 + sz)})toint_{F}(c, {SF}({n}), {rm}, 0, {32 << sz}, {U});'
+                return f'c->v[{d}] = VV(({ut(2 + sz)})toint_{F}(c, {SF}({n}), {rm}, 0, {32 << sz}, {U}));'
             return VWr(VU, Q, d, f'vtoint_{F}(c, {x}, {rm}, 0, {U})')
         if opc == 0b11100:  # URECPE / URSQRTE
             if scalar or sz:
@@ -696,7 +696,7 @@ class SimdC:
         U, sz, opc, n, d = bits(w, 29, 1), bits(w, 22, 2), bits(w, 12, 5), bits(w, 5, 5), bits(w, 0, 5)
         if not U:
             if opc == 0b11011 and sz == 3:
-                return f'c->v[{d}] = (uint64_t)(VS64({n}) + VHI64({n}));'
+                return f'c->v[{d}] = VV((uint64_t)(VS64({n}) + VHI64({n})));'
             raise Unsupported('scalar pairwise')
         fop = {(0b01100, 0): 'FOP_MAXNM', (0b01100, 1): 'FOP_MINNM', (0b01101, 0): 'FOP_ADD',
                (0b01111, 0): 'FOP_MAX', (0b01111, 1): 'FOP_MIN'}.get((opc, sz >> 1))
@@ -724,7 +724,7 @@ class SimdC:
         if op and not (c4 == 14 or c4 == 15):  # MVNI
             imm = ~imm & ((1 << 64) - 1)
         v = imm | (imm << 64) if Q else imm
-        return f'c->v[{d}] = {u128(v)};'
+        return f'c->v[{d}] = VV({u128(v)});'
 
     # ------------------------------------------------------------ shift by immediate
 
@@ -753,7 +753,7 @@ class SimdC:
                     return f'{SET}({d}, fromint_{F}(c, {SU}({n}), {es}, {U}, {fb}));'
                 return VWr(VT, Q, d, f'vfromint_{F}(c, {VR(VU, n)}, {fb}, {U})')
             if scalar:
-                return f'c->v[{d}] = ({ut(sz)})toint_{F}(c, {SF}({n}), 3, {fb}, {es}, {U});'
+                return f'c->v[{d}] = VV(({ut(sz)})toint_{F}(c, {SF}({n}), 3, {fb}, {es}, {U}));'
             return VWr(VU, Q, d, f'vtoint_{F}(c, {VQ(VT, Q, n)}, 3, {fb}, {U})')
         if narrow:
             if sz == 3:
@@ -783,7 +783,7 @@ class SimdC:
                 e = f'({T})({VR(S, n)} >> {min(rsh, es - 1)})'
             if opc == 2:
                 e = f'{VR(T, d)} + {e}'
-            return VWr(T, Q, d, e) if not scalar else f'c->v[{d}] = (uint64_t)(({e})[0]);'
+            return VWr(T, Q, d, e) if not scalar else f'c->v[{d}] = VV((uint64_t)(({e})[0]));'
         if opc in (4, 6):
             return same(lop('RSHRI' if opc == 4 else 'RSRAI', U), sz, ne, d, n, -1, rsh)
         if opc == 8:
@@ -794,7 +794,7 @@ class SimdC:
             if U:
                 return same(lop('SLI'), sz, ne, d, n, -1, lsh)
             e = f'{VR(T, n)} << {lsh}'
-            return VWr(T, Q, d, e) if not scalar else f'c->v[{d}] = (uint64_t)(({e})[0]);'
+            return VWr(T, Q, d, e) if not scalar else f'c->v[{d}] = VV((uint64_t)(({e})[0]));'
         if opc == 12:
             if not U:
                 raise Unsupported('sqshlu U')
@@ -904,11 +904,11 @@ class SimdC:
         F, VT, VU, T, SF, SU, SET = FT[t]
         sign = '0x80000000u' if not t else '0x8000000000000000ull'
         if opc == 0:
-            return f'c->v[{d}] = {SU}({n});'
+            return f'c->v[{d}] = VV({SU}({n}));'
         if opc == 1:
-            return f'c->v[{d}] = {SU}({n}) & ~{sign};'
+            return f'c->v[{d}] = VV({SU}({n}) & ~{sign});'
         if opc == 2:
-            return f'c->v[{d}] = {SU}({n}) ^ {sign};'
+            return f'c->v[{d}] = VV({SU}({n}) ^ {sign});'
         if opc == 3:
             return f'fp_op_{F}(c, FOP_SQRT, {d}, {n}, {n});'
         if opc in (4, 5, 7):
@@ -916,7 +916,7 @@ class SimdC:
             if to == t:
                 raise Unsupported('fcvt same')
             if to == 3:
-                return f'c->v[{d}] = {"simd_s2h" if not t else "simd_dd2h"}(c, {SF}({n}));'
+                return f'c->v[{d}] = VV({"simd_s2h" if not t else "simd_dd2h"}(c, {SF}({n})));'
             return f'FP_SETD({d}, simd_s2d(c, VSF32({n})));' if to else f'FP_SETS({d}, simd_d2s(c, VSF64({n})));'
         rm = {8: 0, 9: 1, 10: 2, 11: 3, 12: 4, 14: 5, 15: 6}.get(opc)
         if rm is None:
@@ -942,14 +942,14 @@ class SimdC:
         t = self._ftype(w)
         SU = FT[t][5]
         d, n, m, cnd = bits(w, 0, 5), bits(w, 5, 5), bits(w, 16, 5), bits(w, 12, 4)
-        return f'c->v[{d}] = {cond(cnd)} ? {SU}({n}) : {SU}({m});'
+        return f'c->v[{d}] = VV({cond(cnd)} ? {SU}({n}) : {SU}({m}));'
 
     def fp_imm(self, w):
         t = self._ftype(w)
         if bits(w, 5, 5):
             raise Unsupported('fmov imm5')
         imm8, d = bits(w, 13, 8), bits(w, 0, 5)
-        return f'c->v[{d}] = {hx(vfp_expand_imm(imm8, 32 << t))};'
+        return f'c->v[{d}] = VV({hx(vfp_expand_imm(imm8, 32 << t))});'
 
     def fp_fixed(self, w):
         sf, t, rmode, opc, scale, n, d = (bits(w, 31, 1), bits(w, 22, 2), bits(w, 19, 2), bits(w, 16, 3), bits(w, 10, 6),
@@ -971,12 +971,12 @@ class SimdC:
         sf, t, rmode, opc, n, d = bits(w, 31, 1), bits(w, 22, 2), bits(w, 19, 2), bits(w, 16, 3), bits(w, 5, 5), bits(w, 0, 5)
         if opc in (6, 7):  # FMOV
             if t == 2 and sf and rmode == 1:
-                return set_reg(1, d, f'VHI64({n})') if opc == 6 else f'VHI64({d}) = {X(n)};'
+                return set_reg(1, d, f'VHI64({n})') if opc == 6 else f'VSETL(vu64, {d}, 1, {X(n)});'
             if rmode or t != sf or t > 1:
                 raise Unsupported('fmov general')
             if opc == 6:
                 return set_reg(sf, d, f'VS64({n})' if sf else f'VS32({n})')
-            return f'c->v[{d}] = {X(n) if sf else W(n)};'
+            return f'c->v[{d}] = VV({X(n) if sf else W(n)});'
         if t > 1:
             raise Unsupported('fp int type')
         F, VT, VU, T, SF, SU, SET = FT[t]
@@ -1002,7 +1002,7 @@ class SimdC:
             if opc == 3:
                 raise Unsupported('ldr literal opc')
             addr = (pc + sext(bits(w, 5, 19), 19) * 4) & ((1 << 64) - 1)
-            return f'c->v[{rt}] = {("LD32", "LD64", "LD128")[opc]}({hx(addr)});'
+            return f'c->v[{rt}] = VV({("LD32", "LD64", "LD128")[opc]}({hx(addr)}));'
         if bits(w, 31, 1) == 0 and bits(w, 24, 6) in (0b001100, 0b001101):
             return self.ldst_struct(w)
         if bits(w, 27, 3) == 0b101:
@@ -1025,8 +1025,8 @@ class SimdC:
         sz = 1 << scale
         lines = [f'uint64_t ea = {ea};']
         if L:
-            lines.append(f'u128 a = {ld}(ea), b = {ld}(ea + {sz});')
-            lines.append(f'c->v[{rt}] = a; c->v[{rt2}] = b;')
+            lines.append(f'{"VReg" if scale == 4 else "u128"} a = {ld}(ea), b = {ld}(ea + {sz});')
+            lines.append(f'c->v[{rt}] = VV(a); c->v[{rt2}] = VV(b);')
         else:
             cast = {2: 'VS32', 3: 'VS64', 4: 'c->v'}[scale]
             v1, v2 = (f'c->v[{rt}]', f'c->v[{rt2}]') if scale == 4 else (f'{cast}({rt})', f'{cast}({rt2})')
@@ -1076,7 +1076,7 @@ class SimdC:
             raise Unsupported('ldst simd')
         parts = [f'uint64_t ea = {ea};']
         if L:
-            parts.append(f'c->v[{rt}] = {("LD8", "LD16", "LD32", "LD64", "LD128")[scale]}(ea);')
+            parts.append(f'c->v[{rt}] = VV({("LD8", "LD16", "LD32", "LD64", "LD128")[scale]}(ea));')
         else:
             src = (f'VS8({rt})', f'VS16({rt})', f'VS32({rt})', f'VS64({rt})', f'c->v[{rt}]')[scale]
             parts.append(f'{("ST8", "ST16", "ST32", "ST64", "ST128")[scale]}(ea, {src});')
@@ -1105,7 +1105,7 @@ class SimdC:
                 regs = [(rt + i) % 32 for i in range(rpt)]
                 step = 16 if Q else 8
                 if L:
-                    acc = ' '.join(f'c->v[{r}] = {"LD128" if Q else "LD64"}(ea + {i * step});' for i, r in enumerate(regs))
+                    acc = ' '.join(f'c->v[{r}] = VV({"LD128" if Q else "LD64"}(ea + {i * step}));' for i, r in enumerate(regs))
                 else:
                     acc = ' '.join(f'{"ST128" if Q else "ST64"}(ea + {i * step}, {"c->v[%d]" % r if Q else "VS64(%d)" % r});'
                                    for i, r in enumerate(regs))

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <string.h>
 
+// A V register: a vector, so code that keeps it in a local or forwards it between ops uses a vector register (as a
+// 128-bit integer it went through pairs of integer registers). simd.h VV / VU convert from and to 128-bit integers.
+typedef uint64_t VReg __attribute__((vector_size(16)));
+
 typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t x[32];          // x0-x30 (x[31] unused; sp is separate)
     uint64_t sp;             // 256
@@ -17,7 +21,7 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
     uint8_t _pad[512 - 336];
-    __uint128_t v[32];       // 512
+    VReg v[32];              // 512
 } Cpu;
 
 _Static_assert(offsetof(Cpu, sp) == 256, "sp");

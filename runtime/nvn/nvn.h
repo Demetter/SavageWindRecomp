@@ -11,7 +11,7 @@
 #define AP(i) ((void *)(uintptr_t)c->x[(i)])
 #define AF(i) (*(float *)&c->v[(i)])
 #define RET(v) (c->x[0] = (uint64_t)(v))
-#define RETF(f) do { c->v[0] = 0; *(float *)&c->v[0] = (f); } while (0)
+#define RETF(f) do { c->v[0] = (VReg){0, 0}; *(float *)&c->v[0] = (f); } while (0)
 #define HOST(T, guest) ((T *)(uintptr_t)(*(uint64_t *)(uintptr_t)(guest)))
 #define SET_HOST(guest, p) (*(uint64_t *)(uintptr_t)(guest) = (uint64_t)(uintptr_t)(p))
 #define G(T, base, off) (*(T *)((uint8_t *)(uintptr_t)(base) + (off)))

@@ -242,7 +242,7 @@ def _gui_speed(gen, a):
 def _persp_matrix(gen, a):
     assert _word(gen, a) == 0x2d558801, hex(_word(gen, a))  # ldp s1, s2, [x0, #0xac]
     return ('{ extern void rt_persp(uint64_t, uint32_t *, uint32_t *); uint32_t t = LD32(c->x[0] + 0xac), '
-            'k = LD32(c->x[0] + 0xb0); rt_persp(c->x[0], &t, &k); c->v[1] = t; c->v[2] = k; }'
+            'k = LD32(c->x[0] + 0xb0); rt_persp(c->x[0], &t, &k); c->v[1] = VV(t); c->v[2] = VV(k); }'
             f'  /* {a:#x}: ldp s1, s2, [x0, #0xac] (perspective matrix: tan(fovy / 2), aspect) */')
 
 
@@ -257,7 +257,7 @@ def _frustum_load(word, regs, what):
         k = 0 if what == 'lr' else 2
         return ('{ extern void rt_frustum(uint64_t, float *); float f[4]; rt_frustum(c->x[0], f); '
                 f'union {{ float f; uint32_t u; }} p0 = {{ f[{k}] }}, p1 = {{ f[{k + 1}] }}; '
-                f'c->v[{r0}] = p0.u; c->v[{r1}] = p1.u; }}'
+                f'c->v[{r0}] = VV(p0.u); c->v[{r1}] = VV(p1.u); }}'
                 f'  /* {a:#x}: ldp s{r0}, s{r1}, [x0, #{0xa8 if what == "lr" else 0xa0:#x}] (frustum matrix) */')
     return patch
 
@@ -279,7 +279,7 @@ def _proj_update(gen, a):
 def _persp_matrix_offset(gen, a):
     assert _word(gen, a) == 0x2d569404, hex(_word(gen, a))  # ldp s4, s5, [x0, #0xb4]
     return ('{ extern void rt_persp_offset(uint64_t, uint32_t *, uint32_t *); uint32_t x = LD32(c->x[0] + 0xb4), '
-            'y = LD32(c->x[0] + 0xb8); rt_persp_offset(c->x[0], &x, &y); c->v[4] = x; c->v[5] = y; }'
+            'y = LD32(c->x[0] + 0xb8); rt_persp_offset(c->x[0], &x, &y); c->v[4] = VV(x); c->v[5] = VV(y); }'
             f'  /* {a:#x}: ldp s4, s5, [x0, #0xb4] (perspective matrix: offset) */')
 
 
@@ -289,14 +289,14 @@ def _persp_matrix_offset(gen, a):
 def _persp_unproject_y(gen, a):
     assert _word(gen, a) == 0xbd40ac01, hex(_word(gen, a))  # ldr s1, [x0, #0xac]
     return ('{ extern void rt_persp(uint64_t, uint32_t *, uint32_t *); uint32_t t = LD32(c->x[0] + 0xac), '
-            'k = LD32(c->x[0] + 0xb0); rt_persp(c->x[0], &t, &k); c->v[1] = t; }'
+            'k = LD32(c->x[0] + 0xb0); rt_persp(c->x[0], &t, &k); c->v[1] = VV(t); }'
             f'  /* {a:#x}: ldr s1, [x0, #0xac] (screen to camera: tan(fovy / 2)) */')
 
 
 def _persp_unproject_x(gen, a):
     assert _word(gen, a) == 0x2d558c02, hex(_word(gen, a))  # ldp s2, s3, [x0, #0xac]
     return ('{ extern void rt_persp(uint64_t, uint32_t *, uint32_t *); uint32_t t = LD32(c->x[0] + 0xac), '
-            'k = LD32(c->x[0] + 0xb0); rt_persp(c->x[0], &t, &k); c->v[2] = t; c->v[3] = k; }'
+            'k = LD32(c->x[0] + 0xb0); rt_persp(c->x[0], &t, &k); c->v[2] = VV(t); c->v[3] = VV(k); }'
             f'  /* {a:#x}: ldp s2, s3, [x0, #0xac] (screen to camera: tan(fovy / 2), aspect) */')
 
 
@@ -325,7 +325,7 @@ def _cam_pitch(gen, a):
     # fmul s1, s0, s0 just above, fnmul s3, s0, s0 here: the vertical part kept its sign squared, s1 or s3 by s0's sign
     assert _word(gen, a) == 0x1e208803 and _word(gen, a - 4) == 0x1e200801, hex(_word(gen, a))
     return ('{ extern int rt_cam_pitch(float *); union { uint32_t u; float f; } y = { .u = (uint32_t)VS32(0) }; '
-            'if (rt_cam_pitch(&y.f)) c->v[1] = y.u; else y.f = -(y.f * y.f); c->v[3] = y.u; }'
+            'if (rt_cam_pitch(&y.f)) c->v[1] = VV(y.u); else y.f = -(y.f * y.f); c->v[3] = VV(y.u); }'
             f'  /* {a:#x}: fnmul s3, s0, s0 (camera: the vertical stick part squared) */')
 
 
@@ -336,7 +336,7 @@ def _cam_pitch_aim(gen, a):
     w = next(_word(gen, a - 4 * i) for i in range(1, 5) if _word(gen, a - 4 * i) & 0xffc003ff == 0xf9400268)
     lng = ((w >> 10) & 0xfff) * 8 + 8
     return ('{ extern uint32_t rt_cam_pitch_scale(uint32_t, uint32_t); '
-            f'c->v[1] = rt_cam_pitch_scale(LD32(c->x[8]), LD32(LD64(c->x[19] + {lng:#x}))); }}'
+            f'c->v[1] = VV(rt_cam_pitch_scale(LD32(c->x[8]), LD32(LD64(c->x[19] + {lng:#x})))); }}'
             f'  /* {a:#x}: ldr s1, [x8] (camera: latStickScale) */')
 
 

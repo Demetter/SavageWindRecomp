@@ -49,7 +49,7 @@ void hle_longjmp(Cpu *c) {
         LOG("[setjmp] longjmp to %llx val %u (lr=%llx, back to %llx)\n", gbuf, val, c->x[30], LD64(gbuf + 0x58));
     for (int r = 19; r <= 30; r++) c->x[r] = LD64(gbuf + 8 * (r - 19));
     c->sp = s->gsp;
-    for (int r = 8; r <= 15; r++) c->v[r] = LD64(gbuf + 0x70 + 8 * (r - 8));  // (ldp d: upper half zeroed)
+    for (int r = 8; r <= 15; r++) c->v[r] = (VReg){LD64(gbuf + 0x70 + 8 * (r - 8)), 0};  // (ldp d: upper half zeroed)
     c->x[0] = val ? val : 1;
     longjmp(s->hb, 1);
 }
