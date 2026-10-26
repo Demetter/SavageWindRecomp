@@ -1357,6 +1357,7 @@ static ViewEnt view_tab[VIEW_TAB];
 void vk_views_forget(TexBackend *b) { views_forget(b); }
 uint32_t vk_view_gen;  // bumped whenever a cached view may be destroyed (exec.c's per-frame texture memo)
 static pthread_mutex_t view_lock = PTHREAD_MUTEX_INITIALIZER;  // (the table: every translating thread)
+uint64_t vk_view_lock_ns, vk_view_lock_waits;  // (exec.c's SAVAGEWIND_VK_PAR_PROBE) time lookups waited for it
 static void views_forget(TexBackend *b) {
     pthread_mutex_lock(&view_lock);
     __atomic_fetch_add(&vk_view_gen, 1, __ATOMIC_RELAXED);
@@ -1371,7 +1372,12 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     uint64_t k2 = (uint64_t)ly0 | (uint64_t)nly << 16 | (uint64_t)sw.r << 32 | (uint64_t)sw.g << 40 | (uint64_t)sw.b << 48 | (uint64_t)sw.a << 56;
     uint64_t h = ((uint64_t)(uintptr_t)b * 0x9E3779B97F4A7C15ull) ^ (k1 * 0xC2B2AE3D27D4EB4Full) ^ (k2 * 0x165667B19E3779F9ull);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VIEW_TAB - 1);
-    pthread_mutex_lock(&view_lock);
+    if (pthread_mutex_trylock(&view_lock)) {  // (taken: the wait counted, SAVAGEWIND_VK_PAR_PROBE)
+        uint64_t t0 = SDL_GetTicksNS();
+        pthread_mutex_lock(&view_lock);
+        __atomic_fetch_add(&vk_view_lock_ns, SDL_GetTicksNS() - t0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&vk_view_lock_waits, 1, __ATOMIC_RELAXED);
+    }
     for (int probe = 0; probe < 16; probe++, slot = (slot + 1) & (VIEW_TAB - 1)) {
         ViewEnt *e = &view_tab[slot];
         if (e->b == b && e->k1 == k1 && e->k2 == k2) { VkImageView v = e->view; pthread_mutex_unlock(&view_lock); return v; }

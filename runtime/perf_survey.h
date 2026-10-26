@@ -20,11 +20,16 @@ void perf_survey_guest(struct KThread *t);
 // SAVAGEWIND_PERFX_AB_START (default 3000), for an A/B within one launch: "[perfx] frame <n> block <b> on|off".
 // The render thread takes the bits on at the start of each command list (perfx_list_begin; the list's draw jobs are
 // all done before the next list starts), so a list's translation and its workers see one state.
-enum { PERFX_CBR = 1, PERFX_TEXBIND = 2, PERFX_SMT = 4, PERFX_MATUP = 8, PERFX_KSPIN = 16, PERFX_GWORDER = 32, PERFX_DJSPIN = 64, PERFX_MICRO = 128, PERFX_DSITE = 256, PERFX_MVO = 512, PERFX_PAR = 1024 };
+enum { PERFX_CBR = 1, PERFX_TEXBIND = 2, PERFX_SMT = 4, PERFX_MATUP = 8, PERFX_KSPIN = 16, PERFX_GWORDER = 32, PERFX_DJSPIN = 64, PERFX_MICRO = 128, PERFX_DSITE = 256, PERFX_MVO = 512, PERFX_PAR = 1024, PERFX_PIECES = 2048, PERFX_DETACH = 4096 };
 extern _Atomic uint32_t g_perfx, g_perfx_list;
 extern uint32_t g_perfx_mask;  // the bits on trial (SAVAGEWIND_PERFX)
 void perfx_list_begin(void);
 int perf_usable_processors(void);  // the logical processors the game may run on
+void perf_one_per_core(bool on);   // (in-launch trials) the process on one logical processor per core, or on all
+uint64_t perf_process_cpu_ns(void);  // user + kernel time of all the process's threads (0 where unknown)
+uint64_t perf_process_cycles(void);  // CPU cycles of all the process's threads so far / of this thread (0 where unknown)
+uint64_t perf_thread_cycles(void);
+void perf_thread_priority(int p);  // this thread's priority (Windows' steps; elsewhere nothing)
 static inline bool perfx(uint32_t bit) { return atomic_load_explicit(&g_perfx_list, memory_order_relaxed) & bit; }
 static inline bool perfx_trial(uint32_t bit) { return g_perfx_mask & bit; }
 static inline bool perf_survey_on(int mode) {

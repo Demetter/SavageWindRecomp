@@ -15,6 +15,10 @@
 bool vk_timing_on;
 static bool tried;
 static bool timing_log_on;
+// (measuring) SAVAGEWIND_VK_PASS_GPU=1: the frame trace's GPU marks (each pass, dispatch, copy: exec.c gp_mark) without the
+// frame trace, which keeps lists serial; every 16th frame's segments logged: "[pass-gpu] <frame> <draws> <ns> <label>"
+bool vk_pass_gpu;
+uint64_t vk_gpu_span_ns, vk_gpu_spans;  // (SAVAGEWIND_VK_TIMING; exec.c's SAVAGEWIND_VK_PAR_PROBE) the submissions' GPU spans
 static VkQueryPool pool;
 static VkQueryPool pass_pool;
 static uint64_t mask;
@@ -95,6 +99,9 @@ static void timing_init(void) {
     const char *e = getenv("SAVAGEWIND_VK_TIMING");
     const char *f = getenv("SAVAGEWIND_FRAME_LOG");
     timing_log_on = e ? atoi(e) != 0 : f && atoi(f) >= 2;
+    const char *pg = getenv("SAVAGEWIND_VK_PASS_GPU");
+    vk_pass_gpu = pg && atoi(pg);
+    if (vk_pass_gpu) timing_log_on = true;
     if (!vk_frame_trace_on && !timing_log_on) return;
     uint32_t n = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &n, NULL);
@@ -108,7 +115,7 @@ static void timing_init(void) {
     VkQueryPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
         .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = TIMING_SLOTS * 4};
     if (vkCreateQueryPool(g_vk.dev, &ci, NULL, &pool) != VK_SUCCESS) return;
-    if (vk_frame_trace_on) {
+    if (vk_frame_trace_on || vk_pass_gpu) {
         ci.queryCount = TIMING_SLOTS * PASS_MARKS;
         if (vkCreateQueryPool(g_vk.dev, &ci, NULL, &pass_pool) != VK_SUCCESS)
             LOG("[frame-trace] GPU pass query pool unavailable; CPU/submission trace only\n");
@@ -214,6 +221,10 @@ void vk_timing_retire(unsigned slot) {
             if (!first) vk_frame_trace_event("Upload command buffer", 11, timing[slot].frame, seq,
                 begin, begin + (uint64_t)(((t[1] - t[0]) & mask) * ns), 0, 0);
         }
+        if (timing_log_on) {
+            __atomic_fetch_add(&vk_gpu_span_ns, (uint64_t)(((t[3] - t[first]) & mask) * period * 1e6), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&vk_gpu_spans, 1, __ATOMIC_RELAXED);
+        }
         if (timing_log_on) TRACE_LOG("[vktrace] {\"seq\":%llu,\"frame\":%llu,\"enqueue_ns\":%llu,\"driver_ns\":%llu,\"return_ns\":%llu,"
             "\"gpu_begin_tick\":%llu,\"gpu_end_tick\":%llu,\"gpu_ms\":%.6f,\"main_ms\":%.6f,\"upload_ms\":%.6f,\"reasons\":%u}\n",
             (unsigned long long)seq, (unsigned long long)timing[slot].frame, (unsigned long long)timing[slot].enqueue,
@@ -228,7 +239,12 @@ void vk_timing_retire(unsigned slot) {
         if (vkGetQueryPoolResults(g_vk.dev, pass_pool, slot * PASS_MARKS, n, sizeof ticks, ticks, sizeof(uint64_t),
                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             double ns = g_vk.props.limits.timestampPeriod;
-            for (unsigned i = 0; i + 1 < n; i++) {
+            for (unsigned i = 0; i + 1 < n && vk_pass_gpu; i++)
+                if (!(passes[slot].marks[i].frame & 15))
+                    TRACE_LOG("[pass-gpu] %llu %u %llu %s\n", (unsigned long long)passes[slot].marks[i].frame,
+                              passes[slot].marks[i].draws, (unsigned long long)(((ticks[i + 1] - ticks[i]) & mask) * ns),
+                              passes[slot].marks[i].label);
+            for (unsigned i = 0; i + 1 < n && vk_frame_trace_on; i++) {
                 uint64_t begin = (uint64_t)((ticks[i] & mask) * ns);
                 vk_frame_trace_event(passes[slot].marks[i].label, 10, passes[slot].marks[i].frame, seq, begin,
                     begin + (uint64_t)(((ticks[i + 1] - ticks[i]) & mask) * ns),

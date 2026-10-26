@@ -13,6 +13,10 @@ extern __thread bool vkq_on;  // this thread's Vulkan commands go to the recordi
 extern bool vkq_native_multi_draw; // device initialization sets this before recorder creation
 void vkq_defer_begin(void);   // (the submission thread, at the start of a list)
 void vkq_defer_end(void);     // all of it recorded and submitted: direct calls are safe again
+void vkq_defer_detach(void);  // deferring ends, the recording thread going on with it: vkq_catch_up before direct calls
+extern _Atomic uint64_t vkq_idle_ns, vkq_submit_ns, vkq_cycles;  // (SAVAGEWIND_VK_PAR_PROBE) the recording thread idle; in vkQueueSubmit2
+extern bool vkq_probe;
+void vkq_catch_up(void);      // (any thread) everything deferred before the last detach recorded and submitted
 void vkq_drain(void);         // everything deferred so far recorded and submitted (deferring goes on)
 void vkq_trace_frame(uint64_t frame); // diagnostic wait deltas, separate from descriptor-job waits
 extern bool vkq_address_wait; // native Windows waits, selected before recorder/descriptor workers start

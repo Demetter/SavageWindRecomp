@@ -77,6 +77,8 @@ static _Alignas(64) _Atomic int sleeping, waiting;
 static int state;  // 0 not started, 1 on, -1 off (SAVAGEWIND_VK_NO_DEFER, or no thread)
 static _Atomic int failed;  // a deferred submission failed: the producer reports it at the next drain
 static _Atomic uint64_t trace_ring_ns, trace_drain_ns;
+_Atomic uint64_t vkq_idle_ns, vkq_submit_ns, vkq_cycles;  // (SAVAGEWIND_VK_PAR_PROBE, exec.c) the recording thread waiting for work; in vkQueueSubmit2
+bool vkq_probe;
 uint64_t renderer_present_count(void);
 
 void vkq_trace_frame(uint64_t frame) {
@@ -98,11 +100,14 @@ static void *recorder(void *arg) {
         uint64_t r = atomic_load_explicit(&rpos, memory_order_relaxed);
         uint64_t w = atomic_load_explicit(&wpos, memory_order_acquire);
         if (r == w) {
+            uint64_t idle0 = vkq_probe ? plat_now_ns() : 0;
+            if (idle0) atomic_store_explicit(&vkq_cycles, perf_thread_cycles(), memory_order_relaxed);
             if(a1d_busy){a1d_local[A1D_RECORDER]+=plat_now_ns()-a1d_busy;a1d_busy=0;a1d_publish();}
             if (vkq_address_wait) {
                 if (atomic_load(&waiting)) vkq_wake_address(&rpos, false);
                 for (int i = 0; i < 64 && atomic_load_explicit(&wpos, memory_order_acquire) == r; i++) _mm_pause();
                 if (atomic_load_explicit(&wpos, memory_order_acquire) == r) vkq_wait_address(&wpos, r, sizeof wpos);
+                if (idle0) atomic_fetch_add_explicit(&vkq_idle_ns, plat_now_ns() - idle0, memory_order_relaxed);
                 continue;
             }
             if (atomic_load(&waiting)) { pthread_mutex_lock(&m); pthread_cond_broadcast(&cv_idle); pthread_mutex_unlock(&m); }
@@ -111,12 +116,14 @@ static void *recorder(void *arg) {
                 _mm_pause();
                 got = atomic_load_explicit(&wpos, memory_order_acquire) != r;
             }
-            if (got) continue;
-            pthread_mutex_lock(&m);
-            atomic_store(&sleeping, 1);
-            while (atomic_load_explicit(&wpos, memory_order_acquire) == r) pthread_cond_wait(&cv_work, &m);
-            atomic_store(&sleeping, 0);
-            pthread_mutex_unlock(&m);
+            if (!got) {
+                pthread_mutex_lock(&m);
+                atomic_store(&sleeping, 1);
+                while (atomic_load_explicit(&wpos, memory_order_acquire) == r) pthread_cond_wait(&cv_work, &m);
+                atomic_store(&sleeping, 0);
+                pthread_mutex_unlock(&m);
+            }
+            if (idle0) atomic_fetch_add_explicit(&vkq_idle_ns, plat_now_ns() - idle0, memory_order_relaxed);
             continue;
         }
         if(a1d_enabled&&!a1d_busy)a1d_busy=plat_now_ns();
@@ -243,6 +250,47 @@ void vkq_defer_end(void) {
     if (!vkq_on) return;
     vkq_drain();
     vkq_on = false;
+}
+
+// Deferring ends without waiting for the recording thread, which goes on with what was deferred; whoever calls Vulkan
+// directly next (any thread, with exec.c's gpu_lock held) waits for it first: vkq_catch_up.
+static _Atomic uint64_t detached;  // (the ring position the producer published as it stopped)
+void vkq_defer_detach(void) {
+    if (!vkq_on) return;
+    if (vkq_native_multi_draw) push(R_NativeFlush, 0);
+    publish();
+    atomic_store_explicit(&detached, wlocal, memory_order_release);
+    vkq_on = false;
+}
+void vkq_catch_up(void) {
+    if (state <= 0 || vkq_on) return;  // (deferring: the producer's own calls are in order anyway)
+    uint64_t d = atomic_load_explicit(&detached, memory_order_acquire);
+    if (atomic_load_explicit(&rpos, memory_order_acquire) >= d) return;
+    uint64_t trace_wait = vk_frame_trace_on ? plat_now_ns() : 0;
+    if (vkq_address_wait) {
+        atomic_store(&waiting, 1);
+        uint64_t r;
+        while ((r = atomic_load_explicit(&rpos, memory_order_acquire)) < d) vkq_wait_address(&rpos, r, sizeof rpos);
+        atomic_store(&waiting, 0);
+    } else {
+        pthread_mutex_lock(&m);
+        atomic_store(&waiting, 1);
+        while (atomic_load_explicit(&rpos, memory_order_acquire) < d) {
+            if (atomic_load(&sleeping)) pthread_cond_signal(&cv_work);
+            struct timespec ts;  // (as vkq_drain)
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 2000000;
+            if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&cv_idle, &m, &ts);
+        }
+        atomic_store(&waiting, 0);
+        pthread_mutex_unlock(&m);
+    }
+    if (trace_wait) {
+        uint64_t end = plat_now_ns();
+        atomic_fetch_add_explicit(&trace_drain_ns, end - trace_wait, memory_order_relaxed);
+    }
+    if (atomic_exchange(&failed, 0)) FATAL("deferred vkQueueSubmit2 failed (see the log above)\n");
 }
 
 // ---- an entry of the caller's own: fn(arg) on the recording thread, in order with the commands around it (exec.c: a
@@ -683,7 +731,9 @@ static void R_QueueSubmit2(void *p) {
     q += ARR(VkCommandBufferSubmitInfo, a->si.commandBufferInfoCount);
     a->si.pSignalSemaphoreInfos = (const VkSemaphoreSubmitInfo *)q;
     vk_timing_driver(1, &a->si, false);
+    uint64_t t0 = vkq_probe ? plat_now_ns() : 0;
     VkResult r = vkd_QueueSubmit2(a->q, 1, &a->si, VK_NULL_HANDLE);
+    if (t0) atomic_fetch_add_explicit(&vkq_submit_ns, plat_now_ns() - t0, memory_order_relaxed);
     vk_timing_driver(1, &a->si, true);
     if (r != VK_SUCCESS) {
         LOG("[vk] deferred vkQueueSubmit2: %d\n", r);
