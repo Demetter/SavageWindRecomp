@@ -3989,11 +3989,12 @@ static VkDescriptorBufferInfo taa_cam_copy(uint64_t addr, uint64_t size) {
 // cut: a word changing by more than a quarter of its magnitude + 1 m; BOTW's terrain clipmap swaps levels between
 // frames), gets zeros: its velocity is unknown there (w 0) and the camera's is used. The copies the draw binds are
 // made here, at draw time: the descriptor worker builds its sets later (t_vel_prev).
-// SAVAGEWIND_MV_OBJECTS=1: on with DLAA or DLSS (user play test, 26 Oct: "working much better", but 75-110 fps: the cost
-// is being cut); 0 or unset: the camera's motion only. PERFX bit 512 (SAVAGEWIND_PERFX_AB): on / off by blocks of frames.
+// On whenever DLAA or DLSS is (what DLSS is meant to be given: user play test, 26 Oct, "working much better"; ~1.4 ms at
+// the Plateau, the second vertex pass of what moves by itself); SAVAGEWIND_MV_OBJECTS=0: the camera's motion only.
+// PERFX bit 512 (SAVAGEWIND_PERFX_AB): on / off by blocks of frames.
 static bool mvo_wanted(void) {
     static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_MV_OBJECTS") ? atoi(getenv("SAVAGEWIND_MV_OBJECTS")) : 0;
+    if (on < 0) on = getenv("SAVAGEWIND_MV_OBJECTS") ? atoi(getenv("SAVAGEWIND_MV_OBJECTS")) : 1;
     return on && dlaa_wanted() && (!perfx_trial(PERFX_MVO) || perfx(PERFX_MVO));
 }
 #define MVO_TAB (1u << 16)
