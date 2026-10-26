@@ -16,6 +16,9 @@
 typedef __uint128_t u128;
 #define SI static inline __attribute__((always_inline))
 #define SN static __attribute__((noinline))
+// The slow paths (SN) take the FPCR, not the Cpu: in a native function the V registers and FPCR are a local Cpu
+// (tools/native.py), kept in host registers only while its address stays in the function. They read c->fpcr only.
+#define SIMD_SLOW_CPU(f) Cpu c_slow_; c_slow_.fpcr = (f); Cpu *c = &c_slow_
 #define SIMD_CAT2(a, b) a##_##b
 #define SIMD_CAT(a, b) SIMD_CAT2(a, b)
 
@@ -337,8 +340,9 @@ SI double simd_s2d(Cpu *c, float x) {
     }
     return (double)fv_s(u);
 }
-SN float simd_d2s_slow(Cpu *c, double x) {
+SN float simd_d2s_slow(uint64_t fpcr_, double x) {
 #pragma STDC FENV_ACCESS ON
+    SIMD_SLOW_CPU(fpcr_);
     int mode = simd_fe_mode(c->fpcr);
     if (mode == FE_TONEAREST) return (float)x;  // (FZ alone: flushed by the caller)
     int old = simd_getround();
@@ -357,7 +361,7 @@ SI float simd_d2s(Cpu *c, double x) {
     x = fv_d(u);
     if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) {
         if ((c->fpcr & FPCR_FZ) && __builtin_fabs(x) < 0x1p-126 && x != 0) return fv_s((uint32_t)(u >> 63) << 31);
-        return simd_d2s_slow(c, x);
+        return simd_d2s_slow(c->fpcr, x);
     }
     return (float)x;
 }

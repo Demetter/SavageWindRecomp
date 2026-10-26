@@ -184,12 +184,25 @@ RE_FLAGOP = re.compile(r'\b(adds|subs|adcs|sbcs|adc|sbc|logic)(32|64)\(c,')
 RE_COND = re.compile(r'\b(COND_[A-Z]{2}|FLAG_[NZCV])\(c\)')
 
 
+# A native function is called with the Cpu as cg. Its c is a Cpu of its own on its stack, of which only the V registers
+# and FPCR are used: the SIMD lowering and simd.h's helpers keep working on c->v[] and c->fpcr, and since the address
+# never leaves the function (the out-of-line slow paths get the FPCR's value, simd.h SIMD_SLOW_CPU), the compiler keeps
+# those fields in host registers, across calls too. Everything else of the Cpu (x0-x18, x30, pc, the exclusive monitor,
+# TLS, FPSR) stays cg's; the kernel, exclusive loads and stores, dispatch and calls get cg.
+RE_CG = re.compile(r'(?<![\w>])c->(x\[\d+\]|(?:pc|tpidrro|tpidr|excl_addr|excl_val|thread|fpsr)\b)')
+RE_CG_CALL = re.compile(r'\b(ldx\d+|stx\d+|rt_svc|rt_udf|rt_brk)\(c,')
+
+
 def rewrite(code):
     code = RE_X.sub(r'x\1', code)
     code = RE_FLAGOP.sub(r'n\1\2(&fl,', code)
     code = RE_COND.sub(r'\1(&fl)', code)
     code = code.replace('c->nzcv', 'fl.nzcv')
-    return re.sub(r'c->sp\b', 'sp', code)
+    code = re.sub(r'c->sp\b', 'sp', code)
+    code = RE_CG.sub(r'cg->\1', code)
+    code = RE_CG_CALL.sub(r'\1(cg,', code)
+    # MSR FPCR: the thread's (MXCSR, cg) and this function's copy
+    return re.sub(r'rt_fpcr_write\(c, ([^;]*)\);', r'rt_fpcr_write(cg, \1); c->fpcr = cg->fpcr;', code)
 
 
 # Placeholders the body is written with; expanded once the locals it uses are known (finish):
@@ -208,34 +221,51 @@ RE_LOCAL = re.compile(r'\b(x(?:[0-9]|1[0-9]|2[0-9])|sp|fl)\b' if ALL_REGS else r
 
 
 def finish(lines):
-    """Expands the placeholders and puts the locals' declarations after FN_ENTER (lines[1])."""
+    """Expands the placeholders and puts the locals' declarations after FN_ENTER_N (lines[1])."""
     body = '\n'.join(lines[2:])
     used = set(RE_LOCAL.findall(re.sub(r'/\*@\w+\*/|c->sp\b|c->x\[\d+\]|c->nzcv', '', body)))
     xs = [r for r in range(NREG) if f'x{r}' in used]
     has_sp, has_fl = 'sp' in used, 'fl' in used
+    # (its own Cpu, for V and FPCR: c named, or one of simd.h's macros that use c)
+    has_v = re.search(r'(?<![\w>])c\b|\b(VU|VREG|VQ|VW|VS8|VS16|VS32|VS64|VSF32|VSF64|VHI64|VGET|VSETL|FP_SETS|FP_SETD|'
+                      r'SV_FOP_S|SV_FOP_D)\(', re.sub(r'/\*@\w+\*/', '', body)) is not None
     spills = PRE_LEGACY in body
 
     def st(rs):
-        return ''.join(f' c->x[{r}] = x{r};' for r in xs if r in rs)
+        return ''.join(f' cg->x[{r}] = x{r};' for r in xs if r in rs)
 
     def ld(rs):
-        return ''.join(f' x{r} = c->x[{r}];' for r in xs if r in rs)
+        return ''.join(f' x{r} = cg->x[{r}];' for r in xs if r in rs)
 
-    st_sp = ' c->sp = sp;' if has_sp else ''
-    st_fl = ' c->nzcv = fl.nzcv;' if has_fl else ''
-    ld_fl = ' fl.nzcv = c->nzcv;' if has_fl else ''
+    def st_v(rs):  # (a store of a value unchanged since it was loaded from cg is dropped by the compiler)
+        return ''.join(f' cg->v[{r}] = c->v[{r}];' for r in rs) if has_v else ''
+
+    def ld_v(rs):
+        return (''.join(f' c->v[{r}] = cg->v[{r}];' for r in rs) + ' c->fpcr = cg->fpcr;') if has_v else ''
+
+    st_sp = ' cg->sp = sp;' if has_sp else ''
+    st_fl = ' cg->nzcv = fl.nzcv;' if has_fl else ''
+    ld_fl = ' fl.nzcv = cg->nzcv;' if has_fl else ''
     keep = CS if spills else (29,)  # (the frame chain always; x19-x28 again once spilled)
-    rep = {PRE_CALL: st(ARGS) + st((29,)) + st_sp, POST_CALL: ld(RES) + ld_fl,
+    v_args, v_res, v_cs, v_all = range(8), range(4), range(8, 16), range(32)
+    # (after a call v0-v7 are loaded back, not only the results: the next call's stores of the ones not changed since
+    # then are dropped)
+    rep = {PRE_CALL: st(ARGS) + st((29,)) + st_sp + st_v(v_args), POST_CALL: ld(RES) + ld_fl + ld_v(v_args),
            PRE_SVC: st(ARGS) + st_sp, POST_SVC: ld(range(8)) + ld_fl,
-           PRE_TAIL: st(ARGS) + st(keep) + st_sp,
-           PRE_LEGACY: st(range(NREG)) + st_sp + st_fl, POST_LEGACY: ld(range(NREG)) + ld_fl,
-           PRE_RET: st(RES) + (st(CS) if spills else '') + st_sp + st_fl}
+           PRE_TAIL: st(ARGS) + st(keep) + st_sp + st_v(v_args) + (st_v(v_cs) if spills else ''),
+           PRE_LEGACY: st(range(NREG)) + st_sp + st_fl + st_v(v_all),
+           POST_LEGACY: ld(range(NREG)) + ld_fl + ld_v(v_all),
+           PRE_RET: st(RES) + (st(CS) if spills else '') + st_sp + st_fl + st_v(v_res) +
+           (st_v(v_cs) if spills else '')}
     out = lines[:2]
-    decl = [f'uint64_t x{r} = c->x[{r}];' for r in xs]
+    decl = [f'uint64_t x{r} = cg->x[{r}];' for r in xs]
     if has_sp:
-        decl.append('uint64_t sp = c->sp;')
+        decl.append('uint64_t sp = cg->sp;')
     if has_fl:
-        decl.append('NFlags fl = {c->nzcv};')
+        decl.append('NFlags fl = {cg->nzcv};')
+    if has_v:
+        decl.append('Cpu c_; Cpu *const restrict c = &c_; c_.fpcr = cg->fpcr;' +
+                    ''.join(f' c_.v[{r}] = cg->v[{r}];' for r in v_all))
     if decl:
         out.append('    ' + ' '.join(decl))
     for l in lines[2:]:

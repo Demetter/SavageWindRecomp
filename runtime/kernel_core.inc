@@ -20,6 +20,10 @@ static int g_cores_on = -1;
 #ifndef CORE_B2_BITS
 #define CORE_B2_BITS() 0
 #endif
+// (kernel.c) after a thread takes or lets go of its core: what the generated code's inline preemption check reads
+#ifndef CORE_HELD_CHANGED
+#define CORE_HELD_CHANGED(t) ((void)0)
+#endif
 // The best (lowest) priority among the threads waiting for each core, INT_MAX with none: what dispatch.c checks at every
 // indirect call (kernel_preempt). SAVAGEWIND_NO_PREEMPT=1: kept at INT_MAX (preemption at syscalls only, as before).
 // One cache line per core, written only when it changes: every indirect call of every guest thread reads its core's
@@ -99,6 +103,7 @@ static void core_acquire(KThread *t) {
     core_best_update(k);
     if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
     t->core_held = k->owner == t ? idx : -1;
+    CORE_HELD_CHANGED(t);
     pthread_mutex_unlock(&k->m);
 }
 
@@ -108,6 +113,7 @@ static void core_release(KThread *t) {
     pthread_mutex_lock(&k->m);
     if (k->owner == t) k->owner = NULL;
     t->core_held = -1;
+    CORE_HELD_CHANGED(t);
     if (!core_direct_wake() || k->overflow || g_rt_unwind) core_wake_all(k);
     else if (k->nwaiting) pthread_cond_signal(&core_best_waiter(k)->core_cond);
     pthread_mutex_unlock(&k->m);

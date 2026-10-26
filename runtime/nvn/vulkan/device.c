@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "../../framepace.h"
+#include "../../platform.h"
 #include "../../imageload.h"
 #include "../../paths.h"
 #include "../../settings.h"
@@ -1013,7 +1014,33 @@ static VkPresentInfoKHR pres_info;
 static VkSwapchainKHR pres_sc;
 static VkSemaphore pres_sem;
 static uint32_t pres_img;
+static uint64_t pres_seq;        // the submission that finishes the frame
 static _Atomic int pres_stale;   // that present said the swapchain is out of date or suboptimal
+
+// SAVAGEWIND_PRESENT_GRID=1: frames reach the screen on the pace's grid. With VSync off (or Fast) a frame is shown as
+// soon as its present is made and the GPU has drawn it, so the frames went out as unevenly as the GPU finished them:
+// ~1 ms standard deviation at a steady 120 fps (26 Oct, Plateau), on presents spaced to 0.2 ms. The present thread now
+// waits for the frame's submission, then until a frame period after the last present, and presents then; a frame
+// that is late goes at once and the grid starts again from it. It adds the frame's early part to the latency (up to a
+// period), so it is off by default. With VSync On the display paces them already: not used there.
+static bool present_grid(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_PRESENT_GRID") && atoi(getenv("SAVAGEWIND_PRESENT_GRID"));
+    return on && g_vk.sc_mode != VK_PRESENT_MODE_FIFO_KHR && g_vk.sc_mode != VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+}
+static void present_on_grid(uint64_t seq) {
+    static uint64_t last;
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                              .pSemaphores = &g_vk.timeline, .pValues = &seq};
+    if (seq && vkWaitSemaphores(g_vk.dev, &wi, 200000000ull) != VK_SUCCESS) { last = 0; return; }
+    uint64_t period = framepace_period_ns(), now = plat_now_ns();
+    if (last && now < last + period) {
+        plat_sleep_until_ns(last + period);
+        last += period;
+    } else {
+        last = now;
+    }
+}
 
 static void *present_thread(void *arg) {
     (void)arg;
@@ -1021,7 +1048,9 @@ static void *present_thread(void *arg) {
     for (;;) {
         while (!pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
         VkPresentInfoKHR pi = pres_info;
+        uint64_t seq = pres_seq;
         pthread_mutex_unlock(&pres_m);
+        if (present_grid()) present_on_grid(seq);
         VkResult r = queue_present(g_vk.present_queue, &pi);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&pres_stale, 1);
         else if (r != VK_SUCCESS) { static int n; if (n++ < 5) LOG("[vk] present failed: %d\n", r); }
@@ -1050,7 +1079,7 @@ void vk_present_idle(void) {
 }
 
 // Present window image img once sem is signalled. Returns false when the swapchain must be made again.
-static bool present_image(uint32_t img, VkSemaphore sem) {
+static bool present_image(uint32_t img, VkSemaphore sem, uint64_t seq) {
     if (!present_threaded()) {
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &sem,
                                .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
@@ -1062,6 +1091,7 @@ static bool present_image(uint32_t img, VkSemaphore sem) {
     pres_sc = g_vk.swapchain;
     pres_sem = sem;
     pres_img = img;
+    pres_seq = seq;
     pres_info = (VkPresentInfoKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &pres_sem,
                                    .swapchainCount = 1, .pSwapchains = &pres_sc, .pImageIndices = &pres_img};
     pres_busy = true;
@@ -1219,7 +1249,7 @@ void vk_frame_end(const char *shot_path) {
     present_trace_mark("Submit presentation commands", &trace_submit);
     g_present_split[3] += SDL_GetTicksNS() - ts;
     ts = SDL_GetTicksNS();
-    if (!present_image(img, done_sem[img])) recreate_swapchain();
+    if (!present_image(img, done_sem[img], seq)) recreate_swapchain();
     present_trace_mark("Queue presentation", &trace_submit);
     g_present_split[4] += SDL_GetTicksNS() - ts;
     cur_frame.ok = false;

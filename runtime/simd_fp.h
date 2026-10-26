@@ -28,12 +28,14 @@ SI T FN(fz)(Cpu *c, T x) { return SIMD_HOST_FP ? x : FN(fzx)(c, x); }
 SI T FN(neg)(T x) { return FN(fv)(FN(fb)(x) ^ SGN); }
 
 // FPProcessNaN(s): first signalling NaN (quietened), else first quiet NaN, else (invalid op) default NaN
-SN T FN(nan1)(Cpu *c, T a) {
+SN T FN(nan1)(uint64_t fpcr_, T a) {
+    SIMD_SLOW_CPU(fpcr_);
     U x = FN(fb)(a);
     if (!(c->fpcr & FPCR_DN) && FN(isnan)(x)) return FN(fv)(x | QB);
     return FN(fv)(DNAN);
 }
-SN T FN(nan2)(Cpu *c, T a, T b) {
+SN T FN(nan2)(uint64_t fpcr_, T a, T b) {
+    SIMD_SLOW_CPU(fpcr_);
     U x = FN(fb)(a), y = FN(fb)(b);
     if (!(c->fpcr & FPCR_DN)) {
         if (FN(issnan)(x)) return FN(fv)(x | QB);
@@ -43,7 +45,8 @@ SN T FN(nan2)(Cpu *c, T a, T b) {
     }
     return FN(fv)(DNAN);
 }
-SN T FN(nan3)(Cpu *c, T a, T b, T d) {
+SN T FN(nan3)(uint64_t fpcr_, T a, T b, T d) {
+    SIMD_SLOW_CPU(fpcr_);
     U x = FN(fb)(a), y = FN(fb)(b), z = FN(fb)(d);
     if (!(c->fpcr & FPCR_DN)) {
         if (FN(issnan)(x)) return FN(fv)(x | QB);
@@ -93,17 +96,18 @@ SN T FN(rsqrts)(T a, T b) {
 }
 
 // ARM result for a lane flagged by FBAD. (The fast paths' operands aren't flushed: FZ is the host's there.)
-SN T FN(fix)(Cpu *c, int op, T a, T b, T d) {
+SN T FN(fix)(uint64_t fpcr_, int op, T a, T b, T d) {
+    SIMD_SLOW_CPU(fpcr_);
     a = FN(fzx)(c, a), b = FN(fzx)(c, b), d = FN(fzx)(c, d);
     U x = FN(fb)(a), y = FN(fb)(b), z = FN(fb)(d);
     int nan = FN(isnan)(x) || FN(isnan)(y);
     switch (op) {
-    case FOP_SQRT: return FN(nan1)(c, a); // NaN in, or negative -> default NaN
+    case FOP_SQRT: return FN(nan1)(c->fpcr, a); // NaN in, or negative -> default NaN
     case FOP_MADD:
         if (FN(isnan)(x) || FN(isnan)(y) || FN(isnan)(z)) {
             if (FN(isqnan)(x) && ((FN(isinf)(y) && FN(iszero)(z)) || (FN(iszero)(y) && FN(isinf)(z))))
                 return FN(fv)(DNAN);
-            return FN(nan3)(c, a, b, d);
+            return FN(nan3)(c->fpcr, a, b, d);
         }
         return FN(fv)(DNAN);
     case FOP_MULX:
@@ -118,10 +122,10 @@ SN T FN(fix)(Cpu *c, int op, T a, T b, T d) {
             return FN(rsqrts)(a, b);
         }
         break;
-    case FOP_NMUL: return FN(neg)(FN(nan2)(c, a, b));
-    case FOP_ABD: return FN(fv)(FN(fb)(FN(nan2)(c, a, b)) & ~SGN);
+    case FOP_NMUL: return FN(neg)(FN(nan2)(c->fpcr, a, b));
+    case FOP_ABD: return FN(fv)(FN(fb)(FN(nan2)(c->fpcr, a, b)) & ~SGN);
     }
-    return FN(nan2)(c, a, b);
+    return FN(nan2)(c->fpcr, a, b);
 }
 
 // FMAX/FMIN/FMAXNM/FMINNM (operands already flushed)
@@ -132,7 +136,7 @@ SI T FN(minmax)(Cpu *c, int op, T a, T b) {
             if (FN(isqnan)(x) && !FN(isnan)(y)) return b;
             if (FN(isqnan)(y) && !FN(isnan)(x)) return a;
         }
-        return FN(nan2)(c, a, b);
+        return FN(nan2)(c->fpcr, a, b);
     }
     if (op == FOP_MAX || op == FOP_MAXNM) return a == b ? FN(fv)(x & y) : a > b ? a : b;
     return a == b ? FN(fv)(x | y) : a < b ? a : b;
@@ -141,8 +145,9 @@ SI T FN(minmax)(Cpu *c, int op, T a, T b) {
 
 // FPCR.FZ / RMode path: flush inputs, round in the FPCR mode, flush tiny results (tininess is detected
 // before rounding on ARM: a result rounded up to the smallest normal is recomputed toward zero).
-SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
+SN T FN(slow)(uint64_t fpcr_, int op, T a, T b, T d) {
 #pragma STDC FENV_ACCESS ON
+    SIMD_SLOW_CPU(fpcr_);
     uint64_t fpcr = c->fpcr;
     if (fpcr & FPCR_FZ) a = FN(flush)(a), b = FN(flush)(b), d = FN(flush)(d);
     if (FMINMAX(op)) return FN(minmax)(c, op, a, b);
@@ -152,7 +157,7 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
     volatile T va = a, vb = b, vd = d;
     volatile T vr = op == FOP_RSQRTS ? FN(rsqrts)(va, vb) : FCALC(op, va, vb, vd, K);
     T r = vr;
-    if (FBAD(op, r)) vr = FN(fix)(c, op, a, b, d), r = vr;
+    if (FBAD(op, r)) vr = FN(fix)(c->fpcr, op, a, b, d), r = vr;
     if ((fpcr & FPCR_FZ) && (FN(fb)(r) & ~SGN) <= MINN && !FN(iszero)(FN(fb)(r))) {
         if ((FN(fb)(r) & ~SGN) == MINN) {
             if (!set) old = simd_getround(), set = 1;
@@ -169,14 +174,15 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
 
 // Scalar FP op (constant op folds the selection).
 SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
-    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(slow)(c, op, a, b, d);
+    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(slow)(c->fpcr, op, a, b, d);
     if (FMINMAX(op)) return FN(minmax)(c, op, FN(fzx)(c, a), FN(fzx)(c, b));  // (picks an operand: flushed by hand)
     T r = FCALC(op, a, b, d, K);
-    if (FCHECK(op) && __builtin_expect(FBAD(op, r), 0)) r = FN(fix)(c, op, a, b, d);
+    if (FCHECK(op) && __builtin_expect(FBAD(op, r), 0)) r = FN(fix)(c->fpcr, op, a, b, d);
     return r;
 }
 
-SN VT FN(vslow)(Cpu *c, int op, VT a, VT b, VT d) {
+SN VT FN(vslow)(uint64_t fpcr_, int op, VT a, VT b, VT d) {
+    SIMD_SLOW_CPU(fpcr_);
     VT r;
     for (int i = 0; i < NL; i++) r[i] = FN(op)(c, op, a[i], b[i], d[i]);
     return r;
@@ -196,11 +202,11 @@ SI VT FN(vfz)(Cpu *c, VT a) { return SIMD_HOST_FP ? a : FN(vfzx)(c, a); }
 
 // Vector FP op: native lanes, any NaN (or an FPCR_SLOW setting) reruns all lanes through the scalar path.
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
-    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(vslow)(c, op, a, b, d);
+    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(vslow)(c->fpcr, op, a, b, d);
     VT r;
     if (FMINMAX(op)) {
         a = FN(vfzx)(c, a), b = FN(vfzx)(c, b);  // (picks an operand: flushed by hand)
-        if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
+        if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0)) return FN(vslow)(c->fpcr, op, a, b, d);
         VTU x = (VTU)a, y = (VTU)b;
         if (op == FOP_MAX || op == FOP_MAXNM)
             r = (VT)FN(vsel)(a > b, x, FN(vsel)(a == b, x & y, y));
@@ -209,7 +215,7 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
         return r;
     }
     r = FCALC(op, a, b, d, VK);
-    if (FCHECK(op) && __builtin_expect(__builtin_reduce_or(FBAD(op, r)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
+    if (FCHECK(op) && __builtin_expect(__builtin_reduce_or(FBAD(op, r)) != 0, 0)) return FN(vslow)(c->fpcr, op, a, b, d);
     return r;
 }
 
@@ -244,7 +250,7 @@ SI T FN(frint)(Cpu *c, T x, int rm) {
     x = FN(fz)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     T r = FN(rnd)(x, rm);
-    if (!SIMD_HOST_FP && __builtin_expect(r != r, 0)) r = FN(nan1)(c, x);
+    if (!SIMD_HOST_FP && __builtin_expect(r != r, 0)) r = FN(nan1)(c->fpcr, x);
     return r;
 }
 SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
@@ -260,7 +266,7 @@ SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
     }
     if (!SIMD_HOST_FP && __builtin_expect(__builtin_reduce_or(r != r) != 0, 0))
         for (int i = 0; i < NL; i++)
-            if (r[i] != r[i]) r[i] = FN(nan1)(c, x[i]);
+            if (r[i] != r[i]) r[i] = FN(nan1)(c->fpcr, x[i]);
     return r;
 }
 
@@ -281,8 +287,9 @@ SI uint64_t FN(toint)(Cpu *c, T x, int rm, int fbits, int ib, int uns) {
 }
 
 // ---- integer -> FP (SCVTF/UCVTF, fixed point), rounded in the FPCR mode
-SN T FN(fromint_slow)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
+SN T FN(fromint_slow)(uint64_t fpcr_, uint64_t v, int ib, int uns, int fbits) {
 #pragma STDC FENV_ACCESS ON
+    SIMD_SLOW_CPU(fpcr_);
     int old = simd_getround();
     simd_setround(simd_fe_mode(c->fpcr));
     volatile uint64_t vv = v;
@@ -295,7 +302,7 @@ SN T FN(fromint_slow)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
     return x;
 }
 SI T FN(fromint)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
-    if (!SIMD_HOST_FP && __builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(fromint_slow)(c, v, ib, uns, fbits);  // (host: MXCSR rounds)
+    if (!SIMD_HOST_FP && __builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(fromint_slow)(c->fpcr, v, ib, uns, fbits);  // (host: MXCSR rounds)
     T r;
     if (uns) r = ib == 32 ? (T)(uint32_t)v : (T)v;
     else r = ib == 32 ? (T)(int32_t)v : (T)(int64_t)v;
@@ -306,7 +313,7 @@ SI T FN(fromint)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
 // ---- reciprocal estimates (bit-exact ARMv8.0 pseudocode)
 SI T FN(recpe)(Cpu *c, T a) {
     U x = FN(fb)(FN(fzx)(c, a)), s = x & SGN;
-    if (FN(isnan)(x)) return FN(nan1)(c, a);
+    if (FN(isnan)(x)) return FN(nan1)(c->fpcr, a);
     if (FN(isinf)(x)) return FN(fv)(s);
     if (FN(iszero)(x)) return FN(fv)(s | EXPM);
     U mag = x & ~SGN;
@@ -332,7 +339,7 @@ SI T FN(recpe)(Cpu *c, T a) {
 }
 SI T FN(rsqrte)(Cpu *c, T a) {
     U x = FN(fb)(FN(fzx)(c, a)), s = x & SGN;
-    if (FN(isnan)(x)) return FN(nan1)(c, a);
+    if (FN(isnan)(x)) return FN(nan1)(c->fpcr, a);
     if (FN(iszero)(x)) return FN(fv)(s | EXPM);
     if (s) return FN(fv)(DNAN);
     if (FN(isinf)(x)) return K(0);
@@ -349,7 +356,7 @@ SI T FN(rsqrte)(Cpu *c, T a) {
 }
 SI T FN(recpx)(Cpu *c, T a) {
     U x = FN(fb)(FN(fzx)(c, a)), s = x & SGN;
-    if (FN(isnan)(x)) return FN(nan1)(c, a);
+    if (FN(isnan)(x)) return FN(nan1)(c->fpcr, a);
     if (!(x & EXPM)) return FN(fv)(s | (EXPM - MINN));
     return FN(fv)(s | (~x & EXPM));
 }

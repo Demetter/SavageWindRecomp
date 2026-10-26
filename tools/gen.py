@@ -36,8 +36,22 @@ import layout
 # A guest indirect call (blr / br) through its call site's own cache of the last target (runtime/dispatch.c
 # rt_dispatch_site): the call happens here, a branch of its own for the CPU's predictor, instead of in rt_dispatch,
 # which every indirect call shared.
-SITE_CALL = '{ static const DispatchEnt *ds; rt_dispatch_site(c, &ds)(c); }'
-SITE_TAIL = '{ static const DispatchEnt *ds; __attribute__((musttail)) return rt_dispatch_site(c, &ds)(c); }'
+# The site's cached target is checked inline, as a native indirect call is a load and a call: the runtime
+# (rt_dispatch_site) only on a miss, a site's other targets, or when a better thread waits for this one's emulated core
+# (cpu.h RT_PREEMPT_DUE: kernel_preempt's condition, two loads).
+SITE_CALL = ('{ static const DispatchEnt *ds; const DispatchEnt *de = __atomic_load_n(&ds, __ATOMIC_ACQUIRE); '
+             'if (__builtin_expect(de && de->pc == c->pc && !RT_PREEMPT_DUE(c), 1)) de->fn(c); '
+             'else rt_dispatch_site(c, &ds)(c); }')
+SITE_TAIL = ('{ static const DispatchEnt *ds; const DispatchEnt *de = __atomic_load_n(&ds, __ATOMIC_ACQUIRE); '
+             'if (__builtin_expect(de && de->pc == c->pc && !RT_PREEMPT_DUE(c), 1)) __attribute__((musttail)) return de->fn(c); '
+             '__attribute__((musttail)) return rt_dispatch_site(c, &ds)(c); }')
+
+
+def site(s, ctx):  # (a native function's Cpu is cg: its c is the local one holding its V registers, tools/native.py)
+    if ctx == 'c':
+        return s
+    return (s.replace('(c, &ds)(c)', f'({ctx}, &ds)({ctx})').replace('de->fn(c)', f'de->fn({ctx})')
+            .replace('c->pc', f'{ctx}->pc').replace('RT_PREEMPT_DUE(c)', f'RT_PREEMPT_DUE({ctx})'))
 import native
 import patches
 from analyze import eh_frame_extents, eh_frame_functions
@@ -459,6 +473,9 @@ class Module:
             out = [f'void {fname(entry)}(Cpu *restrict c) {{', f'    FN_ENTER({hx(entry)});']
         nat = mode != 'resume' and self.native.get(entry, False)
         rw = native.rewrite if nat else (lambda s: s)
+        C = 'cg' if nat else 'c'  # (the Cpu the function was called with; in a native one c is its own, for V and FPCR)
+        if nat:
+            out = [f'void {fname(entry)}(Cpu *restrict cg) {{', f'    FN_ENTER_N({hx(entry)});']
 
         def ph(p):  # (a placeholder of a native function's, nothing otherwise)
             return p if nat else ''
@@ -477,15 +494,15 @@ class Module:
             if entry <= t < end:
                 return f'GUEST_LOOP_BARRIER(); goto L_{t:x};' if frm is not None and t <= frm else f'goto L_{t:x};'
             if not self.in_text(t):
-                return f'{ph(native.PRE_LEGACY)}c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
+                return f'{ph(native.PRE_LEGACY)}{C}->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch({C});'
             refs.add(t)
             pre = ph(native.PRE_TAIL if native_callee(t) else native.PRE_LEGACY)
-            return f'{pre}__attribute__((musttail)) return {fname(t)}(c);'
+            return f'{pre}__attribute__((musttail)) return {fname(t)}({C});'
 
         all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
         if all_labels:
             labels = set(range(entry, end, 4))
-        miss = (f'{ph(native.PRE_LEGACY)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
+        miss = (f'{ph(native.PRE_LEGACY)}__attribute__((musttail)) return {fname(entry)}_r({C});' if mode == 'fast'
                 else 'goto L_dispatch;')
         last = None
         for a in range(entry, end, 4):
@@ -530,13 +547,13 @@ class Module:
                     refs.add(t)
                     pre, post = ((native.PRE_CALL, native.POST_CALL) if native_callee(t)
                                  else (native.PRE_LEGACY, native.POST_LEGACY))
-                    out.append(f'    c->x[30] = {hx(a + 4)}; {ph(pre)}{fname(t)}(c);{ph(post)}')
+                    out.append(f'    {C}->x[30] = {hx(a + 4)}; {ph(pre)}{fname(t)}({C});{ph(post)}')
                 else:
-                    out.append(f'    c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; {ph(native.PRE_LEGACY)}rt_dispatch(c);'
+                    out.append(f'    {C}->x[30] = {hx(a + 4)}; {C}->pc = {hx(t)}; {ph(native.PRE_LEGACY)}rt_dispatch({C});'
                                f'{ph(native.POST_LEGACY)}')
             elif k == 'blr':  # (a function pointer or a virtual call: a function made as the convention says)
-                out.append(f'    c->pc = {rw(ins.target)}; c->x[30] = {hx(a + 4)}; {ph(native.PRE_CALL)}{SITE_CALL}'
-                           f'{ph(native.POST_CALL)}')
+                out.append(f'    {C}->pc = {rw(ins.target)}; {C}->x[30] = {hx(a + 4)}; {ph(native.PRE_CALL)}'
+                           f'{site(SITE_CALL, C)}{ph(native.POST_CALL)}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -545,15 +562,15 @@ class Module:
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: {jump(t, a)}' for t in jt)
                     out.append(f'    switch ({rw(ins.target)}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {rw(ins.target)}; {miss}')
+                    out.append(f'    {C}->pc = {rw(ins.target)}; {miss}')
                     continue
-                out.append(f'    c->pc = {rw(ins.target)}; {ph(native.PRE_LEGACY)}{SITE_TAIL}')
+                out.append(f'    {C}->pc = {rw(ins.target)}; {ph(native.PRE_LEGACY)}{site(SITE_TAIL, C)}')
             elif k == 'ret':
                 out.append(f'    {ph(native.PRE_RET)}return;')
             last = k
         flush()
         if last not in ('b', 'br', 'ret', 'trap'):
-            out.append('    ' + jump(end) if end < self.hi else f'    rt_udf(c, {hx(end)});')
+            out.append('    ' + jump(end) if end < self.hi else f'    rt_udf({C}, {hx(end)});')
         if all_labels:
             out.append('L_dispatch: GUEST_LOOP_BARRIER();')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))

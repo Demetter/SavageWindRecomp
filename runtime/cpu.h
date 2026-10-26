@@ -20,7 +20,11 @@ typedef struct __attribute__((aligned(16))) Cpu {
     void *thread;            // 312: runtime thread object
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
-    uint8_t _pad[512 - 336];
+    // (runtime/kernel.c) the best priority waiting for the emulated core this thread holds, or NULL (none held, or
+    // SAVAGEWIND_CORES=0), and the thread's priority: a call site's inline fast path checks them (RT_PREEMPT_DUE)
+    const volatile int *best_wait;  // 336
+    int32_t prio;                   // 344
+    uint8_t _pad[512 - 348];
     VReg v[32];              // 512
 } Cpu;
 
@@ -39,6 +43,9 @@ void rt_dispatch(Cpu *c);                 // call function at c->pc
 // site keeps a pointer to it and the call happens at the site (a branch of its own for the CPU's predictor).
 typedef struct DispatchEnt { uint64_t pc; GuestFn fn; } DispatchEnt;
 GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site);  // the function at c->pc, for the caller to call
+// A better thread waits for this thread's emulated core: an indirect call goes through rt_dispatch_site, whose
+// kernel_preempt hands it over (the generated code calls a site's cached target inline otherwise: tools/gen.py)
+#define RT_PREEMPT_DUE(c) ((c)->best_wait && *(c)->best_wait < (c)->prio)
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
 void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
@@ -68,6 +75,7 @@ typedef uint8_t __attribute__((may_alias)) u8a;
 extern volatile int g_fnprof;
 void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
+#define FN_ENTER_N(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, cg->x[30], cg->x[0]); } while (0)  // (native)
 
 // volatile: every guest load and store happens, in order, as on the console's CPU. Guest memory is shared with the
 // game's other threads: with plain accesses the compiler could keep a spinlock's word in a register for good (BOTW's

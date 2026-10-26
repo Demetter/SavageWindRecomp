@@ -178,6 +178,8 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 // Generated code has no preemption points of its own, so a long stretch without syscalls keeps the core.
 // SAVAGEWIND_CORES=0 lets every thread run at once, as before.
 #define CORE_B2_BITS() b2_bits()
+// (cpu.h RT_PREEMPT_DUE: the generated code's indirect calls check these inline, kernel_preempt's condition)
+#define CORE_HELD_CHANGED(t) ((t)->cpu.best_wait = (t)->core_held >= 0 ? &g_core_best_wait[(t)->core_held].v : NULL)
 #include "kernel_core.inc"
 
 // A thread that does a coprocessor's work runs beside the four cores, as on the console: the in-process audio
@@ -420,7 +422,7 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     pthread_cond_init(&t->core_cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
-    t->prio = t->base_prio = prio;
+    t->prio = t->base_prio = t->cpu.prio = prio;
     t->core = core < 0 ? 0 : core & 3;  // (-2: the process's default core, 0)
     t->core_held = -1;
     t->id = next_thread_id++;
@@ -497,7 +499,7 @@ static bool prio_inherit_on(void) {
 
 static void prio_set(KThread *t, int p) {
     if (t->prio == p) return;
-    t->prio = p;
+    t->prio = t->cpu.prio = p;
     if (!cores_on() || t->off_cores) return;
     core_priority_changed(t);
 }
