@@ -777,7 +777,7 @@ static int rm_rf(const char *p, bool keep_root) {
     return keep_root ? 0 : rmdir(p);
 }
 
-static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
+static void filesystem_cmd(Service *s, IpcReq *req, IpcResp *resp) {
     HostFs *fs = s->state;
     char p[2048], p2[2048];
     host_path(fs, in_path(req, 0), p, sizeof p);
@@ -841,6 +841,18 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     case 13: rm_rf(p, true); break;
     case 14: memset(resp->data, 0, 0x20); resp_size(resp, 0x20); break;
     default: LOG("[fs] IFileSystem cmd %u (ok)\n", req->cmd);
+    }
+}
+
+// The game waits for each request (often on its main thread): the slow ones are logged with their path.
+static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
+    uint64_t t0 = plat_now_ns();
+    filesystem_cmd(s, req, resp);
+    uint64_t ns = plat_now_ns() - t0;
+    if (ns > 1000000) {
+        char p[2048];
+        host_path(s->state, in_path(req, 0), p, sizeof p);
+        LOG("[fs] IFileSystem cmd %u took %.2f ms: %s\n", req->cmd, ns / 1e6, p);
     }
 }
 

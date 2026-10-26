@@ -28,6 +28,21 @@ __declspec(dllimport) int __stdcall MoveFileExA(const char *from, const char *to
 #endif
 
 VkG g_vk;
+uint64_t vk_mem_blocks, vk_mem_block_bytes;
+uint64_t renderer_present_count(void);
+static void VKAPI_PTR mem_allocated(VmaAllocator a, uint32_t type, VkDeviceMemory m, VkDeviceSize size, void *user) {
+    (void)a; (void)m; (void)user;
+    __atomic_add_fetch(&vk_mem_blocks, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&vk_mem_block_bytes, size, __ATOMIC_RELAXED);
+    static int log = -1;  // SAVAGEWIND_IMAGE_ALLOC_LOG=1 (textures.c): also every device memory block
+    if (log < 0) log = getenv("SAVAGEWIND_IMAGE_ALLOC_LOG") ? atoi(getenv("SAVAGEWIND_IMAGE_ALLOC_LOG")) : 0;
+    if (log) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+        LOG("[mem-alloc] frame %llu type %u flags %#x: %.1f MB (%llu blocks)\n", (unsigned long long)renderer_present_count(),
+            type, mp.memoryTypes[type].propertyFlags, size / 1048576.0, (unsigned long long)vk_mem_blocks);
+    }
+}
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
@@ -432,9 +447,10 @@ static void create_device(void) {
     g_vk.present_queue = g_vk.queue;
     if (qi.queueCount == 2) vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 1, &g_vk.present_queue);
 
+    static const VmaDeviceMemoryCallbacks mem_cb = {.pfnAllocate = mem_allocated};
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .flags = g_vk.native_multi_draw ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0,
-                                 .vulkanApiVersion = VK_API_VERSION_1_3};
+                                 .pDeviceMemoryCallbacks = &mem_cb, .vulkanApiVersion = VK_API_VERSION_1_3};
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,

@@ -432,7 +432,20 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     // 2D color targets may be sampled by the draws that render into them (exec.c resolve_feedback: a feedback loop)
     b->feedback_ok = g_vk.feedback_loop && type == VK_IMAGE_TYPE_2D && samples == 1 && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     if (b->feedback_ok) ci.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    static int alloc_log = -1;  // SAVAGEWIND_IMAGE_ALLOC_LOG=1: every image; otherwise the ones that took over 2 ms
+    if (alloc_log < 0) alloc_log = getenv("SAVAGEWIND_IMAGE_ALLOC_LOG") ? atoi(getenv("SAVAGEWIND_IMAGE_ALLOC_LOG")) : 0;
+    uint64_t alloc_t0 = plat_now_ns(), blocks0 = __atomic_load_n(&vk_mem_blocks, __ATOMIC_RELAXED);
     VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
+    uint64_t alloc_ns = plat_now_ns() - alloc_t0;
+    if (r == VK_SUCCESS && (alloc_log || alloc_ns > 2000000)) {
+        VmaAllocationInfo2 info;
+        vmaGetAllocationInfo2(g_vk.vma, b->mem, &info);
+        LOG("[img-alloc] frame %llu %ux%ux%u L%u M%u fmt %d usage %#x: %.2f ms, %s %.1f MB, block %.0f MB, %llu new blocks "
+            "(%llu, %.0f MB in all)\n", (unsigned long long)renderer_present_count(), tw, th, depth, layers, levels, vf,
+            ci.usage, alloc_ns / 1e6, info.dedicatedMemory ? "dedicated" : "placed", info.allocationInfo.size / 1048576.0,
+            info.blockSize / 1048576.0, (unsigned long long)(__atomic_load_n(&vk_mem_blocks, __ATOMIC_RELAXED) - blocks0),
+            (unsigned long long)vk_mem_blocks, vk_mem_block_bytes / 1048576.0);
+    }
     if (r != VK_SUCCESS && b->feedback_ok) {
         b->feedback_ok = false;
         ci.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;

@@ -72,6 +72,8 @@ typedef struct {
     VkImageView sc_views[8];
 } VkG;
 extern VkG g_vk;
+// device memory blocks VMA has allocated so far, and their bytes (device.c: VMA's allocation callback)
+extern uint64_t vk_mem_blocks, vk_mem_block_bytes;
 static inline bool vk_native_draw_active(uint64_t frame) {
     return g_vk.native_multi_draw && (!g_vk.native_multi_draw_ab ||
         frame < g_vk.native_multi_draw_ab || frame >= g_vk.native_multi_draw_ab + 4 || (frame & 1));
