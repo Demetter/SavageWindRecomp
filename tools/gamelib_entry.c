@@ -14,3 +14,8 @@ GAMELIB_EXPORT const GameLibTables *swgame_tables(void) {
                                     game_version, game_sites, &game_site_count};
     return &t;
 }
+
+#ifdef SW_PGO_GEN  // (a profile-instrumented build: the app has the library write its profile before it exits, gamelib.c)
+int __llvm_profile_write_file(void);
+GAMELIB_EXPORT int swgame_profile_write(void) { return __llvm_profile_write_file(); }
+#endif

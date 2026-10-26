@@ -1468,6 +1468,18 @@ survey_account:;
             if (*next == ',') next++;
         }
     }
+    {   // SAVAGEWIND_PGO_EXIT_AT=<frame> (counted as SAVAGEWIND_SHOT_AT): a profile-instrumented build writes its profiles
+        // and exits there (runtime/gamelib.c)
+        static long at = -1;
+        if (at < 0) at = getenv("SAVAGEWIND_PGO_EXIT_AT") ? atol(getenv("SAVAGEWIND_PGO_EXIT_AT")) : 0;
+        if (at > 0 && (long)script_frame >= at) {
+            extern void gamelib_profile_write(void);
+            LOG("[pgo] writing the profiles at frame %llu\n", (unsigned long long)script_frame);
+            gamelib_profile_write();
+            plat_trace_flush();
+            _exit(0);
+        }
+    }
     if(g_vk.native_multi_draw_ab && total_frames-1 >= g_vk.native_multi_draw_ab &&
         total_frames-1 < g_vk.native_multi_draw_ab+4) {
         uint64_t rendered=total_frames-1;bool native=vk_native_draw_active(rendered);

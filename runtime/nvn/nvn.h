@@ -34,6 +34,8 @@ typedef struct NvnTexture {
     uint64_t backend_used_frame; // last use of this texture holder, not another alias of its image
     uint64_t debug_id;
     bool finalized;  // nvnTextureFinalize ran (the object stays: pool entries and copies may still name it)
+    bool zombie;     // (Vulkan backend) in textures.c's list of finalized textures holding an image
+    uint32_t init_gen;  // initializes of this host object (texture interning hands it back): a finalize queued before the last is dropped
     uint32_t cpu_levels;  // levels nvnTextureWriteTexels filled since the renderer last uploaded them (bit per level)
     char label[64];
 } NvnTexture;

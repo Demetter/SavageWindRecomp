@@ -624,7 +624,7 @@ static uint32_t errno_result(void) {
 // IFile Flush. BOTW's autosave (game_data.sav near a stable, say) flushes from a thread its main thread then waits for,
 // and a flush to disk takes milliseconds: a hitch. What was written is in the system's cache already (pwrite), so the
 // flush to disk goes to a thread of its own, on a copy of the descriptor that it closes after; the game goes on.
-// SAVAGEWIND_SYNC_FLUSH=1: on the calling thread, as before.
+// SAVAGEWIND_SAVE_FLUSH_WAIT=1: on the calling thread, as before.
 #include <pthread.h>
 static pthread_mutex_t flush_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t flush_cv = PTHREAD_COND_INITIALIZER;
@@ -652,7 +652,7 @@ static void flush_start(void) {
 static void file_flush(int fd) {
     static int sync_flush = -1;
     static pthread_once_t once = PTHREAD_ONCE_INIT;
-    if (sync_flush < 0) sync_flush = getenv("SAVAGEWIND_SYNC_FLUSH") != NULL;
+    if (sync_flush < 0) sync_flush = getenv("SAVAGEWIND_SAVE_FLUSH_WAIT") != NULL;
     if (!sync_flush) pthread_once(&once, flush_start);
     int d = !sync_flush && flush_started ? dup(fd) : -1;
     if (d >= 0) {

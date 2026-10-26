@@ -11,6 +11,7 @@
 #include "../perfmon.h"
 #include "nvn.h"
 #include "texture_registry.h"
+#include "texture_intern.h"
 #ifndef __APPLE__
 #include "vulkan/frame_trace.h"
 #else
@@ -220,6 +221,7 @@ static void frame_split_log(void) {
     #undef FS
 }
 
+static void texture_finalize_queued(NvnTexture *t, uint32_t gen);
 static void qop_run(const QOp *o) {
     if (o->queued_ns) {
         static const char *names[] = {"Queued command list", "Queued fence", "Queued present", "Queued texture release", "Queued sync release"};
@@ -243,7 +245,7 @@ static void qop_run(const QOp *o) {
         backend_present(o->p);
         if (frame_split()) frame_split_log();
         break;
-    case QOP_TEXTURE_FINALIZE: backend_texture_destroyed(o->p); ((NvnTexture *)o->p)->finalized = true; break;
+    case QOP_TEXTURE_FINALIZE: texture_finalize_queued(o->p, (uint32_t)o->a); break;
     case QOP_SYNC_FREE: free(o->p); break;
     }
 }
@@ -435,7 +437,9 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     static int flush = -1;
     static uint64_t n;
     if (flush < 0) flush = getenv("SAVAGEWIND_SYNC_FLUSH") ? 1 : 0;
-    if (getenv("SAVAGEWIND_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
+    static int log_sync = -1;
+    if (log_sync < 0) log_sync = getenv("SAVAGEWIND_LOG_SYNC") != NULL;
+    if (log_sync && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
     static int whole = -1;  // SAVAGEWIND_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("SAVAGEWIND_SYNC_ALL") ? 1 : 0;
     NvnSync *s = sync_of(A(0));
@@ -711,8 +715,7 @@ static uint64_t builder_storage_size(uint64_t b) {
 NVN(nvnTextureBuilderGetStorageSize) { RET(builder_storage_size(A(0))); }
 NVN(nvnTextureBuilderGetStorageAlignment) { RET(is_linear(A(0)) ? 32 : 512); }
 
-static NvnTexture *texture_from_builder(uint64_t b) {
-    NvnTexture *t = calloc(1, sizeof *t);
+static void texture_shape_from_builder(NvnTexture *t, uint64_t b) {  // (t zeroed)
     t->target = G(uint32_t, b, 0xC);
     t->flags = G(uint32_t, b, 8);
     t->width = G(uint32_t, b, 0x10);
@@ -729,8 +732,6 @@ static NvnTexture *texture_from_builder(uint64_t b) {
     t->pool_offset = G(uint64_t, b, 0x40);
     t->addr = t->pool ? t->pool->storage + t->pool_offset : 0;
     builder_layout(b, &t->layout);
-    t->debug_id = next_debug_id++;
-    return t;
 }
 
 // Every host texture of this boot (they are only freed by a reboot: see nvnTextureFinalize), so a guest NVNtexture
@@ -769,18 +770,79 @@ void nvn_debug_textures_at(uint64_t a) {
     pthread_mutex_unlock(&g_tex_lock);
 }
 
+// Texture interning (SAVAGEWIND_TEXTURE_INTERN=1; default off: a new host object for every initialize, as before).
+// BOTW initializes the same NVNtexture objects again every frame (the exposure chain: one object, a step per size), and
+// each initialize made a host object that lives until reboot: ~80 a frame, ~9 GB an hour, with the registry growing
+// and rehashing all the while. Initialized again with the shape one of its earlier host objects has, a guest object
+// gets that host object back: same storage, same image (textures.c finds images by storage and shape, not by holder).
+// Only a guest object's own earlier host objects are candidates, so two guest objects never share one, and Finalize on
+// one never reaches the other. SAVAGEWIND_TEXTURE_INTERN_PROBE=1 (either mode): counts every 600 frames.
+static TextureIntern g_tex_intern;  // (g_tex_lock)
+static uint64_t g_tex_inits, g_tex_reused, g_tex_hosts, g_tex_probe_frame;
+static bool texture_intern_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_TEXTURE_INTERN");
+        on = e && atoi(e) != 0;
+        if (on) LOG("[nvn] texture interning on\n");
+    }
+    return on;
+}
+static bool texture_intern_probe(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_TEXTURE_INTERN_PROBE") && atoi(getenv("SAVAGEWIND_TEXTURE_INTERN_PROBE"));
+    return on;
+}
+
+// Whether host texture h already has the shape s an initialize would give it (texture_shape_from_builder).
+static bool texture_same_shape(const void *h, const void *s) {
+    const NvnTexture *a = h, *b = s;
+    return a->target == b->target && a->flags == b->flags && a->width == b->width && a->height == b->height &&
+           a->depth == b->depth && a->levels == b->levels && a->format == b->format && a->samples == b->samples &&
+           !memcmp(a->swizzle, b->swizzle, sizeof a->swizzle) && a->ds_mode == b->ds_mode && a->stride == b->stride &&
+           a->pool == b->pool && a->pool_offset == b->pool_offset && a->addr == b->addr &&
+           a->layout.width == b->layout.width && a->layout.height == b->layout.height &&
+           a->layout.depth == b->layout.depth && a->layout.layers == b->layout.layers &&
+           a->layout.levels == b->layout.levels && a->layout.fmt == b->layout.fmt &&
+           a->layout.block_height_log2 == b->layout.block_height_log2 &&
+           a->layout.block_depth_log2 == b->layout.block_depth_log2;
+}
+
 RT_ON_RESET(tex_set_reset) {  // (after the renderer's reset: no image is left)
     texture_registry_clear(&g_tex_registry, free);
+    texture_intern_clear(&g_tex_intern);
+    g_tex_inits = g_tex_reused = g_tex_hosts = g_tex_probe_frame = 0;
 }
 
 NVN(nvnTextureInitialize) {
-    NvnTexture *t = texture_from_builder(A(1));
+    NvnTexture shape = {0};
+    texture_shape_from_builder(&shape, A(1));
+    pthread_mutex_lock(&g_tex_lock);
+    TextureInternEntry *e = texture_intern_on() ? texture_intern_entry(&g_tex_intern, A(0), true) : NULL;
+    NvnTexture *t = texture_intern_find(e, texture_same_shape, &shape);
+    g_tex_inits++;
+    if (t) {
+        g_tex_reused++;
+        t->finalized = false;
+    } else {
+        t = malloc(sizeof *t);
+        *t = shape;
+        t->debug_id = next_debug_id++;
+        tex_set_put((uintptr_t)t);
+        texture_intern_add(e, t);
+        g_tex_hosts++;
+    }
+    t->init_gen++;
+    if (texture_intern_probe() && renderer_present_count() >= g_tex_probe_frame + 600) {
+        g_tex_probe_frame = renderer_present_count();
+        LOG("[tex-intern] frame %llu on %d initializes %llu reused %llu host objects %llu guest objects %u\n",
+            (unsigned long long)g_tex_probe_frame, texture_intern_on(), (unsigned long long)g_tex_inits,
+            (unsigned long long)g_tex_reused, (unsigned long long)g_tex_hosts, g_tex_intern.count);
+    }
+    pthread_mutex_unlock(&g_tex_lock);
     if (t->flags & 2)
         LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", t, t->width, t->height,
             t->format, t->flags, t->target, t->addr, t->stride);
-    pthread_mutex_lock(&g_tex_lock);
-    tex_set_put((uintptr_t)t);
-    pthread_mutex_unlock(&g_tex_lock);
     SET_HOST(A(0), t);
     RET(1);
 }
@@ -801,12 +863,13 @@ NvnTexture *nvn_texture_host(uint64_t guest) {
 // Only the renderer's image goes; the host object stays, and so does the guest object's pointer to it. BOTW copies
 // NVNtexture objects and finalizes one copy while it keeps drawing with another, and keeps texture pool entries
 // registered with finalized textures: on hardware those just go on reading the texture's memory. (A texture
-// initialized again in the same object gets a new host object.)
+// initialized again in the same object gets a new host object, or with interning one of its earlier ones.)
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     if (!t) return;
     pthread_mutex_lock(&g_tex_lock);
     bool known = tex_set_has((uintptr_t)t);
+    uint32_t gen = known ? t->init_gen : 0;
     pthread_mutex_unlock(&g_tex_lock);
     if (!known) {
         static int logged;
@@ -814,9 +877,21 @@ NVN(nvnTextureFinalize) {
                               (unsigned long long)A(0), (unsigned long long)(uintptr_t)t, (unsigned long long)c->x[30]);
         return;
     }
-    if (async_exec()) { queue_put(QOP_TEXTURE_FINALIZE, 0, t); return; }  // (after the lists submitted before it)
+    if (async_exec()) { queue_put(QOP_TEXTURE_FINALIZE, gen, t); return; }  // (after the lists submitted before it)
     backend_texture_destroyed(t);
     t->finalized = true;
+}
+// A finalize that waited in the queue behind the lists submitted before it. If the object was initialized again
+// meanwhile (interning handed it back), that finalize belongs to the earlier use: the new one keeps the object live.
+static void texture_finalize_queued(NvnTexture *t, uint32_t gen) {
+    pthread_mutex_lock(&g_tex_lock);
+    bool current = t->init_gen == gen;
+    pthread_mutex_unlock(&g_tex_lock);
+    if (!current) return;
+    backend_texture_destroyed(t);  // (outside g_tex_lock: it takes the GPU lock)
+    pthread_mutex_lock(&g_tex_lock);
+    if (t->init_gen == gen) t->finalized = true;
+    pthread_mutex_unlock(&g_tex_lock);
 }
 NVN(nvnTextureSetDebugLabel) {
     NvnTexture *t = HOST(NvnTexture, A(0));

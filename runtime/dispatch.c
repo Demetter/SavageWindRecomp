@@ -229,7 +229,9 @@ GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site) {
     if (__builtin_expect(e && e->pc == pc, 1) && on) return e->fn;
     unsigned h = dcache_index(pc);
     GuestFn f = dcache[h].addr == pc ? dcache[h].fn : dispatch_slow(c);
-    if (on && !(pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE)) __atomic_store_n(site, dent_get(pc, f), __ATOMIC_RELEASE);
+    // only a site's first target: a site that calls several (virtual calls) keeps it and looks the others up, instead of
+    // taking dent_get's lock and writing a shared line on every change of target
+    if (on && !e && !(pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE)) __atomic_store_n(site, dent_get(pc, f), __ATOMIC_RELEASE);
     return f;
 }
 

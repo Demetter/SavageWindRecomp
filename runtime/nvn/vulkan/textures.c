@@ -640,8 +640,8 @@ static void zombies_expire(void) {  // (gpu lock held)
     for (int i = 0; i < g_nzombies; i++) {
         NvnTexture *t = g_zombies[i];
         TexBackend *b = t->backend;
-        if (!b) continue;
-        if (now - (per_holder ? t->backend_used_frame : b->used_frame) > PARK_FRAMES) { release_backend(t); released++; }
+        if (!b || !t->finalized) { t->zombie = false; continue; }  // (initialized again: live, it keeps its image)
+        if (now - (per_holder ? t->backend_used_frame : b->used_frame) > PARK_FRAMES) { release_backend(t); released++; t->zombie = false; }
         else g_zombies[k++] = t;
     }
     g_nzombies = k;
@@ -706,11 +706,15 @@ static TexBackend *tex_backend(NvnTexture *t) {
     holders_add(t);
     if (t->finalized) {
         t->backend_used_frame = b->used_frame = renderer_present_count();
-        if (g_nzombies == g_cap_zombies) {
-            g_cap_zombies = g_cap_zombies ? g_cap_zombies * 2 : 64;
-            g_zombies = realloc(g_zombies, g_cap_zombies * sizeof *g_zombies);
+        // (Listed once: an interned object finalized again while still listed would otherwise be added every frame.)
+        if (!t->zombie) {
+            t->zombie = true;
+            if (g_nzombies == g_cap_zombies) {
+                g_cap_zombies = g_cap_zombies ? g_cap_zombies * 2 : 64;
+                g_zombies = realloc(g_zombies, g_cap_zombies * sizeof *g_zombies);
+            }
+            g_zombies[g_nzombies++] = t;
         }
-        g_zombies[g_nzombies++] = t;
     }
     return b;
 }
