@@ -24,7 +24,13 @@ typedef struct __attribute__((aligned(16))) Cpu {
     // SAVAGEWIND_CORES=0), and the thread's priority: a call site's inline fast path checks them (RT_PREEMPT_DUE)
     const volatile int *best_wait;  // 336
     int32_t prio;                   // 344
-    uint8_t _pad[512 - 348];
+    // (runtime/dispatch.c) every game function's host entry by guest address, for indirect calls (rt_fn_at): the
+    // table, the first address it covers, its span (0: not attached to this Cpu yet) and the base its offsets add to
+    const uint32_t *fn_tab;         // 352
+    uint64_t fn_lo;                 // 360
+    uint64_t fn_span;               // 368
+    uintptr_t fn_base;              // 376
+    uint8_t _pad[512 - 384];
     VReg v[32];              // 512
 } Cpu;
 
@@ -39,13 +45,18 @@ typedef void (*GuestFn)(Cpu *);
 
 // ---- runtime services (runtime/*.c)
 void rt_dispatch(Cpu *c);                 // call function at c->pc
-// An indirect call site's own cache (generated code: blr / br): an entry for one target, never freed or changed, so a
-// site keeps a pointer to it and the call happens at the site (a branch of its own for the CPU's predictor).
-typedef struct DispatchEnt { uint64_t pc; GuestFn fn; } DispatchEnt;
-GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site);  // the function at c->pc, for the caller to call
-// A better thread waits for this thread's emulated core: an indirect call goes through rt_dispatch_site, whose
-// kernel_preempt hands it over (the generated code calls a site's cached target inline otherwise: tools/gen.py)
+// An indirect call (generated code: blr / br, tools/gen.py) is what a native one is: a load from the function table and
+// a call, at the site (a branch of its own for the CPU's predictor), whatever the target. rt_dispatch_at, the function
+// at c->pc for the caller to call, only for an address no call reached yet, the HLE functions and the ones the runtime
+// overrides (never in the table), or when a better thread waits for this one's emulated core (RT_PREEMPT_DUE:
+// rt_dispatch_at's kernel_preempt hands it over).
+GuestFn rt_dispatch_at(Cpu *c);
 #define RT_PREEMPT_DUE(c) ((c)->best_wait && *(c)->best_wait < (c)->prio)
+static inline GuestFn rt_fn_at(Cpu *c) {  // (NULL: through rt_dispatch_at)
+    uint64_t o = c->pc - c->fn_lo;
+    uint32_t e = o < c->fn_span ? c->fn_tab[o >> 2] : 0;
+    return e && !RT_PREEMPT_DUE(c) ? (GuestFn)(c->fn_base + e) : (GuestFn)0;
+}
 // (debugging, tools/native.py SW_NATIVE_CHECK) a native function left with sp or x19-x29 (reg 31: sp) not as at entry
 void rt_native_fail(uint64_t fn, int reg, uint64_t got, uint64_t want);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);

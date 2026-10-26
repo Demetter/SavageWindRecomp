@@ -13,6 +13,12 @@
 typedef struct { const uint64_t *addrs; const GuestFn *fns; uint64_t count, lo, hi; } FnTable;
 static FnTable tables[MAX_MODULES];  // one per module of the game code (runtime/gamelib.h)
 static int ntables;
+// The function table (cpu.h rt_fn_at): every game function's host entry by guest address, filled in as indirect calls
+// first reach each one (rt_dispatch_at). One 32-bit entry per 4 bytes of the modules' code, an offset from just below
+// the game library's lowest function (0: not filled): 49 MiB of code, 52 MB reserved, pages touched where calls land.
+static uint32_t *fn_tab;
+static uint64_t fn_lo, fn_span;
+static uintptr_t fn_base;
 
 // HLE stubs live at fake addresses HLE_BASE + 16*i
 #define MAX_HLE 4096
@@ -65,6 +71,7 @@ void hle_override(uint64_t addr, HostFn fn, const char *name) {
     overrides[override_count].fn = fn;
     overrides[override_count].name = name;
     override_count++;
+    if (addr - fn_lo < fn_span) __atomic_store_n(&fn_tab[(addr - fn_lo) >> 2], 0, __ATOMIC_RELAXED);  // (the override wins)
 }
 
 static __thread uint64_t unimpl_pc;
@@ -116,6 +123,21 @@ void dispatch_init(void) {  // (after gamelib_load)
         uint64_t n = *m->count;
         if (n) tables[ntables++] = (FnTable){m->addrs, m->fns, n, m->addrs[0], m->addrs[n - 1]};
     }
+    if (fn_tab || !ntables) return;
+    uint64_t lo = UINT64_MAX, hi = 0;
+    uintptr_t fmin = UINTPTR_MAX, fmax = 0;
+    for (int t = 0; t < ntables; t++) {
+        if (tables[t].lo < lo) lo = tables[t].lo;
+        if (tables[t].hi + 4 > hi) hi = tables[t].hi + 4;
+        for (uint64_t i = 0; i < tables[t].count; i++) {
+            uintptr_t f = (uintptr_t)tables[t].fns[i];
+            if (f < fmin) fmin = f;
+            if (f > fmax) fmax = f;
+        }
+    }
+    // (a library over 4 GB, or modules strewn over the address space: no table, every indirect call looks up)
+    if (fmax - fmin < 0xfffff000u && hi - lo < (1ull << 32) && (fn_tab = calloc((hi - lo) / 4, sizeof *fn_tab)))
+        fn_lo = lo, fn_span = hi - lo, fn_base = fmin - 16;
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
@@ -180,42 +202,10 @@ void rt_dispatch(Cpu *c) {
     __attribute__((musttail)) return f(c);
 }
 
-// rt_dispatch's safe point and lookup, for an indirect call site that then calls the function itself: through the site's
-// last target (an immutable entry per target, *site) when it is the same. HLE stubs aren't remembered (dispatch_slow is
-// their reboot safe point). SAVAGEWIND_PERFX bit PERFX_DSITE on trial: off, the dcache every time.
-static pthread_mutex_t dent_lock = PTHREAD_MUTEX_INITIALIZER;
-static const DispatchEnt **dent_tab;
-static size_t dent_cap, dent_n;
-static const DispatchEnt *dent_get(uint64_t pc, GuestFn fn) {
-    pthread_mutex_lock(&dent_lock);
-    if (dent_n * 2 >= dent_cap) {  // (grow: rehash into twice the room)
-        size_t cap = dent_cap ? dent_cap * 2 : 16384;
-        const DispatchEnt **tab = calloc(cap, sizeof *tab);
-        if (!tab) FATAL("dispatch site table\n");
-        for (size_t i = 0; i < dent_cap; i++)
-            if (dent_tab[i]) {
-                size_t j = (size_t)((dent_tab[i]->pc >> 2) * 0x9E3779B97F4A7C15ull) & (cap - 1);
-                while (tab[j]) j = (j + 1) & (cap - 1);
-                tab[j] = dent_tab[i];
-            }
-        free(dent_tab);
-        dent_tab = tab, dent_cap = cap;
-    }
-    size_t j = (size_t)((pc >> 2) * 0x9E3779B97F4A7C15ull) & (dent_cap - 1);
-    while (dent_tab[j] && dent_tab[j]->pc != pc) j = (j + 1) & (dent_cap - 1);
-    if (!dent_tab[j]) {
-        DispatchEnt *e = malloc(sizeof *e);
-        if (!e) FATAL("dispatch site entry\n");
-        e->pc = pc, e->fn = fn;
-        dent_tab[j] = e;
-        dent_n++;
-    }
-    const DispatchEnt *r = dent_tab[j];
-    pthread_mutex_unlock(&dent_lock);
-    return r;
-}
-
-GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site) {
+// rt_dispatch's safe point and lookup, for an indirect call that the function table (cpu.h rt_fn_at) didn't take: it
+// attaches the table to the Cpu and enters the function it found. HLE functions and overrides (outside the game library)
+// never go in: dispatch_slow stays their reboot safe point, and an override wins over the game's function.
+GuestFn rt_dispatch_at(Cpu *c) {
     KThread *t = c->thread;  // (the same safe point as rt_dispatch: kernel_preempt)
     if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held].v < t->prio, 0)) kernel_preempt(t);
     if (perf_survey_mode == SURVEY_MAIN || perf_survey_mode == SURVEY_JOBS || perf_survey_mode == SURVEY_OVERLAP_SENSITIVITY || perf_survey_mode == SURVEY_WAIT_JOBS) {
@@ -224,14 +214,15 @@ GuestFn rt_dispatch_site(Cpu *c, const DispatchEnt **site) {
         if (frame != survey_seen && t && t->core_held >= 0) { survey_seen = frame; perf_survey_guest(t); }
     }
     uint64_t pc = c->pc;
-    bool on = !perfx_trial(PERFX_DSITE) || perfx(PERFX_DSITE);
-    const DispatchEnt *e = __atomic_load_n(site, __ATOMIC_ACQUIRE);
-    if (__builtin_expect(e && e->pc == pc, 1) && on) return e->fn;
     unsigned h = dcache_index(pc);
     GuestFn f = dcache[h].addr == pc ? dcache[h].fn : dispatch_slow(c);
-    // only a site's first target: a site that calls several (virtual calls) keeps it and looks the others up, instead of
-    // taking dent_get's lock and writing a shared line on every change of target
-    if (on && !e && !(pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE)) __atomic_store_n(site, dent_get(pc, f), __ATOMIC_RELEASE);
+    if (!c->fn_span && fn_span) c->fn_tab = fn_tab, c->fn_lo = fn_lo, c->fn_base = fn_base, c->fn_span = fn_span;
+    uint64_t o = pc - fn_lo, d = (uintptr_t)f - fn_base;
+    if (o < fn_span && d < 0x100000000ull) {
+        bool over = false;  // (a thread's dcache may still hold the game's function from before a late hle_override)
+        for (int i = 0; i < override_count && !over; i++) over = overrides[i].addr == pc;
+        if (!over) __atomic_store_n(&fn_tab[o >> 2], (uint32_t)d, __ATOMIC_RELAXED);
+    }
     return f;
 }
 
