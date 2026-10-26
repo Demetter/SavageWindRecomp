@@ -2213,7 +2213,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                   !key->cube_layer && !dbg;
     bool vel_fs = stage == STAGE_FRAGMENT && key && key->velocity && key->vel_vs && !dbg && key->vel_rt < 8 &&
                   !((c->omap_target >> (key->vel_rt * 4)) & 0xF) && !(c->in_attr_mask & (3u << 30));
-    info->vel = vel_vs || vel_fs;
+    // (the "still" variant: no positions from the vertex shader, the velocity written unknown - w 0, the camera's used)
+    bool vel_fs0 = stage == STAGE_FRAGMENT && key && key->velocity && !key->vel_vs && !dbg && key->vel_rt < 8 &&
+                   !((c->omap_target >> (key->vel_rt * 4)) & 0xF);
+    info->vel = vel_vs || vel_fs || vel_fs0;
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
         uint32_t n = info->cbuf_size[i] / 16;
@@ -2266,6 +2269,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (vel_fs)
             sp(&s, "layout(location = 30) in vec4 mv_prev_;\nlayout(location = 31) in vec4 mv_cur_;\n"
                    "layout(location = %d) out vec4 c_vel_;\n", key->vel_rt);
+        if (vel_fs0) sp(&s, "layout(location = %d) out vec4 c_vel_;\n", key->vel_rt);
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;
             const char *interp = (c->flat_mask & (1u << i)) ? "flat " : (c->noperspective_mask & (1u << i)) ? "noperspective " : "";
@@ -2357,13 +2361,16 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             if (c->reg_used[r + 1]) sp(&s, "  gl_FragDepth = as_f(r%d);\n", r + 1);
             else sp(&s, "  gl_FragDepth = gl_FragCoord.z;\n");
         }
-        // velocity in uv (this - previous: GL NDC / 2, y up), the distances' ratio previous / current, w = 1: an object's
-        // own motion (exec.c dlss_mv.comp). No previous constants (zeros: w 0) or not a number: w = 0, unknown there.
+        // velocity in uv (this - previous: GL NDC / 2, y up) into an RG16F target: an object's own motion (exec.c
+        // dlss_mv.comp). Unknown - no previous constants (w 0), not a number, the "still" variant - is 60000: the camera's
+        // motion is used there.
         if (vel_fs)
-            sp(&s, "  if (abs(mv_prev_.w) < 1e-6f) c_vel_ = vec4(0.0f);\n"
+            sp(&s, "  if (abs(mv_prev_.w) < 1e-6f) c_vel_ = vec4(60000.0f);\n"
                    "  else { vec2 a_ = mv_cur_.xy / mv_cur_.w, b_ = mv_prev_.xy / mv_prev_.w;\n"
-                   "    c_vel_ = vec4((a_ - b_) * 0.5f, mv_prev_.w / mv_cur_.w, 1.0f);\n"
-                   "    if (any(isnan(c_vel_)) || any(isinf(c_vel_))) c_vel_ = vec4(0.0f); }\n");
+                   "    c_vel_ = vec4((a_ - b_) * 0.5f, 0.0f, 0.0f);\n"
+                   "    if (any(isnan(c_vel_.xy)) || any(isinf(c_vel_.xy)) || any(greaterThan(abs(c_vel_.xy), vec2(30000.0f))))\n"
+                   "      c_vel_ = vec4(60000.0f); }\n");
+        if (vel_fs0) sp(&s, "  c_vel_ = vec4(60000.0f);\n");
     }
     sp(&s, "}\n");
     info->msl = glsl_with_prelude(s.buf);
