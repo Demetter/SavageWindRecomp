@@ -61,10 +61,12 @@ static uint32_t yaz0_run(uint8_t *s, uint8_t *dst, const uint8_t *src, uint32_t 
             if (!cut) return 0xfffffffeu;
             x14 = x0 & 0xffff;
         }
-        {   // byte by byte: a copy may overlap what it writes
+        {   // byte by byte where it overlaps what it writes (the same bytes as memcpy where it doesn't, memset at 1)
             uint32_t n = x14;
             const uint8_t *from = x8 - x11;
-            do { *x8++ = *from++; } while (--n);
+            if (x11 >= n) memcpy(x8, from, n), x8 += n;
+            else if (x11 == 1) memset(x8, *from, n), x8 += n;
+            else do { *x8++ = *from++; } while (--n);
         }
         x13 = 0;
         x0 -= x14;
