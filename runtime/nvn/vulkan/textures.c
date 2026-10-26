@@ -986,18 +986,24 @@ static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferI
     vk_defer_image(img, mem);
 }
 
-// How many times its guest size t's image is made at: the game's font sheets (runtime/nvn/font_scale.c) at
-// SAVAGEWIND_FONT_SCALE, or with auto at the text's size on screen when they go up (the 1280x720 layouts are drawn
-// 1.5 times as large into the 1920x1080 final image, RS_OUT); everything else 1.
-static uint8_t font_scale_of(NvnTexture *t, TexBackend *b) {
+// The scale font sheets are made at now: SAVAGEWIND_FONT_SCALE, or with auto (the default) the text's size on screen
+// at the current output size (the 1280x720 layouts are drawn 1.5 times as large into the 1920x1080 final image, RS_OUT):
+// 1 at 720 lines, 2 at 1080 and 1440, 3 at 2160, 4 above.
+static int font_scale_now(void) {
     int n = font_scale_setting();
-    if (n == 1 || b->gpu_owned || b->dynamic || (t->format != 0x49 && t->format != 0x01) || (t->target != 1 && t->target != 4) ||
-        nvn_texture_flags_pitch(t->flags) ||
-        !font_sheet_is((const uint8_t *)(uintptr_t)t->addr, tegra_layer_size(&t->layout), t->layout.layers ? t->layout.layers : 1,
-                       t->format, t->width, t->height, t->layout.levels))
-        return 1;
     if (!n) n = (int)lroundf(1.5f * g_rs[RS_OUT][1]);
-    n = n < 1 ? 1 : n > 4 ? 4 : n;
+    return n < 1 ? 1 : n > 4 ? 4 : n;
+}
+
+// How many times its guest size t's image is made at: the game's font sheets (runtime/nvn/font_scale.c) at
+// font_scale_now; everything else 1.
+static uint8_t font_scale_of(NvnTexture *t, TexBackend *b) {
+    b->font_sheet = font_scale_setting() != 1 && !b->gpu_owned && !b->dynamic && (t->format == 0x49 || t->format == 0x01) &&
+                    (t->target == 1 || t->target == 4) && !nvn_texture_flags_pitch(t->flags) &&
+                    font_sheet_is((const uint8_t *)(uintptr_t)t->addr, tegra_layer_size(&t->layout),
+                                  t->layout.layers ? t->layout.layers : 1, t->format, t->width, t->height, t->layout.levels);
+    if (!b->font_sheet) return 1;
+    int n = font_scale_now();
     static int nlog;
     if (nlog++ < 48) LOG("[fonts] font sheet %llx (%ux%ux%u, format %#x) at %dx\n", (unsigned long long)t->addr, t->width,
                          t->height, t->layout.layers ? t->layout.layers : 1, t->format, n);
@@ -1222,6 +1228,7 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
         vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->uploaded, b->dynamic);
     if (b->pending_rgba) upload_pending(b);
     if (b->glyph_gen && b->glyph_gen != glyphs_generation()) upload_levels(t, b, 1);  // (button icons: other device)
+    if (b->font_sheet && font_scale_now() != (b->font_scale > 1 ? b->font_scale : 1)) upload_levels(t, b, ~0u);  // (new size)
     // Levels nvnTextureWriteTexels filled go up now, also into an image the GPU draws into: BOTW writes level 0 of its
     // 32x32x32 noise that way and then renders the smaller levels from it (the noise stayed black: GPU-owned images
     // never read guest memory again).

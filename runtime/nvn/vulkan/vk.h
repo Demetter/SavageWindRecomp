@@ -133,6 +133,7 @@ typedef struct TexBackend {
     bool astc_srgb;
     uint32_t glyph_gen;          // a button glyph sheet (runtime/nvn/glyphs.c): the icons it was uploaded with
     uint8_t font_scale;          // a font sheet (runtime/nvn/font_scale.c): made this many times its size (0, 1: none)
+    bool font_sheet;             // one of the game's font sheets: made again when the output size changes its scale
     // textures.c: one image per memory and shape, shared by every texture made there
     uint64_t key_addr;           // 0: not shared
     uint32_t key[7];             // target, format, width, height, depth, levels, samples

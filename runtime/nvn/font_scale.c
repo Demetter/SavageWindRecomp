@@ -5,7 +5,8 @@
 // icons: runtime/nvn/glyphs.c). Their sheets, mostly 1024x1024 BC4, are made for a 1280x720 layout drawn at 1920x1080:
 // at 2160 lines each texel covers three pixels, and the bilinear filter shows it as soft edges.
 //
-// SAVAGEWIND_FONT_SCALE=N (2..4, or auto: the text's size on screen when the sheet is made; default 1, off) makes those
+// SAVAGEWIND_FONT_SCALE=N (2..4; auto, the default: the text's size on screen, made again when the output size changes
+// it; 1: off) makes those
 // images N times as wide and as high (textures.c) and fills them from the game's own glyphs: the signed distance to
 // each glyph's edge, worked out from its anti-aliased coverage (the edge estimate of Gustavson & Strand's anti-aliased
 // Euclidean distance transform, 2011), is interpolated to the larger grid and made coverage again with an edge one new
@@ -38,9 +39,9 @@
 int font_scale_setting(void) {
     static int n = -1;
     if (n < 0) {
-        const char *e = getenv("SAVAGEWIND_FONT_SCALE");
-        n = !e ? 1 : !strcmp(e, "auto") ? 0 : atoi(e);
-        if (n < 0 || n > 4 || (n == 0 && strcmp(e, "auto"))) n = 1;
+        const char *e = getenv("SAVAGEWIND_FONT_SCALE");  // (default auto: from the output resolution)
+        n = !e || !*e || !strcmp(e, "auto") ? 0 : atoi(e);
+        if (n < 1 || n > 4) n = 0;
     }
     return n;
 }

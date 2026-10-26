@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// SAVAGEWIND_FONT_SCALE: how many times as large font sheets are made, 2..4; 1 (the default): off; 0 ("auto"): the
+// SAVAGEWIND_FONT_SCALE: how many times as large font sheets are made, 2..4; 1: off; 0 ("auto", the default): the
 // caller works it out from the output size.
 int font_scale_setting(void);
 
