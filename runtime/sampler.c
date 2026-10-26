@@ -22,7 +22,7 @@
 // handle, independently of whether the creator has already detached pthread_t.
 static HANDLE sample_host_handles[4];
 void sampler_register_host_thread(unsigned index) {
-    if (index >= 4 || !getenv("SAVAGEWIND_SAMPLE")) return;
+    if (index >= 4 || (!getenv("SAVAGEWIND_SAMPLE") && !getenv("SAVAGEWIND_SAMPLE_ON_HANG"))) return;
     HANDLE handle = NULL;
     if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
                         &handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) sample_host_handles[index] = handle;
@@ -180,11 +180,32 @@ static void *sampler_main(void *arg) {
     return NULL;
 }
 
+// (debugging) SAVAGEWIND_SAMPLE_ON_HANG=<seconds>: once frames have been presented, a stretch of that many seconds
+// without one samples every thread for 0.3 s (build/samples.txt, as SAVAGEWIND_SAMPLE) and logs the renderer's
+// submission state: where a hang is, without a sampler running (and changing the timing) before it.
+static void *hang_main(void *arg) {
+    double secs = atof((const char *)arg);
+    if (secs <= 0) return NULL;
+    extern uint64_t renderer_present_count(void);
+    extern void vk_hang_report(void);
+    uint64_t last = 0, since = plat_now_ns();
+    for (;;) {
+        plat_sleep_until_ns(plat_now_ns() + 250000000ull);
+        uint64_t n = renderer_present_count(), now = plat_now_ns();
+        if (n != last || !n) { last = n, since = now; continue; }
+        if (now - since < (uint64_t)(secs * 1e9)) continue;
+        LOG("[hang] no frame presented for %.1f s (frame %llu): sampling every thread\n", (now - since) / 1e9,
+            (unsigned long long)n);
+        vk_hang_report();
+        sampler_main((void *)"0:0.3:10000");
+        return NULL;
+    }
+}
+
 __attribute__((constructor)) static void sampler_start(void) {
-    const char *e = getenv("SAVAGEWIND_SAMPLE");
-    if (!e) return;
+    const char *e = getenv("SAVAGEWIND_SAMPLE"), *h = getenv("SAVAGEWIND_SAMPLE_ON_HANG");
     pthread_t th;
-    pthread_create(&th, NULL, sampler_main, (void *)e);
-    pthread_detach(th);
+    if (e) { pthread_create(&th, NULL, sampler_main, (void *)e); pthread_detach(th); }
+    else if (h) { pthread_create(&th, NULL, hang_main, (void *)h); pthread_detach(th); }
 }
 #endif

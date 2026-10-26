@@ -287,6 +287,12 @@ void vk_wait_seq(uint64_t seq) {
 }
 
 uint64_t vk_pending_seq(void) { return t_seq ? t_seq : submit_seq + 1; }
+// (debugging, sampler.c SAVAGEWIND_SAMPLE_ON_HANG) the submissions' state when frames stopped
+void vk_hang_report(void) {
+    LOG("[hang] submitted %llu, completed %llu, deferred %llu, one-off readback %llu, in a pass %d\n",
+        (unsigned long long)__atomic_load_n(&submit_seq, __ATOMIC_RELAXED), (unsigned long long)vk_completed_seq(),
+        (unsigned long long)deferred_seq, (unsigned long long)oneshot_seq, (int)in_pass);
+}
 uint64_t vk_latest_seq(void) { return __atomic_load_n(&submit_seq, __ATOMIC_RELAXED) + 1; }  // (the render thread's)
 
 // (out of line: its ~8 KB stack frame was allocated and probed on every sub() call, several a draw)
@@ -4974,6 +4980,10 @@ static bool vg_current(uint64_t lo, uint64_t hi) {
 }
 
 static void vram_copy(const VkBufferCopy *rg, uint32_t n);
+static VkBufferCopy *vg_rg;  // (render thread) copies vg_copy planned, recorded by vg_record
+static uint32_t vg_nrg, vg_rgcap;
+static bool vg_defer;        // (vram_collect, under vg_lock) vg_copy only plans; vg_record after the lock
+static void vg_record(void);
 static int cmp_u32(const void *a, const void *b) {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
     return x < y ? -1 : x > y;
@@ -4991,20 +5001,30 @@ static void vg_copy(const uint64_t *dirty, size_t n) {
     }
     if (!vg_nnext) return;
     qsort(vg_next, vg_nnext, sizeof *vg_next, cmp_u32);
-    enum { MAXRG = 512 };
-    VkBufferCopy rg[MAXRG];
-    uint32_t nr = 0;
     for (size_t i = 0; i < vg_nnext; i++) {
         uint32_t p = vg_next[i];
         vok_bits[p >> 6] |= 1ull << (p & 63);
         vpend_bits[p >> 6] &= ~(1ull << (p & 63));
         uint64_t off = (uint64_t)p << 12;
-        if (nr && rg[nr - 1].srcOffset + rg[nr - 1].size == off) { rg[nr - 1].size += 0x1000; continue; }
-        if (nr == MAXRG) { vram_copy(rg, nr); nr = 0; }
-        rg[nr++] = (VkBufferCopy){off, off, 0x1000};
+        if (vg_nrg && vg_rg[vg_nrg - 1].srcOffset + vg_rg[vg_nrg - 1].size == off) { vg_rg[vg_nrg - 1].size += 0x1000; continue; }
+        if (vg_nrg == vg_rgcap) {
+            vg_rgcap = vg_rgcap ? vg_rgcap * 2 : 512;
+            vg_rg = realloc(vg_rg, vg_rgcap * sizeof *vg_rg);
+            if (!vg_rg) FATAL("geometry copy ranges\n");
+        }
+        vg_rg[vg_nrg++] = (VkBufferCopy){off, off, 0x1000};
     }
-    vram_copy(rg, nr);
     vg_nnext = 0;
+    if (!vg_defer) vg_record();
+}
+
+// The copies vg_copy planned, recorded (render thread, after vg_lock is let go: recording may wait for the recording
+// thread - begin_cb's vkq_drain the first time a submission's upload buffer is made - which may be waiting for the
+// translation workers' chunks, and they for vg_lock in vg_current: that was a deadlock at the first 3D frames, 27 Oct).
+// They go into this submission's upload buffer, which runs before its draws, so the order on the GPU is the same.
+static void vg_record(void) {
+    for (uint32_t i = 0; i < vg_nrg; i += 512) vram_copy(vg_rg + i, vg_nrg - i < 512 ? vg_nrg - i : 512);
+    vg_nrg = 0;
 }
 
 // (SAVAGEWIND_VK_GEOMETRY_LAYOUT=1, every 600 lists) How the geometry lies in the heap: its runs of pages with gaps under G
@@ -5298,12 +5318,15 @@ static bool vram_collect(bool wait) {
     pthread_mutex_unlock(&vq_lock);
     vram_pending = false;
     if (par_active) pthread_mutex_lock(&vg_lock);  // (translation workers add pages to the next copy meanwhile: vg_current)
+    vg_defer = true;
     if (n == SIZE_MAX) {  // (the first query saw the OS report pages: not expected to stop)
         vg_copy_all();  // a failed query must not allow this list to fetch stale geometry
         vram_full = true;
     } else if (n >= vram_pages_max) vg_copy_all();
     else vg_layout_log(vram_pages, n), vg_copy(vram_pages, n);  // (ascending)
+    vg_defer = false;
     if (par_active) pthread_mutex_unlock(&vg_lock);
+    vg_record();
     return true;
 }
 
