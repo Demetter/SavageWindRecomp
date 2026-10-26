@@ -4267,6 +4267,7 @@ static bool mvo_prev_ok(void) {
 
 // How far a previous copy is from this frame's data: the sum of the float words' differences, stopping past `limit`
 static float mvo_dist(const uint32_t *a, const uint32_t *b, uint32_t nw, float limit) {
+    if (!memcmp(a, b, (size_t)nw * 4)) return 0;  // (the same data: mvo_words_ok)
     float d = 0;
     for (uint32_t i = 0; i < nw && d < limit; i++) {
         if (a[i] == b[i] || ((a[i] >> 23) & 0xFF) == 0xFF || ((b[i] >> 23) & 0xFF) == 0xFF) continue;
@@ -4318,6 +4319,9 @@ static uint64_t mvo_pick(const ShaderInfo *si) {
 // is the same for every draw: once a frame.
 static bool mvo_words_ok(const uint32_t *a, const uint32_t *b, uint32_t nw, bool *same) {
     *same = true;
+    // (most objects are still: the same bytes, compared at memcmp's speed; word by word only what changed. On the render
+    // thread these comparisons and mvo_dist's were a quarter of its time with DLSS / DLAA at the Plateau, 27 Oct)
+    if (!memcmp(a, b, (size_t)nw * 4)) return true;
     for (uint32_t i = 0; i < nw; i++) {
         if (a[i] == b[i]) continue;
         *same = false;
