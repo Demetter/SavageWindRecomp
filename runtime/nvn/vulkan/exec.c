@@ -218,7 +218,10 @@ static bool in_pass;
 // not in secondary buffers. The shadow maps' passes: depth-only passes executed from secondary buffers took the GPU
 // 30-130% longer (NVIDIA; the 8192x8192 cascades, the same draws) and so did the passes sampling them afterwards: +0.27
 // ms a frame at Kakariko, +0.13 at the Plateau, where 1 to 3 secondaries per cascade made no difference (per-pass GPU
-// time, SAVAGEWIND_VK_PASS_GPU). SAVAGEWIND_VK_PAR_INLINE=<mask of scale groups, 1 << RS_*> (default 1 << RS_SHADOW)
+// time, SAVAGEWIND_VK_PASS_GPU). And passes into unscaled targets (RS_NONE): recorded by the workers, the inventory's
+// model of Link came out as scattered shards (27 Oct; the same draws on the render thread are right).
+// SAVAGEWIND_VK_PAR_INLINE=<mask of scale groups, 1 << RS_*> (default PAR_INLINE_DEFAULT)
+#define PAR_INLINE_DEFAULT (1 << RS_SHADOW | 1 << RS_NONE)
 static bool pass_inline;
 static int par_inline_mask = -1;
 static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
@@ -2022,7 +2025,7 @@ static void begin_pass(bool cube_layers) {
     }
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
-    if (par_inline_mask < 0) par_inline_mask = getenv("SAVAGEWIND_VK_PAR_INLINE") ? atoi(getenv("SAVAGEWIND_VK_PAR_INLINE")) : 1 << RS_SHADOW;
+    if (par_inline_mask < 0) par_inline_mask = getenv("SAVAGEWIND_VK_PAR_INLINE") ? atoi(getenv("SAVAGEWIND_VK_PAR_INLINE")) : PAR_INLINE_DEFAULT;
     {
         NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
         pass_inline = par_list && par_inline_mask && t0 && (par_inline_mask >> vk_texture_scale_group(t0) & 1);
@@ -9266,7 +9269,7 @@ static void par_curve_step(void) {  // (SAVAGEWIND_VK_PAR_CURVE, at each list) t
     if (!chunk0) chunk0 = par_chunk_draws;
     par_chunk_draws = par_curve_chunk[i] ? par_curve_chunk[i] : chunk0;
     static int inline0 = -2;
-    if (inline0 == -2) inline0 = getenv("SAVAGEWIND_VK_PAR_INLINE") ? atoi(getenv("SAVAGEWIND_VK_PAR_INLINE")) : 1 << RS_SHADOW;
+    if (inline0 == -2) inline0 = getenv("SAVAGEWIND_VK_PAR_INLINE") ? atoi(getenv("SAVAGEWIND_VK_PAR_INLINE")) : PAR_INLINE_DEFAULT;
     par_inline_mask = par_curve_inline[i] >= 0 ? par_curve_inline[i] : inline0;
     static int spin0 = -1;
     if (spin0 < 0) spin0 = par_spin;
