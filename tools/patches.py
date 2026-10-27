@@ -513,6 +513,23 @@ def _view_rec_cbs(gen, a):
             f'  /* {a:#x}: mov w1, #0x20 (command buffers of a list: at least its parts) */')
 
 
+# ... and a draw list no view cut, which the consumer (1.9.0 f_7000fab5e0) records whole on the one thread drawing the
+# layer (`bl f_7000fab328` with range 0..-1, after its search found no record of parts for the list's pass): cut into
+# parts recorded on every core and then drawn as the views' parts are (runtime/hle/jobs.c rt_view_rec_inline); a list
+# too short to cut keeps the game's call.
+def _view_rec_inline(gen, a):
+    w = _word(gen, a)
+    assert w >> 26 == 0x25, hex(w)  # bl f_7000fab328
+    t = a + sext(w & 0x3FFFFFF, 26) * 4
+    fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in ('view_rec_consume', 'view_rec_part', 'view_rec_ctx',
+                                                       'view_rec_ctx_fini', 'view_rec_item_end', 'view_rec_lock',
+                                                       'view_rec_unlock', 'view_rec_record', 'view_rec_begin',
+                                                       'view_rec_end')) + f', {t:#x}ull'
+    return (f'{{ extern int rt_view_rec_inline(Cpu *, const uint64_t *); static const uint64_t fns[] = {{{fns}}}; '
+            f'if (!rt_view_rec_inline(c, fns)) {{ c->x[30] = {a + 4:#x}ull; c->pc = {t:#x}ull; rt_dispatch(c); }} }}'
+            f'  /* {a:#x}: bl {t:#x} (a draw list with no parts: its parts on every core) */')
+
+
 # The game's memory heap size (1.9.0 nninitStartup 0x7000000710: `mov w0, #0xc3000000` before SetMemoryHeapSize): the
 # PC's application memory less what the Switch build kept back (runtime/hle/heaps.c rt_memory_heap_size). BOTW gives
 # what its fixed heaps leave to "the rest" heaps, whose contents grow with the core count (BOTW-JOBS-NATIVE.md step 4).
@@ -1426,6 +1443,7 @@ PATCHES = {
     'view_rec_parts': _view_rec_parts,
     'view_rec_items': _view_rec_items,
     'view_rec_cbs': _view_rec_cbs,
+    'view_rec_inline': _view_rec_inline,
     'jobs_push': _jobs_entry('rt_jobs_push', 0xa9bc7bfd, 0x40, 'stp x29, x30, [sp, #-0x40]! (job pool push)'),
     'jobs_kick': _jobs_entry('rt_jobs_kick', 0xd10103ff, 0x40, 'sub sp, sp, #0x40 (job pool kick)'),
     'jobs_run': _jobs_entry('rt_jobs_run', 0xa9ba7bfd, 0x60, 'stp x29, x30, [sp, #-0x60]! (job worker run)'),

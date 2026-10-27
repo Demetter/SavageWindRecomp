@@ -766,6 +766,28 @@ SITES = [
     # (f_7000faa800: `mov w1, #0x20`, 32 each). Both clamp an overflow to slot 0 without a word.
     Site('view_rec_items', 'code', '528016e9 528000ca a909a2c8 910302c0 a90aa2c8 f94027e8 aa1503e2 91040277', 0),
     Site('view_rec_cbs', 'code', '52800401 aa1403e2 52800103 91016100 94000000/fc000000 910006e8 92407d17 6b0802bf', 0),
+    # ... and the lists no view cut (a pass made at draw time): the consumer f_7000fab5e0 finds no record of parts for the
+    # list's pass and records the whole list inline (bl f_7000fab328, range 0..-1) on the one thread drawing the layer.
+    # tools/patches.py _view_rec_inline cuts it into parts there instead, recorded on every core (runtime/hle/jobs.c
+    # rt_view_rec_inline) by the game's own part recorder f_7000fab13c with a draw context of its own (f_7000ebf0c4 /
+    # f_7000ebf148, f_7000eb0380 after each part as f_7000fb5a20 does), the list's record lock f_7000eaff08 / 18
+    Site('view_rec_inline', 'code', '94000000/fc000000 14000000/fc000000 52800e08 9ba86b88 b9405909 7100053f 5400000b/ff00001f '
+         '90000001/9f00001f', 0),
+    Site('view_rec_consume', 'code', 'b9403c08 7100051f b9400049 b9401c0a 0a090149 7a40a924 54000000/ff00001f d101c3ff', 0),
+    Site('view_rec_part', 'call', '94000000/fc000000 885f7eb7 110006e8 88097ea8 35000009/ff00001f 94000000/fc000000 910023e0 '
+         '94000000/fc000000', 0),
+    Site('view_rec_ctx', 'call', '94000000/fc000000 f96f1e62 910062e5 910023e1 a9408ee0 d10073a6 f94002e4 94000000/fc000000', 0),
+    Site('view_rec_ctx_fini', 'call', '94000000/fc000000 b9401a88 6b0802ff 5400000b/ff00001f 910743ff a9434ff4 a94257f6 '
+         'a9415ffc', 0),
+    Site('view_rec_item_end', 'call', '94000000/fc000000 910023e0 94000000/fc000000 b9401a88 6b0802ff 5400000b/ff00001f '
+         '910743ff a9434ff4', 0),
+    Site('view_rec_lock', 'call', '94000000/fc000000 b94052c8 7100051f 5400000b/ff00001f 2a1f03f8 52800e19 b94042ca 6b18015f', 0),
+    Site('view_rec_unlock', 'call', '94000000/fc000000 aa1703e0 a9444ff4 a94357f6 f9400bf9 a9425ff8 a8c57bfd d65f03c0', 0),
+    Site('view_rec_record', 'call', '94000000/fc000000 b94002e3 aa0003f3 9100e002 aa1503e0 aa1403e1 94000000/fc000000 '
+         '2a0003fa', 0),
+    Site('view_rec_begin', 'call', '94000000/fc000000 2a0003fa aa1903e0 aa1403e1 aa1303e2 aa1803e3 aa1703e4 52800025', 0),
+    Site('view_rec_end', 'call', '94000000/fc000000 39409008 36000008/fff8001f 91016268 885f7d09 1100052a 880b7d0a '
+         '3500000b/ff00001f', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -925,7 +947,10 @@ OPTIONAL_GROUPS = [
      'heap_root_flags',
      'root_heap_size',
      'jobs_pool_got', 'job_thread_proc', 'job_thread_res',
-     'view_rec_jobs', 'view_rec_parts', 'view_rec_items', 'view_rec_cbs'),
+     'view_rec_jobs', 'view_rec_parts', 'view_rec_items', 'view_rec_cbs',
+     'view_rec_inline', 'view_rec_consume', 'view_rec_part', 'view_rec_ctx',
+     'view_rec_ctx_fini', 'view_rec_item_end', 'view_rec_lock', 'view_rec_unlock',
+     'view_rec_record', 'view_rec_begin', 'view_rec_end'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1446,6 +1471,17 @@ KNOWN = {
         'view_rec_parts': 0x7000fb3ef4,
         'view_rec_items': 0x7000fb3d04,
         'view_rec_cbs': 0x7000faa864,
+        'view_rec_inline': 0x7000fab6bc,
+        'view_rec_consume': 0x7000fab5e0,
+        'view_rec_part': 0x7000fab13c,
+        'view_rec_ctx': 0x7000ebf0c4,
+        'view_rec_ctx_fini': 0x7000ebf148,
+        'view_rec_item_end': 0x7000eb0380,
+        'view_rec_lock': 0x7000eaff08,
+        'view_rec_unlock': 0x7000eaff18,
+        'view_rec_record': 0x7000fab224,
+        'view_rec_begin': 0x7000ef349c,
+        'view_rec_end': 0x7000ef3608,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

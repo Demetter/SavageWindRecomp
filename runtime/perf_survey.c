@@ -15,6 +15,7 @@ uint32_t g_perfx_mask;
 static uint32_t perfx_ab, perfx_ab_start = 3000;
 
 void perfx_list_begin(void) { atomic_store_explicit(&g_perfx_list, atomic_load(&g_perfx), memory_order_relaxed); }
+uint32_t perfx_now(void) { return atomic_load_explicit(&g_perfx, memory_order_relaxed); }
 
 // One logical processor per physical core for the whole process (or all of them back): the game's main thread and the
 // render thread then never share a core with another of the game's busy threads, or a helper spinning for work.

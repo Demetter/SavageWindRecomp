@@ -220,8 +220,11 @@ static uint64_t sbfx34(uint64_t v) { return (uint64_t)((int64_t)(v << 30) >> 30)
 // block when it has memory).
 void cmdbuf_arena_region(uint64_t pool, uint64_t offset, uint64_t size);  // (runtime/nvn/cmdbuf.c)
 
+extern uint64_t g_cmd_arena;  // (runtime/hle/jobs.c rt_view_rec_inline)
+
 void rt_arena_setup(Cpu *c, const uint64_t *fn) {
     uint64_t obj = c->x[0], ctl = c->x[2], heap = c->x[5], blk = (c->x[1] + 3) & ~3ull;
+    g_cmd_arena = obj;
     uint32_t nbuf = (uint32_t)((uint64_t)(uint32_t)c->x[3] * (uint64_t)rt_game_cores() / 3);  // (command buffers a frame
     // for every recorder: the Switch build's count is for three cores' worth of parts, the views' recording among them)
     uint8_t per = (uint8_t)c->x[4];

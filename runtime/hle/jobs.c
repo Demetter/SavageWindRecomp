@@ -281,6 +281,8 @@ static void wait_change(const uint32_t *w, uint32_t v, bool core_held) {
     if (core_held) kernel_host_work_end();
 }
 
+static void help(Cpu *c);  // (fork-join, below)
+
 // The worker's share of one group, as the game's run does: chunks of its grab size until the group's jobs are all
 // claimed, its count of jobs added to the group's, the group's event signalled by whoever completes it; a barrier group
 // (type 1 or 2) is waited for before the worker goes on.
@@ -347,8 +349,10 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     if (type == 1 || type == 2) {
         uint64_t b0 = g_stats ? plat_now_ns() : 0;
         for (uint32_t v = __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE);
-             !(call1(c, vfn(g, V_IS_DONE), g) & 1) && !g_rt_unwind; v = __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE))
-            wait_change(P32(g + G_DONE), v, core_held);
+             !(call1(c, vfn(g, V_IS_DONE), g) & 1) && !g_rt_unwind; v = __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE)) {
+            help(c);
+            if (v == __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE)) wait_change(P32(g + G_DONE), v, core_held);
+        }
         if (g_stats) SADD(g_st_barrier, plat_now_ns() - b0);
     }
     if (rtr) {
@@ -368,6 +372,74 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     }
     ST32(w + W_STATE, 10);
     ST32(w + W_STATE, 2);
+}
+
+// ---- fork-join: work the runtime hands to the job threads while a job waits for it (rt_jobs_fork_join)
+// A task set is published in a slot; the job threads that are idle (between groups, at a barrier, the main thread in
+// its run-and-wait) claim its tasks and run them, and the thread that forked runs them too until none is left, then
+// waits for the last ones to finish: a join by helping, so the work goes on whatever the others are doing. Slots are
+// static; a helper counts itself in before it reads one and out after, and the owner frees its slot only when no
+// helper is left in it.
+typedef struct {
+    int active;                // published, tasks may be claimed
+    int helpers;               // threads in the slot right now
+    uint32_t next, done;
+    uint32_t n;
+    void (*fn)(Cpu *c, void *arg, uint32_t i);
+    void *arg;
+    int used;                  // reserved by an owner
+} __attribute__((aligned(64))) TaskSet;
+#define MAX_TASKSETS 16
+static TaskSet g_ts[MAX_TASKSETS];
+static int g_ts_live;  // sets active now: idle threads look for work only when it is not 0
+
+static void ts_run(Cpu *c, TaskSet *t) {  // (counted in) claims and runs t's tasks until none is left to claim
+    for (uint32_t i; (i = __atomic_fetch_add(&t->next, 1, __ATOMIC_SEQ_CST)) < t->n;) {
+        t->fn(c, t->arg, i);
+        if (__atomic_fetch_add(&t->done, 1, __ATOMIC_SEQ_CST) + 1 == t->n) plat_wake_u32_all(&t->done);
+    }
+}
+static void help(Cpu *c) {  // an idle job thread: any published tasks
+    if (!__atomic_load_n(&g_ts_live, __ATOMIC_ACQUIRE)) return;
+    for (int k = 0; k < MAX_TASKSETS; k++) {
+        TaskSet *t = &g_ts[k];
+        if (!__atomic_load_n(&t->active, __ATOMIC_ACQUIRE)) continue;
+        __atomic_fetch_add(&t->helpers, 1, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&t->active, __ATOMIC_SEQ_CST) && __atomic_load_n(&t->next, __ATOMIC_SEQ_CST) < t->n) ts_run(c, t);
+        __atomic_fetch_sub(&t->helpers, 1, __ATOMIC_SEQ_CST);
+    }
+}
+static void wake_helpers(void) {
+    for (int i = 0; i < 8; i++) {
+        Pool *p = &g_pools[i];
+        if (!__atomic_load_n(&p->pool, __ATOMIC_ACQUIRE)) continue;
+        bump(&p->seq), bump(&p->evt);
+    }
+}
+
+// Runs fn(c, arg, i) for i < n on the job threads and this one; returns when all have run. 0: no slot free (the
+// caller runs them itself).
+int rt_jobs_fork_join(Cpu *c, void (*fn)(Cpu *, void *, uint32_t), void *arg, uint32_t n) {
+    TaskSet *t = NULL;
+    for (int k = 0; k < MAX_TASKSETS && !t; k++) {
+        int z = 0;
+        if (__atomic_compare_exchange_n(&g_ts[k].used, &z, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) t = &g_ts[k];
+    }
+    if (!t) return 0;
+    t->fn = fn, t->arg = arg, t->n = n;
+    __atomic_store_n(&t->next, 0, __ATOMIC_SEQ_CST), __atomic_store_n(&t->done, 0, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&g_ts_live, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&t->active, 1, __ATOMIC_RELEASE);
+    wake_helpers();
+    __atomic_fetch_add(&t->helpers, 1, __ATOMIC_SEQ_CST);
+    ts_run(c, t);
+    __atomic_fetch_sub(&t->helpers, 1, __ATOMIC_SEQ_CST);
+    for (uint32_t d; (d = __atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) < n && !g_rt_unwind;) wait_change(&t->done, d, false);
+    __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST);
+    __atomic_fetch_sub(&g_ts_live, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&t->helpers, __ATOMIC_SEQ_CST)) PAUSE();  // (a helper between its check and its count: out at once)
+    __atomic_store_n(&t->used, 0, __ATOMIC_RELEASE);
+    return 1;
 }
 
 // The worker's share of the round's groups from *k on, in list order.
@@ -401,6 +473,7 @@ static void worker_loop(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32
     uint32_t gen = UINT32_MAX, k = 0;
     while (!g_rt_unwind) {
         uint32_t s = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
+        help(c);  // (tasks a job forked: rt_jobs_fork_join)
         if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) {
             __atomic_add_fetch(&p->busy, 1, __ATOMIC_SEQ_CST);
             if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) {  // (run-and-wait closes, then waits for busy = 0)
@@ -533,6 +606,108 @@ uint32_t rt_view_rec_parts(void) {
     return (uint32_t)n;
 }
 
+// A draw list no view cut into parts (tools/patches.py _view_rec_inline): the consumer f_7000fab5e0(list, draw
+// context, pass, view, x4) found no record of parts for the list's pass and is about to record the whole list on the
+// one thread drawing the layer. Instead its parts - contiguous ranges, at least VRI_MIN draws each, up to the view parts'
+// count - are recorded on every core by the game's part recorder, each in a command buffer of its own as the views'
+// parts are, and the consumer is entered again: it finds the record now, sorts the parts by their start and calls them
+// in order (the GPU sees the list's draws in the list's order). The record is dropped after, as the game's own inline
+// recording leaves none. A list another thread is doing the same for (two layers drawing it at once) is recorded the
+// game's way. fns: the consumer, the part recorder f_7000fab13c, the draw context's constructor / destructor, the step
+// the game's recorder takes after each part, the list's record lock / unlock.
+enum { VRI_CONSUME, VRI_PART, VRI_CTX, VRI_CTX_FINI, VRI_ITEM_END, VRI_LOCK, VRI_UNLOCK, VRI_RECORD, VRI_BEGIN, VRI_END, VRI_REC };
+#define VRI_MIN 8
+uint64_t g_cmd_arena;  // (runtime/hle/percore.c rt_arena_setup) the command arena the parts are recorded from
+typedef struct { const uint64_t *fns; uint64_t list, pass, view, x4; uint32_t total, parts; } VriTask;
+static __thread int t_vri;     // (in the consumer entered again: its search failing again records the game's way)
+static uint64_t g_vri_lists[16];
+static void vri_part(Cpu *c, void *arg, uint32_t i) {
+    VriTask *t = arg;
+    uint32_t per = t->total / t->parts, start = i * per, count = i + 1 == t->parts ? t->total - start : per;
+    uint64_t sp = c->sp;
+    c->sp = (sp - 0x200) & ~15ull;
+    uint64_t ctx = c->sp, range = ctx + 0x1d0;
+    ST32(range, start), ST32(range + 4, count);
+    c->x[0] = ctx;
+    guest_call(c, t->fns[VRI_CTX]);
+    // (f_7000fab13c's steps with the inline recording's mode: the list's record for the pass, a command buffer begun
+    // with the part's start as its key, the range recorded inheriting the state the layer set where it is called - the
+    // views' part mode would set the pass's defaults again over it - the buffer ended and added to the record)
+    c->x[0] = t->list, c->x[1] = t->pass;
+    guest_call(c, t->fns[VRI_RECORD]);
+    uint64_t rec = c->x[0];
+    c->x[0] = g_cmd_arena, c->x[1] = ctx, c->x[2] = rec + 0x38, c->x[3] = start;
+    guest_call(c, t->fns[VRI_BEGIN]);
+    uint32_t key = (uint32_t)c->x[0];
+    c->x[0] = t->list, c->x[1] = ctx, c->x[2] = rec, c->x[3] = t->view, c->x[4] = range, c->x[5] = 0, c->x[6] = t->x4;
+    guest_call(c, t->fns[VRI_REC]);  // (x6 as the consumer passes it: its caller's view data, not a scratch word)
+    c->x[0] = g_cmd_arena, c->x[1] = ctx, c->x[2] = key;
+    guest_call(c, t->fns[VRI_END]);
+    uint64_t dl = c->x[0];
+    if (LD8(dl + 0x24) & 1) {
+        uint32_t k = __atomic_fetch_add(P32(rec + 0x58), 1, __ATOMIC_ACQ_REL);
+        ST64(LD64(rec + 0x60) + 8ull * k, dl);
+    }
+    guest_call(c, t->fns[VRI_ITEM_END]);
+    c->x[0] = ctx;
+    guest_call(c, t->fns[VRI_CTX_FINI]);
+    c->sp = sp;
+}
+int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
+    // (off unless SAVAGEWIND_VIEW_REC_INLINE=1: the parts' draws need the layer's draw context, not a new one - at
+    // Kakariko the material lists the lighting reads came out black: characters and foliage unlit. Open: which of the
+    // context's 0x1d0 bytes are the layer's settings to copy and which the bind caches each part starts empty)
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("SAVAGEWIND_VIEW_REC_INLINE") && atoi(getenv("SAVAGEWIND_VIEW_REC_INLINE"));
+    if (!enabled) return 0;
+    uint64_t list = c->x[23], dctx = c->x[19], pass = c->x[22], view = c->x[21], x4 = c->x[20];
+    uint32_t total = LD32(list + 0x3c), parts = rt_view_rec_parts();
+    if (total / VRI_MIN < parts) parts = total / VRI_MIN;
+    if (t_vri || parts < 2 || !on() || !g_cmd_arena) return 0;
+    {   // (SAVAGEWIND_PERFX=16384 with _AB: the game's inline recording in the "off" blocks, an A/B in one launch)
+        extern uint32_t g_perfx_mask;
+        extern uint32_t perfx_now(void);
+        if ((g_perfx_mask & 16384) && !(perfx_now() & 16384)) return 0;
+    }
+    {   // (the parts come from the arena the layer's own command buffer is from)
+        uint64_t cb = LD64(dctx + 0xe8), arr = LD64(g_cmd_arena + 0x108);
+        if (cb < arr || cb >= arr + 0x288ull * LD32(g_cmd_arena + 0x100)) {
+            static int told;
+            if (!told++) LOG("[jobs] view recording: a draw context's command buffer %llx not from the arena: lists recorded "
+                             "inline\n", (unsigned long long)cb);
+            return 0;
+        }
+    }
+    int slot = -1;
+    for (int k = 0; k < 16 && slot < 0; k++) {
+        uint64_t z = 0;
+        if (__atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) return 0;
+        if (__atomic_compare_exchange_n(&g_vri_lists[k], &z, list, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) slot = k;
+    }
+    if (slot < 0) return 0;
+    for (int k = 0; k < 16; k++)  // (another thread took the same list in the meantime)
+        if (k != slot && __atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) { __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST); return 0; }
+    uint32_t n0 = LD32(list + 0x50);
+    VriTask t = {fns, list, pass, view, x4, total, parts};
+    if (!rt_jobs_fork_join(c, vri_part, &t, parts))
+        for (uint32_t i = 0; i < parts; i++) vri_part(c, &t, i);
+    t_vri = 1;
+    c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
+    guest_call(c, fns[VRI_CONSUME]);
+    t_vri = 0;
+    c->x[0] = list + 0x58;
+    guest_call(c, fns[VRI_LOCK]);
+    if (LD32(list + 0x50) == n0 + 1) ST32(list + 0x50, n0);
+    c->x[0] = list + 0x58;
+    guest_call(c, fns[VRI_UNLOCK]);
+    __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST);
+    static int logged;
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 4)
+        LOG("[jobs] view recording: list %llx (%u draws) recorded in %u parts on every core\n", (unsigned long long)list,
+            total, parts);
+    return 1;
+}
+
 // Whether sead thread id `id` is one of the job system's threads (BOTW-JOBS-NATIVE.md #31): the main thread's (it runs
 // index 0's share of each round; worker 0's own thread is never started) or a worker's of the pool. BOTW asks it in
 // BaseProcMgr's "high priority thread" check and in ResourceMgrTask's load request, each time against a copy of the set
@@ -648,7 +823,9 @@ int rt_jobs_run_wait(Cpu *c, const uint64_t *fns) {
                 break;
         }
         if ((j == n && k == n) || g_rt_unwind) break;
-        if (k == __atomic_load_n(P32(pool + POOL_LIST_N), __ATOMIC_ACQUIRE)) wait_change(&p->evt, e, true);
+        help(c);
+        if (k == __atomic_load_n(P32(pool + POOL_LIST_N), __ATOMIC_ACQUIRE) && e == __atomic_load_n(&p->evt, __ATOMIC_ACQUIRE))
+            wait_change(&p->evt, e, true);
     }
     run_end(w0);
     __atomic_store_n(&p->open, 0, __ATOMIC_SEQ_CST);

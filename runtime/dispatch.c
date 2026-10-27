@@ -208,6 +208,16 @@ void rt_dispatch(Cpu *c) {
 GuestFn rt_dispatch_at(Cpu *c) {
     KThread *t = c->thread;  // (the same safe point as rt_dispatch: kernel_preempt)
     if (t && t->core_held >= 0 && __builtin_expect(g_core_best_wait[t->core_held].v < t->prio, 0)) kernel_preempt(t);
+    // A host function (the NVN API the game calls through its function pointers, the SDK's): from its slot at once.
+    // It is never in the function table or the cache - looking there only missed, ~30,000 times a frame (NVN alone).
+    // Still a reboot's safe point.
+    if (c->pc - HLE_BASE < (uint64_t)hle_count * 16) {
+        GuestFn f = hle_slots[(c->pc - HLE_BASE) / 16].fn;
+        if (__builtin_expect(f != NULL, 1)) {
+            rt_unwind_point();
+            return f;
+        }
+    }
     if (perf_survey_mode == SURVEY_MAIN || perf_survey_mode == SURVEY_JOBS || perf_survey_mode == SURVEY_OVERLAP_SENSITIVITY || perf_survey_mode == SURVEY_WAIT_JOBS) {
         static __thread uint64_t survey_seen;
         uint64_t frame = atomic_load_explicit(&perf_survey_frame, memory_order_relaxed);
