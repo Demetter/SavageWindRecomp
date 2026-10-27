@@ -4346,16 +4346,18 @@ static bool mvo_wanted(void) {
 #define MVO_TAB (1u << 16)
 #define MVO_JUMP 1.0f
 #define MVO_JUMP_REL 0.25f
-typedef struct { uint64_t key; uint32_t off, size; } MvoEntry;
+typedef struct { uint64_t key, akey; uint32_t off, size; } MvoEntry;  // (akey: the draw's address key, mvo_akey)
 typedef struct { MvoEntry *e; uint32_t n, cap; uint8_t *data; uint64_t used, dcap; uint32_t *tab; uint64_t frame; } MvoFrame;
 static MvoFrame mvo[2];
 static int mvo_cur;
 static uint64_t mvo_draw;  // this draw's key
+static uint64_t mvo_akey;  // ... and its address key (mvo_prepare)
 static uint64_t mvo_base;  // ... before its occurrence
 static uint32_t mvo_nth;   // ... its occurrence
 static uint64_t mvo_occ_key[MVO_TAB];
 static uint32_t mvo_occ[MVO_TAB];
-static uint64_t mvo_stats[5];  // cbufs: previous found, missing, rejected (a jump); draws: moved by themselves, still
+static uint64_t mvo_stats[7];  // cbufs: previous found, missing, rejected (a jump); draws: moved by themselves, still;
+                               // draws matched by their buffers, by mvo_pick
 static VkDescriptorBufferInfo mvo_prev_ubo[18];  // (this thread: the velocity draw's bindings 100 + k)
 static __thread const VkDescriptorBufferInfo *t_vel_prev;  // (stage_set: the draw's bindings 100 + k, NULL: none)
 
@@ -4378,9 +4380,10 @@ static void mvo_frame_check(void) {
     static uint64_t logged;
     if (fr >= logged + 600) {
         logged = fr;
-        LOG("[mv-objects] frame %llu: previous constants found %llu, missing %llu, rejected %llu; draws moved %llu, still %llu\n",
-            (unsigned long long)fr, (unsigned long long)mvo_stats[0], (unsigned long long)mvo_stats[1],
-            (unsigned long long)mvo_stats[2], (unsigned long long)mvo_stats[3], (unsigned long long)mvo_stats[4]);
+        LOG("[mv-objects] frame %llu: previous constants found %llu, missing %llu, rejected %llu; draws moved %llu, still %llu; "
+            "matched by their buffers %llu, by search %llu\n", (unsigned long long)fr, (unsigned long long)mvo_stats[0],
+            (unsigned long long)mvo_stats[1], (unsigned long long)mvo_stats[2], (unsigned long long)mvo_stats[3],
+            (unsigned long long)mvo_stats[4], (unsigned long long)mvo_stats[5], (unsigned long long)mvo_stats[6]);
     }
 }
 
@@ -4419,7 +4422,7 @@ static void mvo_record(int k, const void *src, uint32_t size) {
         f->used += size;
         mvo_last[k].frame = f->frame, mvo_last[k].addr = addr, mvo_last[k].off = off, mvo_last[k].size = size;
     }
-    f->e[f->n] = (MvoEntry){key, off, size};
+    f->e[f->n] = (MvoEntry){key, mvo_akey, off, size};
     uint32_t s = (uint32_t)(key ^ (key >> 31)) & (MVO_TAB - 1);
     while (f->tab[s]) s = (s + 1) & (MVO_TAB - 1);
     f->tab[s] = ++f->n;
@@ -4549,8 +4552,76 @@ static uint32_t mvo_cbuf_bytes(const ShaderInfo *si, int k, Range r) {
 // Returns whether the object moved by itself: every cbuf's previous copy found and usable, and one besides the camera
 // block changed. If not - still, new this frame, or a jump - the draw needs no second vertex pass: its velocity is the
 // camera's (or unknown), which dlss_mv.comp makes from the depth (vel_program's "still" variant writes w 0).
+// Objects by their constant buffers. BOTW keeps each object's vertex constants (cbufs 3+) at the same addresses frame
+// after frame, alternating between two buffers: 99% of the velocity draws at the Plateau and Kakariko find their exact
+// addresses two frames back (27 Oct). Once mvo_pick has matched a draw to one of last frame's (by occurrence and
+// closest constants), the pair of address keys is kept, and later frames find the previous draw with one lookup: no
+// candidates' constants compared (mvo_pick was most of mvo_prepare's ~1.3 ms a frame with DLSS at the Plateau). A pair
+// whose previous draw is missing or whose constants jumped is dropped, and that draw is matched again.
+#define MVO_ATAB (1u << 14)
+static struct { uint64_t akey, draw, frame; } mvo_atab[2][MVO_ATAB];  // per frame (as mvo[]): address key -> draw key
+static struct { uint64_t a, b; } mvo_pairs[MVO_ATAB];  // address key -> the same object's in the other frame
+static uint64_t mvo_akey_of(const ShaderInfo *si) {  // the program, vertex stream 0 and the object's own cbuf addresses
+    uint64_t h = mvo_mix(0x84222325cbf29ce4ull, (uint64_t)(uintptr_t)st.program);
+    h = mvo_mix(h, st.vbuf[0].addr);
+    for (int k = 3; k < 18; k++)
+        if ((si->cbuf_mask & (1u << k)) && st.ubuf[0][k - 3].addr != taa.cam) h = mvo_mix(h, st.ubuf[0][k - 3].addr);
+    return h ? h : 1;
+}
+static uint32_t mvo_aslot(uint64_t k) { return (uint32_t)(k ^ (k >> 29)) & (MVO_ATAB - 1); }
+static uint64_t mvo_atab_find(int i, uint64_t frame, uint64_t akey) {
+    for (uint32_t s = mvo_aslot(akey), n = 0; n < 64; s = (s + 1) & (MVO_ATAB - 1), n++) {
+        if (mvo_atab[i][s].frame != frame + 1) return 0;
+        if (mvo_atab[i][s].akey == akey) return mvo_atab[i][s].draw;
+    }
+    return 0;
+}
+static void mvo_atab_add(int i, uint64_t frame, uint64_t akey, uint64_t draw) {
+    for (uint32_t s = mvo_aslot(akey), n = 0; n < 64; s = (s + 1) & (MVO_ATAB - 1), n++)
+        if (mvo_atab[i][s].frame != frame + 1 || mvo_atab[i][s].akey == akey) {
+            mvo_atab[i][s].akey = akey, mvo_atab[i][s].draw = draw, mvo_atab[i][s].frame = frame + 1;
+            return;
+        }
+}
+static uint64_t mvo_pair_of(uint64_t a) { uint32_t s = mvo_aslot(a); return mvo_pairs[s].a == a ? mvo_pairs[s].b : 0; }
+static void mvo_pair_set(uint64_t a, uint64_t b) { uint32_t s = mvo_aslot(a); mvo_pairs[s].a = a, mvo_pairs[s].b = b; }
+
 static bool mvo_prepare(const ShaderInfo *si) {
-    uint64_t prev = mvo_pick(si);
+    mvo_akey = mvo_akey_of(si);
+    uint64_t pair = mvo_prev_ok() ? mvo_pair_of(mvo_akey) : 0;
+    uint64_t prev = pair ? mvo_atab_find(mvo_cur ^ 1, mvo_prev_frame()->frame, pair) : 0;
+    bool paired = prev != 0;
+    if (!paired) prev = mvo_pick(si);
+    mvo_stats[paired ? 5 : 6]++;
+    {   // (checking) SAVAGEWIND_MVO_PAIR_CHECK=1: the search's choice beside the pair's
+        static int chk = -1;
+        static uint64_t n, differ, same_data, pair_closer, pick_closer;
+        if (chk < 0) chk = getenv("SAVAGEWIND_MVO_PAIR_CHECK") != NULL;
+        if (chk && paired) {
+            uint64_t pk = mvo_pick(si);
+            n++;
+            if (pk != prev) {
+                differ++;
+                float dp = 0, dk = 0;  // each choice's distance from this frame's constants
+                for (int k = 3; k < 18; k++) {
+                    Range r = st.ubuf[0][k - 3];
+                    if (!(si->cbuf_mask & (1u << k)) || !r.addr || r.addr == taa.cam) continue;
+                    const MvoEntry *a = mvo_find(mvo_prev_frame(), prev, k), *b = mvo_find(mvo_prev_frame(), pk, k);
+                    if (!a || !b) continue;
+                    const uint32_t *now = (const uint32_t *)(uintptr_t)r.addr;
+                    dp += mvo_dist((const uint32_t *)(mvo_prev_frame()->data + a->off), now, (r.size < a->size ? r.size : a->size) / 4, 1e30f);
+                    dk += mvo_dist((const uint32_t *)(mvo_prev_frame()->data + b->off), now, (r.size < b->size ? r.size : b->size) / 4, 1e30f);
+                }
+                if (dp == dk) same_data++;
+                else if (dp < dk) pair_closer++;
+                else pick_closer++;
+            }
+            if (!(n & 0xFFFFF))
+                LOG("[mv-objects] pair check: %llu of %llu paired draws differ from the search: same data %llu, the pair's "
+                    "closer %llu, the search's closer %llu\n", (unsigned long long)differ, (unsigned long long)n,
+                    (unsigned long long)same_data, (unsigned long long)pair_closer, (unsigned long long)pick_closer);
+        }
+    }
     const void *pd[18] = {0};
     uint32_t ps[18] = {0};
     bool all = true, moved = false;
@@ -4562,6 +4633,15 @@ static bool mvo_prepare(const ShaderInfo *si) {
         else if (!same) moved = true;
     }
     moved = moved && all;
+    if (paired && !all) {
+        mvo_pair_set(mvo_akey, 0);  // (gone or jumped: matched again next time)
+    } else if (!paired && all && mvo_prev_ok()) {  // the object's address key last frame: kept both ways
+        const MvoEntry *e = NULL;
+        for (int k = 3; k < 18 && !e; k++)
+            if ((si->cbuf_mask & (1u << k)) && st.ubuf[0][k - 3].addr != taa.cam) e = mvo_find(mvo_prev_frame(), prev, k);
+        if (e && e->akey) mvo_pair_set(mvo_akey, e->akey), mvo_pair_set(e->akey, mvo_akey);
+    }
+    mvo_atab_add(mvo_cur, mvo[mvo_cur].frame, mvo_akey, mvo_draw);
     // (one upload per piece of data and submission: the camera block's previous copy, shared by every draw's record, goes
     // up once)
     static struct { const void *src; uint32_t size; uint64_t seq; VkDescriptorBufferInfo d; } up[18];
