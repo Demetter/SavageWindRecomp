@@ -393,14 +393,18 @@ void vk_full_barrier(VkCommandBuffer cb) {
 //    pass drew without a barrier of its own (a render-target change orders that on its hardware), and Vulkan orders
 //    attachment writes only within a pass.
 //  - none between dispatches (BOTW's chains of one-warp jobs run side by side) or before the first pass after them.
-// Each image keeps the barrier counts when a pass last drew into it: a vertex-stage or compute read of it before a
-// full barrier since (or a fragment read in a pass that began before one) ends the pass and gets a full one
-// (gb_covered). 5120x2160, uncapped: Plateau 287 -> 315 fps, Kakariko 251 -> 272, Hyrule Castle 193 -> 217; GPU frame
+// Each image keeps the barrier counts when a pass last drew into it: a vertex-stage or compute read of it before a full
+// barrier since ends the pass and gets a full one (gb_covered; fragment reads are covered by the pass's own barrier, and
+// a dispatch that stores counts as drawing). Checked against the old barriers in one run (mode 2: frames alternate):
+// consecutive frames differ no more than with these alone (0.6-0.8% of pixels at the Plateau, grass moving). 5120x2160, uncapped: Plateau 287 -> 315 fps, Kakariko 251 -> 272, Hyrule Castle 193 -> 217; GPU frame
 // at the castle 5.13 -> 4.54 ms (27 Oct). SAVAGEWIND_VK_GAME_BARRIERS=0: a full barrier before every pass and dispatch.
+// (testing) SAVAGEWIND_VK_GAME_BARRIERS=2: on in even frames, off in odd ones (consecutive frames compared in one run);
+// SAVAGEWIND_GB_FRAG_READS=1: fragment reads checked too
+static int gb_mode = -1;
+static bool gb_list_on = true;  // (mode 2: this list's)
 static int gb_on(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_VK_GAME_BARRIERS") ? atoi(getenv("SAVAGEWIND_VK_GAME_BARRIERS")) != 0 : 1;
-    return on;
+    if (gb_mode < 0) gb_mode = getenv("SAVAGEWIND_VK_GAME_BARRIERS") ? atoi(getenv("SAVAGEWIND_VK_GAME_BARRIERS")) : 1;
+    return gb_mode == 2 ? gb_list_on : gb_mode != 0;
 }
 static __thread bool gb_thread;   // (the render thread, while a list is translated)
 static bool gb_pending = true;    // a game barrier, a list, a fence or a read since the last barrier
@@ -5163,10 +5167,11 @@ static VkDescriptorBufferInfo gmem_info(void) {
 // Vertex / index data read in place from the imported guest heap (renderer.m bind_guest does the same with
 // g_guest_buffer): no per-draw copy, no index scan for the copy size. The game fences its CPU writes as on the
 // Switch. Falls back to copies outside the heap or without the import; SAVAGEWIND_VK_COPY_VERTICES=1 forces copies.
+static int guest_copy_vertices = -1;
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     if (bc_direct(addr, size, buf, off)) return true;
-    static int copy = -1;
-    if (copy < 0) copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
+    int copy = guest_copy_vertices;
+    if (copy < 0) copy = guest_copy_vertices = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
     if (t_worker < 0 && !gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
@@ -6018,7 +6023,12 @@ static void gw_check(const uint32_t cbufs[6], bool vertices, uint64_t iaddr, uin
     VkDeviceSize off;
     for (int i = 0; i < 16 && vertices && !wait; i++) {
         Range v = st.vbuf[i];
-        if (v.addr && !guest_direct(v.addr, v.size ? v.size : 256, &b, &off)) wait = gw_overlaps(v.addr, v.addr + (v.size ? v.size : 256));
+        uint64_t n = v.size ? v.size : 256;
+        // (in the imported heap: read in place, as guest_direct would say - the common case, without its call: this loop
+        //  ran for every draw after the frame's first storing shader, 7% of the render thread at the Plateau)
+        if (!v.addr || (gmem_buf && guest_copy_vertices == 0 && v.addr >= HEAP_BASE && v.addr + n <= HEAP_BASE + gmem_size))
+            continue;
+        if (!guest_direct(v.addr, n, &b, &off)) wait = gw_overlaps(v.addr, v.addr + n);
     }
     if (iaddr && !wait && !guest_direct(iaddr, isize, &b, &off)) wait = gw_overlaps(iaddr, iaddr + isize);
     if (!wait) return;
@@ -7219,6 +7229,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdDispatch(cb, dispatch_x, gy, gz);
     gb_game = false;
     gb_done(NULL, 0);
+    if (cp->si->writes_gmem || cp->si->ntex) gb_drawn = true;  // (stores, maybe to images: the next pass orders after it)
     // (gpuprof: a row lasts until the next mark, idle GPU included; this separates the dispatch from what follows. At
     // Hyrule Castle, 27 Oct, cs ffe9487d2fdb1041 is 0.52 ms itself: 109 KB of straight-line code run by 44 warps, one
     // an SM, its instruction fetches exposed; guest memory in VRAM, no textures or overlap with graphics didn't help.)
@@ -8264,25 +8275,25 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
     }
     fb_draws++;
     if (lst_on > 0) lst_draw(pr);
-    if (gb_on())  // (the game's barriers: a texture drawn into since the last barrier that covers this read)
-        for (int sg = 0; sg < 2; sg++) {
-            ShaderInfo *si = sg ? pr->fi : pr->vi;
-            for (int i = 0; i < si->ntex; i++) {
-                NvnTexture *t = shader_texture_object(sg, &si->tex[i]);
-                bool own = false;  // (an image this pass draws into, through any texture of it - BOTW's mip chains
-                                   //  sample the level below through another: resolve_feedback)
-                for (int k = 0; t && t->backend && k < st.rt.ncolor && !own; k++) own = st.rt.color[k] && st.rt.color[k]->backend == t->backend;
-                if (t && t->backend && st.rt.depth && st.rt.depth->backend == t->backend) own = true;
-                // (a draw that begins a pass: that pass's barrier covers its fragment reads - something was drawn since
-                //  the last one, so it is at least a fragment barrier)
-                //  (not a cube's layered pass: it can go on across a change of face, begin_pass)
-                if (own || (sg == 1 && (!in_pass || (st.rt_dirty && !pass_cube_layers))) || gb_covered(t, sg)) continue;
-                if (in_pass) vk_end_pass(), st.rt_dirty = true;  // (the pass begins again after a full barrier)
-                gb_pending = true, gb_src = 3;
-                sg = 2;
-                break;
-            }
+    // (the game's barriers) A texture the vertex stage samples, drawn into since the last full barrier: the pass begins
+    // again after one. Fragment reads need no check: a pass after drawing begins with a fragment barrier at least.
+    static int gb_frag_reads = -1;  // (testing) SAVAGEWIND_GB_FRAG_READS=1: fragment reads checked too
+    if (gb_frag_reads < 0) gb_frag_reads = getenv("SAVAGEWIND_GB_FRAG_READS") != NULL;
+    for (int sg = 0; sg < 1 + gb_frag_reads && gb_on(); sg++) {
+        ShaderInfo *si = sg ? pr->fi : pr->vi;
+        int i = 0;
+        for (; i < si->ntex; i++) {
+            NvnTexture *t = shader_texture_object(sg, &si->tex[i]);
+            if (gb_covered(t, sg) || (sg == 1 && (!in_pass || (st.rt_dirty && !pass_cube_layers)))) continue;
+            bool own = st.rt.depth && st.rt.depth->backend == t->backend;  // (this pass's image, through any texture of it)
+            for (int k = 0; k < st.rt.ncolor && !own; k++) own = st.rt.color[k] && st.rt.color[k]->backend == t->backend;
+            if (own) continue;
+            if (in_pass) vk_end_pass(), st.rt_dirty = true;
+            gb_pending = true, gb_src = 3;
+            break;
         }
+        if (i < si->ntex) break;
+    }
     const ProducerMaterial *material = producer_material_find(pr);
     if (material) { nfeedback = 0; draw_feedback = false; }
     else resolve_feedback(pr);
@@ -11045,6 +11056,7 @@ static void exec_list(uint64_t handle, int depth) {
         compact_probe = e && atoi(e) == 2;
     }
     if (lst_on) lst_begin(depth);
+    if (!depth && gb_mode == 2) gb_list_on = !(renderer_present_count() & 1);
     if (!depth && gb_on()) {  // (a list from the queue: what came before it is ordered against it)
         gb_thread = true, gb_pending = true, gb_src = 0;
         vkq_work_hook = gb_work;
