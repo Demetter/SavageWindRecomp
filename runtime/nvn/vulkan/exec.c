@@ -377,6 +377,131 @@ void vk_full_barrier(VkCommandBuffer cb) {
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+// ---- The game's own barriers. NVN orders nothing between draws and dispatches unless the program asks
+// (nvnCommandBufferBarrier: order primitives / fragments, invalidate the texture cache, ...), and BOTW asks wherever its
+// next work depends on earlier work. A full barrier before every pass and dispatch drained the GPU ~150 times a frame,
+// mostly between work that doesn't depend on each other: ~70 one-warp dispatches and ~70 passes into tiny targets a
+// frame each paid the drain and the ramp (11-22 us), 1.6 ms of the Plateau's 3.5 ms GPU frame at 5120x2160 and 2.3 of
+// the castle's 5.1 (27 Oct). Now:
+//  - a full barrier before a game pass or dispatch when the game ordered primitives (or barriered otherwise) since the
+//    last one, a list or a fence began, or we recorded work of our own since (copies, clears, our own passes and
+//    dispatches: vkq_work_hook counts them). One skipped is still recorded before the first work of ours that comes
+//    before the game's own command (gb_lazy), where it was before.
+//  - a fragment barrier (the earlier fragments and compute before the next fragments; the next pass's vertex work starts
+//    meanwhile) for the game's "order fragments" barriers alone (with texture / shader cache invalidations: BOTW's mip,
+//    blur and bloom chains), and before a pass when passes drew since the last barrier: BOTW samples what an earlier
+//    pass drew without a barrier of its own (a render-target change orders that on its hardware), and Vulkan orders
+//    attachment writes only within a pass.
+//  - none between dispatches (BOTW's chains of one-warp jobs run side by side) or before the first pass after them.
+// Each image keeps the barrier counts when a pass last drew into it: a vertex-stage or compute read of it before a
+// full barrier since (or a fragment read in a pass that began before one) ends the pass and gets a full one
+// (gb_covered). 5120x2160, uncapped: Plateau 287 -> 315 fps, Kakariko 251 -> 272, Hyrule Castle 193 -> 217; GPU frame
+// at the castle 5.13 -> 4.54 ms (27 Oct). SAVAGEWIND_VK_GAME_BARRIERS=0: a full barrier before every pass and dispatch.
+static int gb_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_GAME_BARRIERS") ? atoi(getenv("SAVAGEWIND_VK_GAME_BARRIERS")) != 0 : 1;
+    return on;
+}
+static __thread bool gb_thread;   // (the render thread, while a list is translated)
+static bool gb_pending = true;    // a game barrier, a list, a fence or a read since the last barrier
+static int gb_src;                // (statistics) which: 0 a list, 1 a game barrier, 2 a fence, 3 a read
+static uint32_t gb_bits;          // the game's barrier bits since the last barrier
+static bool gb_lazy;              // a pass / dispatch skipped its barrier and hasn't recorded its own command yet
+static bool gb_game, gb_hook;     // the game's own command / our barrier is being recorded (not work of ours)
+static uint64_t gb_ops, gb_ops_seen;  // work of ours recorded; the count at the last game pass / dispatch
+static uint64_t gb_full = 1, gb_frag = 1;  // barriers recorded: full ones; full or fragment ones
+static bool gb_drawn;             // a pass drew since the last barrier
+static uint64_t gb_stat[8];       // full barriers for a game barrier, for work of ours; fragment barriers after drawing;
+                                  // none; full for a list, a fence, a read; fragment barriers for a game barrier
+
+static void consumer_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages);
+static void gb_recorded(bool full) {
+    gb_pending = gb_lazy = gb_drawn = false;
+    gb_bits = 0;
+    gb_frag++;
+    if (full) gb_full++;
+}
+static void gb_barrier_now(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
+    gb_hook = true;
+    consumer_barrier(cb, stages);
+    gb_hook = false;
+    gb_recorded(true);
+}
+#define GB_FRAG_STAGES (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |          \
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
+static void gb_fragment_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
+    bool compute = stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = GB_FRAG_STAGES | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = compute ? stages : GB_FRAG_STAGES,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    gb_hook = true;
+    vkCmdPipelineBarrier2(cb, &di);
+    gb_hook = false;
+    gb_recorded(false);
+}
+static Sub *sub(void);
+static void gb_work(VkCommandBuffer cb) {
+    if (!gb_thread || gb_game || gb_hook || cb != sub()->main) return;
+    gb_ops++;
+    if (gb_lazy) gb_barrier_now(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+}
+// Before a game pass or dispatch: its barrier now, or skipped for now (gb_lazy)
+static void gb_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
+    if (!gb_on() || !gb_thread) { consumer_barrier(cb, stages); return; }
+    int why = gb_pending ? (gb_src == 1 ? 0 : gb_src == 0 ? 4 : gb_src == 2 ? 5 : 6) : gb_ops != gb_ops_seen ? 1 : -1;
+    if (why == 0 && (gb_bits & 6u) && !(gb_bits & ~0x36u)) {  // (order fragments, with cache invalidations)
+        gb_fragment_barrier(cb, stages);
+        why = 7;
+    } else if (why < 0 && gb_drawn && stages != VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+        gb_fragment_barrier(cb, stages);
+        why = 2;
+    } else if (why >= 0) {
+        gb_barrier_now(cb, stages);
+    } else {
+        gb_lazy = true, why = 3;
+    }
+    gb_stat[why]++;
+}
+// The game's own command recorded (BeginRendering, Dispatch): the images it draws into (att) count from here
+static void gb_done(TexBackend *const *att, int n) {
+    gb_lazy = false;
+    gb_ops_seen = gb_ops;
+    for (int i = 0; i < n; i++)
+        if (att[i]) att[i]->gb_full = gb_full, att[i]->gb_frag = gb_frag, gb_drawn = true;
+}
+// A draw (stage 0 vertex, 1 fragment) or dispatch (5) samples t: whether a barrier since a pass last drew into it
+// covers that read (else the work needs a full one first)
+static bool gb_covered(NvnTexture *t, int stage) {
+    TexBackend *b = t ? t->backend : NULL;
+    if (!b || !gb_on() || !gb_thread) return true;
+    return gb_full > b->gb_full || (stage == 1 && gb_frag > b->gb_frag);
+}
+
+// (probe) SAVAGEWIND_LOG_BARRIERS=<n>: every n-th presented frame, the order of the game's own barriers (B<bits>),
+// passes (P<colour targets>:<w>x<h>) and dispatches (D<groups>:<cs id>) on one "[barriers]" line (the render thread)
+static void bt_note(const char *fmt, ...) {
+    static int every = -1;
+    static char buf[65536];
+    static size_t len;
+    static uint64_t frame = UINT64_MAX;
+    if (every < 0) every = getenv("SAVAGEWIND_LOG_BARRIERS") ? atoi(getenv("SAVAGEWIND_LOG_BARRIERS")) : 0;
+    if (every <= 0) return;
+    uint64_t fr = renderer_present_count();
+    if (fr != frame) {
+        if (len) LOG("[barriers] frame %llu: %s\n", (unsigned long long)frame, buf);
+        len = 0, buf[0] = 0, frame = fr;
+    }
+    if (fr % (uint64_t)every || len + 64 >= sizeof buf) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + len, sizeof buf - len, fmt, ap);
+    va_end(ap);
+    if (n > 0) len += (size_t)n;
+}
+
 // Only the upcoming consumer waits. Keep every prior stage in the source scope
 // for write-after-read hazards too. Copies/readbacks retain the full barrier.
 static void consumer_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
@@ -1928,11 +2053,13 @@ static void begin_pass(bool cube_layers) {
             break;
         }
     VkCommandBuffer cb = vk_cmd();
-    consumer_barrier(cb, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT);
+    gb_barrier(cb, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT);
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
                 (void *)st.rt.depth);
+        NvnTexture *tb = t0n ? t0n : st.rt.depth;
+        bt_note("P%d:%ux%u ", st.rt.ncolor, tb ? tb->width : 0, tb ? tb->height : 0);
     }
     {   // one scale for the pass: attachments the size of a scaled one are scaled too (BOTW's G-buffer mixes
         // targets the scaling heuristic takes and ones it does not; the unscaled ones got only part of the pass)
@@ -2106,7 +2233,16 @@ static void begin_pass(bool cube_layers) {
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL,
                           .flags = par_list && !pass_inline ? VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT : 0};
+    gb_game = true;
     vkCmdBeginRendering(cb, &ri);
+    gb_game = false;
+    {   // (its attachments as they are now: an image made for the pass above is one too)
+        TexBackend *att[9];
+        int n = 0;
+        for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i] && st.rt.color[i]->backend) att[n++] = st.rt.color[i]->backend;
+        if (st.rt.depth && st.rt.depth->backend) att[n++] = st.rt.depth->backend;
+        gb_done(att, n);
+    }
     in_pass = true;  // (before the clear: a parallel list's pass takes secondary buffers only, vk_cmd)
     if (cube_clear) {
         VkClearAttachment a = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0, .clearValue = cube_clear_value};
@@ -6946,7 +7082,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vk_end_pass();
     prepare_depth_comparisons(5,cp->si);
     VkCommandBuffer cb = vk_cmd();
-    consumer_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    for (int i = 0; i < cp->si->ntex && !gb_pending; i++)
+        if (!gb_covered(shader_texture_object(5, &cp->si->tex[i]), 5)) gb_pending = true, gb_src = 3;
+    gb_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     if ((co_on() == 2 || co_on() == 4) && cp->target) {
         co_audit(cp, gx, gy, gz);
         cb = vk_cmd(); // the differential check may have submitted and waited
@@ -6976,6 +7114,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %016llx%s", dispatch_x, gy, gz, cp->split_groups ? 8 : cp->local[0], cp->local[1], cp->local[2],
             (unsigned long long)vk_translate_id(cp->si), cp->si->uses_gmem ? " gmem" : "");
+    bt_note("D%u:%04llx%s ", gx * gy * gz, (unsigned long long)(vk_translate_id(cp->si) >> 48), cp->si->writes_gmem ? "w" : "");
     if (cp->heap_cache) hc_prepare(cb);  // include copies/barriers in this dispatch's timing
     bc_prepare(cp->si);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
@@ -6996,7 +7135,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
+    gb_game = true;
     vkCmdDispatch(cb, dispatch_x, gy, gz);
+    gb_game = false;
+    gb_done(NULL, 0);
     // (gpuprof: a row lasts until the next mark, idle GPU included; this separates the dispatch from what follows. At
     // Hyrule Castle, 27 Oct, cs ffe9487d2fdb1041 is 0.52 ms itself: 109 KB of straight-line code run by 44 warps, one
     // an SM, its instruction fetches exposed; guest memory in VRAM, no textures or overlap with graphics didn't help.)
@@ -8042,6 +8184,25 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
     }
     fb_draws++;
     if (lst_on > 0) lst_draw(pr);
+    if (gb_on())  // (the game's barriers: a texture drawn into since the last barrier that covers this read)
+        for (int sg = 0; sg < 2; sg++) {
+            ShaderInfo *si = sg ? pr->fi : pr->vi;
+            for (int i = 0; i < si->ntex; i++) {
+                NvnTexture *t = shader_texture_object(sg, &si->tex[i]);
+                bool own = false;  // (an image this pass draws into, through any texture of it - BOTW's mip chains
+                                   //  sample the level below through another: resolve_feedback)
+                for (int k = 0; t && t->backend && k < st.rt.ncolor && !own; k++) own = st.rt.color[k] && st.rt.color[k]->backend == t->backend;
+                if (t && t->backend && st.rt.depth && st.rt.depth->backend == t->backend) own = true;
+                // (a draw that begins a pass: that pass's barrier covers its fragment reads - something was drawn since
+                //  the last one, so it is at least a fragment barrier)
+                //  (not a cube's layered pass: it can go on across a change of face, begin_pass)
+                if (own || (sg == 1 && (!in_pass || (st.rt_dirty && !pass_cube_layers))) || gb_covered(t, sg)) continue;
+                if (in_pass) vk_end_pass(), st.rt_dirty = true;  // (the pass begins again after a full barrier)
+                gb_pending = true, gb_src = 3;
+                sg = 2;
+                break;
+            }
+        }
     const ProducerMaterial *material = producer_material_find(pr);
     if (material) { nfeedback = 0; draw_feedback = false; }
     else resolve_feedback(pr);
@@ -10804,6 +10965,20 @@ static void exec_list(uint64_t handle, int depth) {
         compact_probe = e && atoi(e) == 2;
     }
     if (lst_on) lst_begin(depth);
+    if (!depth && gb_on()) {  // (a list from the queue: what came before it is ordered against it)
+        gb_thread = true, gb_pending = true, gb_src = 0;
+        vkq_work_hook = gb_work;
+        static uint64_t logged;
+        uint64_t fr = renderer_present_count();
+        if (fr >= logged + 600) {
+            logged = fr;
+            LOG("[game-barriers] frame %llu: full for a game barrier %llu, for work of ours %llu, for a list %llu, for a "
+                "fence %llu, for a read %llu; fragment for a game barrier %llu, after drawing %llu; none %llu\n",
+                (unsigned long long)fr, (unsigned long long)gb_stat[0], (unsigned long long)gb_stat[1],
+                (unsigned long long)gb_stat[4], (unsigned long long)gb_stat[5], (unsigned long long)gb_stat[6],
+                (unsigned long long)gb_stat[7], (unsigned long long)gb_stat[2], (unsigned long long)gb_stat[3]);
+        }
+    }
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = nvn_cmd_extra(r);
@@ -10926,10 +11101,12 @@ static void exec_list(uint64_t handle, int depth) {
             uub_note(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (the shared copies over it are stale now)
             vram_list_written(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (and the heap copy: draws read it in place)
             break;
-        case CMD_BARRIER:
+        case CMD_BARRIER:  // (0: the start of a list the recorder made, not the game's)
+            if (r->x[0]) bt_note("B%llx ", (unsigned long long)r->x[0]), gb_pending = true, gb_src = 1, gb_bits |= (uint32_t)r->x[0];
             if (logfb > 0 && !fbskip) LOG("[feedback] barrier %#llx after %u draws\n", (unsigned long long)r->x[0], fb_draws);
             break;
         case CMD_FENCE_SYNC: {
+            gb_pending = true, gb_src = 2;
             if (bc_active && bc_vertex_seq > vk_completed_seq()) bc_reasons |= BC_LIVE_VERTEX;
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("SAVAGEWIND_FENCE_FLUSH") ? 1 : 0;

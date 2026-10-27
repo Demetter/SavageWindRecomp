@@ -147,6 +147,7 @@ typedef struct TexBackend {
     uint64_t drawn_frame, prev_drawn;  // last two frames a pass drew into it (exec.c: one-shot draws)
     uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
     uint64_t prep_frame;         // (parallel translation) the frame vk_tex_prepare last checked it
+    uint64_t gb_full, gb_frag;   // (exec.c, the game's barriers) the barrier counts when a pass last drew into it
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)

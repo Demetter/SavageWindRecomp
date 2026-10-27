@@ -22,6 +22,8 @@
 #include "../../rt.h"
 
 __thread bool vkq_on;
+void (*vkq_work_hook)(VkCommandBuffer cb);
+#define WORK(cb) do { if (vkq_work_hook) vkq_work_hook(cb); } while (0)
 bool vkq_address_wait;
 bool vkq_native_multi_draw;
 void vk_native_batch_replay(void *);
@@ -440,13 +442,20 @@ SCALAR2(CmdSetStencilReference, VkStencilFaceFlags, uint32_t)
 SCALAR2(CmdSetStencilWriteMask, VkStencilFaceFlags, uint32_t)
 SCALAR3(CmdBeginQuery, VkQueryPool, uint32_t, VkQueryControlFlags)
 SCALAR3(CmdBindIndexBuffer, VkBuffer, VkDeviceSize, VkIndexType)
-SCALAR3(CmdDispatch, uint32_t, uint32_t, uint32_t)
 SCALAR3(CmdResetQueryPool, VkQueryPool, uint32_t, uint32_t)
 SCALAR3(CmdSetDepthBias, float, float, float)
 SCALAR3(CmdWriteTimestamp2, VkPipelineStageFlags2, VkQueryPool, uint32_t)
 SCALAR4(CmdDraw, uint32_t, uint32_t, uint32_t, uint32_t)
 SCALAR5(CmdDrawIndexed, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
 SCALAR5(CmdSetStencilOp, VkStencilFaceFlags, VkStencilOp, VkStencilOp, VkStencilOp, VkCompareOp)
+typedef struct { VkCommandBuffer cb; uint32_t x, y, z; } A_CmdDispatch;
+static void R_CmdDispatch(void *p) { A_CmdDispatch *a = p; vkd_CmdDispatch(a->cb, a->x, a->y, a->z); }
+VKAPI_ATTR void VKAPI_CALL vkq_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    WORK(cb);
+    if (!vkq_on) { vkd_CmdDispatch(cb, x, y, z); return; }
+    A_CmdDispatch *a = push(R_CmdDispatch, sizeof *a);
+    a->cb = cb; a->x = x; a->y = y; a->z = z;
+}
 
 // ---- calls with arrays
 typedef struct { VkCommandBuffer cb; float c[4]; } A_CmdSetBlendConstants;
@@ -519,6 +528,7 @@ VKAPI_ATTR void VKAPI_CALL vkq_CmdPushConstants(VkCommandBuffer cb, VkPipelineLa
 typedef struct { VkCommandBuffer cb; VkBuffer s, d; uint32_t n; } A_CmdCopyBuffer;
 static void R_CmdCopyBuffer(void *p) { A_CmdCopyBuffer *a = p; vkd_CmdCopyBuffer(a->cb, a->s, a->d, a->n, (const VkBufferCopy *)AFTER(a)); }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *r) {
+    WORK(cb);
     if (!vkq_on) { vkd_CmdCopyBuffer(cb, s, d, n, r); return; }
     A_CmdCopyBuffer *a = push(R_CmdCopyBuffer, sizeof *a + ARR(VkBufferCopy, n));
     a->cb = cb; a->s = s; a->d = d; a->n = n;
@@ -532,6 +542,7 @@ static void R_CmdCopyBufferToImage(void *p) {
 }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer s, VkImage d, VkImageLayout dl,
                                                     uint32_t n, const VkBufferImageCopy *r) {
+    WORK(cb);
     if (!vkq_on) { vkd_CmdCopyBufferToImage(cb, s, d, dl, n, r); return; }
     A_CmdCopyBufferToImage *a = push(R_CmdCopyBufferToImage, sizeof *a + ARR(VkBufferImageCopy, n));
     a->cb = cb; a->s = s; a->d = d; a->dl = dl; a->n = n;
@@ -545,6 +556,7 @@ static void R_CmdCopyImageToBuffer(void *p) {
 }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkBuffer d,
                                                     uint32_t n, const VkBufferImageCopy *r) {
+    WORK(cb);
     if (!vkq_on) { vkd_CmdCopyImageToBuffer(cb, s, sl, d, n, r); return; }
     A_CmdCopyImageToBuffer *a = push(R_CmdCopyImageToBuffer, sizeof *a + ARR(VkBufferImageCopy, n));
     a->cb = cb; a->s = s; a->sl = sl; a->d = d; a->n = n;
@@ -556,6 +568,7 @@ VKAPI_ATTR void VKAPI_CALL vkq_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
     static void R_##name(void *p) { A_##name *a = p; vkd_##name(a->cb, a->s, a->sl, a->d, a->dl, a->n, (const R *)AFTER(a)); } \
     VKAPI_ATTR void VKAPI_CALL vkq_##name(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, \
                                           uint32_t n, const R *r) {                                                   \
+        WORK(cb);                                                                                                     \
         if (!vkq_on) { vkd_##name(cb, s, sl, d, dl, n, r); return; }                                                  \
         A_##name *a = push(R_##name, sizeof *a + ARR(R, n));                                                          \
         a->cb = cb; a->s = s; a->sl = sl; a->d = d; a->dl = dl; a->n = n;                                             \
@@ -571,6 +584,7 @@ static void R_CmdBlitImage(void *p) {
 }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdBlitImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl,
                                             uint32_t n, const VkImageBlit *r, VkFilter f) {
+    WORK(cb);
     if (!vkq_on) { vkd_CmdBlitImage(cb, s, sl, d, dl, n, r, f); return; }
     A_CmdBlitImage *a = push(R_CmdBlitImage, sizeof *a + ARR(VkImageBlit, n));
     a->cb = cb; a->s = s; a->sl = sl; a->d = d; a->dl = dl; a->n = n; a->f = f;
@@ -585,6 +599,7 @@ static void R_CmdClearColorImage(void *p) {
 VKAPI_ATTR void VKAPI_CALL vkq_CmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l,
                                                   const VkClearColorValue *c, uint32_t n,
                                                   const VkImageSubresourceRange *r) {
+    WORK(cb);
     if (!vkq_on) { vkd_CmdClearColorImage(cb, i, l, c, n, r); return; }
     A_CmdClearColorImage *a = push(R_CmdClearColorImage, sizeof *a + ARR(VkImageSubresourceRange, n));
     a->cb = cb; a->i = i; a->l = l; a->c = *c; a->n = n;
@@ -599,6 +614,7 @@ static void R_CmdClearDepthStencilImage(void *p) {
 VKAPI_ATTR void VKAPI_CALL vkq_CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout l,
                                                          const VkClearDepthStencilValue *v, uint32_t n,
                                                          const VkImageSubresourceRange *r) {
+    WORK(cb);
     if (!vkq_on) { vkd_CmdClearDepthStencilImage(cb, i, l, v, n, r); return; }
     A_CmdClearDepthStencilImage *a = push(R_CmdClearDepthStencilImage, sizeof *a + ARR(VkImageSubresourceRange, n));
     a->cb = cb; a->i = i; a->l = l; a->v = *v; a->n = n;
@@ -641,6 +657,7 @@ static void R_CmdBeginRendering(void *p) {
     vkd_CmdBeginRendering(a->cb, &a->ri);
 }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
+    WORK(cb);
     bool chained = ri->pNext != NULL || ri->colorAttachmentCount > 8;
     uint32_t feedback = 0;
     for (uint32_t i = 0; i < ri->colorAttachmentCount && !chained; i++) {
@@ -675,6 +692,7 @@ static void R_CmdPipelineBarrier2(void *p) {
     vkd_CmdPipelineBarrier2(a->cb, &a->di);
 }
 VKAPI_ATTR void VKAPI_CALL vkq_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
+    WORK(cb);
     bool chained = di->pNext != NULL;
     for (uint32_t i = 0; i < di->imageMemoryBarrierCount && !chained; i++) chained = di->pImageMemoryBarriers[i].pNext != NULL;
     for (uint32_t i = 0; i < di->bufferMemoryBarrierCount && !chained; i++) chained = di->pBufferMemoryBarriers[i].pNext != NULL;

@@ -141,7 +141,13 @@ int framepace_target(void) {
 
 // No limit still stops at 300 fps: shorter steps lose precision in the game's float clocks (the time of day, 0..360,
 // takes 1/30 of a minute times the step each frame: at 300 fps that is 1% of the value's rounding unit per frame).
-#define FPS_CEILING 300
+// (measuring) SAVAGEWIND_FPS_CEILING=<fps>: another ceiling, to see how fast a scene could go.
+static int fps_ceiling(void) {
+    static int c;
+    if (!c) c = env_int("SAVAGEWIND_FPS_CEILING", 300) > 0 ? env_int("SAVAGEWIND_FPS_CEILING", 300) : 300;
+    return c;
+}
+#define FPS_CEILING fps_ceiling()
 
 // With VSync On or Adaptive (FIFO), a frame rate at or over the display's refresh rate waits for the display: up to a
 // refresh of delay, and with G-SYNC / FreeSync the display leaves its variable rate at the top of its range. So the

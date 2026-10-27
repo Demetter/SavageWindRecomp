@@ -10,6 +10,9 @@
 #include <vulkan/vulkan.h>
 
 extern __thread bool vkq_on;  // this thread's Vulkan commands go to the recording thread
+// Called first by every command that does work outside a draw (copies, clears, blits, resolves, dispatches, render
+// pass begins, barriers), deferred or not (exec.c: the game's own barriers)
+extern void (*vkq_work_hook)(VkCommandBuffer cb);
 extern bool vkq_native_multi_draw; // device initialization sets this before recorder creation
 void vkq_defer_begin(void);   // (the submission thread, at the start of a list)
 void vkq_defer_end(void);     // all of it recorded and submitted: direct calls are safe again
