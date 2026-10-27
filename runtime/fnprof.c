@@ -112,7 +112,84 @@ static void args_check(uint64_t a, uint64_t lr) {
         }
 }
 
+// SAVAGEWIND_FNPROF_GROUPS=<addr of the job runner, 1.9.0: 7000ef62dc>: how big BOTW's job groups are. At a group's
+// first chunk (the runner's x0 is the group; its next job +0x94 still 0) its job count (+0x90) is filed under the
+// group's vtable, the runner's caller and the first job's vtable; written as build/fnprof_groups.txt (how much work a
+// phase can be split into: BOTW-JOBS-NATIVE.md).
+// With a second address (SAVAGEWIND_FNPROF_GROUPS=<runner>:<post>, 1.9.0: 7000ef62dc:7000ef6258, the worker's step
+// after a group's chunks) each thread's time on a group, from its first chunk to that step, is added up per kind
+// (total, longest, per thread kind), and the profile counts nothing else (the light mode: two compares per entry).
+static uint64_t grp_runner = ~0ull, grp_post;
+static struct {
+    _Atomic uint64_t key;
+    uint64_t jvt;
+    _Atomic uint64_t groups, jobs, max, small, ns, ns_max, ns_main;
+} grp[512];
+static __thread uint64_t grp_cur, grp_t0;  // (this thread's group in progress and when its first chunk started)
+static int grp_slot(uint64_t g, uint64_t *jvt_out) {
+    uint64_t vt = *(uint64_t *)(uintptr_t)g;
+    uint32_t n = *(uint32_t *)(uintptr_t)(g + 0x90);
+    uint64_t jobs = *(uint64_t *)(uintptr_t)(g + 0x88);
+    uint64_t jvt = n && jobs ? *(uint64_t *)(uintptr_t)*(uint64_t *)(uintptr_t)jobs : 0;
+    uint64_t key = vt ^ (jvt << 3);
+    *jvt_out = jvt;
+    for (uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 55), k = 0; k < 512; k++, h = (h + 1) & 511) {
+        uint64_t cur = atomic_load_explicit(&grp[h].key, memory_order_relaxed);
+        if (cur == key || (cur == 0 && atomic_compare_exchange_strong(&grp[h].key, &cur, key))) return (int)h;
+    }
+    return -1;
+}
+static void grp_check(uint64_t g) {
+    if (!g) return;
+    if (grp_cur != g) grp_cur = g, grp_t0 = plat_now_ns();
+    if (*(uint32_t *)(uintptr_t)(g + 0x94)) return;  // (sizes: once a group, at its first chunk)
+    uint64_t jvt;
+    int h = grp_slot(g, &jvt);
+    if (h < 0) return;
+    uint32_t n = *(uint32_t *)(uintptr_t)(g + 0x90);
+    grp[h].jvt = jvt;
+    atomic_fetch_add(&grp[h].groups, 1);
+    atomic_fetch_add(&grp[h].jobs, n);
+    if (n <= 3) atomic_fetch_add(&grp[h].small, 1);
+    for (uint64_t m = atomic_load(&grp[h].max); n > m && !atomic_compare_exchange_weak(&grp[h].max, &m, n);) {}
+}
+static void grp_done(uint64_t g) {
+    if (!g || g != grp_cur) return;
+    uint64_t dt = plat_now_ns() - grp_t0, jvt;
+    grp_cur = 0;
+    int h = grp_slot(g, &jvt);
+    if (h < 0) return;
+    atomic_fetch_add(&grp[h].ns, dt);
+    if (who_bit() == 1) atomic_fetch_add(&grp[h].ns_main, dt);
+    for (uint64_t m = atomic_load(&grp[h].ns_max); dt > m && !atomic_compare_exchange_weak(&grp[h].ns_max, &m, dt);) {}
+}
+static void grp_write(void) {
+    FILE *f = fopen("build/fnprof_groups.txt", "w");
+    if (!f) return;
+    fprintf(f, "# group_vtable first_job_vtable groups jobs avg_jobs max_jobs groups_of_<=3 thread_us_total "
+               "thread_us_longest thread_us_main\n");
+    for (int i = 0; i < 512; i++)
+        if (grp[i].key)
+            fprintf(f, "%llx %llx %llu %llu %.1f %llu %llu %.0f %.1f %.0f\n",
+                    (unsigned long long)(grp[i].key ^ (grp[i].jvt << 3)), (unsigned long long)grp[i].jvt,
+                    (unsigned long long)grp[i].groups, (unsigned long long)grp[i].jobs,
+                    grp[i].groups ? (double)grp[i].jobs / grp[i].groups : 0, (unsigned long long)grp[i].max,
+                    (unsigned long long)grp[i].small, grp[i].ns / 1e3, grp[i].ns_max / 1e3, grp[i].ns_main / 1e3);
+    fclose(f);
+}
+
 void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
+    if (grp_runner == ~0ull) {
+        const char *e = getenv("SAVAGEWIND_FNPROF_GROUPS");
+        char *p = NULL;
+        grp_runner = e ? strtoull(e, &p, 16) : 0;
+        grp_post = p && *p == ':' ? strtoull(p + 1, NULL, 16) : 0;
+    }
+    if (grp_runner) {
+        if (a == grp_runner) grp_check(x0);
+        else if (a == grp_post) grp_done(x0);
+        if (grp_post) return;  // (light mode: group times only)
+    }
     if (bt_n) bt_check(a, lr, x0);
     if (args_n) args_check(a, lr);
     uint32_t h = (uint32_t)((a >> 2) * 0x9E3779B1u) & (NSLOT - 1);
@@ -153,6 +230,7 @@ void fnprof_frame(uint64_t frame) {
     for (int i = 0; f && i < n; i++) fprintf(f, "%llx %llu %llu\n", (unsigned long long)rows[i][0], (unsigned long long)rows[i][1], (unsigned long long)rows[i][2]);
     if (f) fclose(f);
     free(rows);
+    if (grp_runner && grp_runner != ~0ull) grp_write();
     LOG("[fnprof] %d functions, written %s (frames %ld-%ld)\n", n, out, from, to);
     from = -1;
 }
