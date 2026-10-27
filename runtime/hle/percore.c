@@ -214,6 +214,36 @@ void rt_arena_reset(Cpu *c) {
     }
 }
 
+// ---- #25: the job manager's per-core scratch (one object): each core's 0x2800-byte scratch buffer (pointers at +0x458;
+// a job asking for at most that much gets its core's) and the most any job on the core asked for (u32s at +0x448). The
+// game makes, frees and zeroes its three at a time; the constructor's zeroing and the accessors are patched in place
+// (tools/patches.py _jobs_*), the init and destructor walk every core here.
+#define JOBS_BUFS(obj) rt_percore_block(obj, 0x458, 8, 3, 0)
+
+// The init f_700156da74 (1.9.0), at its first buffer's store: that one is core 0's, then every other core's from the
+// same heap (its vtable +0x30: alloc(size, align)).
+void rt_jobs_scratch_alloc(Cpu *c, uint64_t obj, uint64_t heap, uint64_t size, uint64_t first) {
+    uint64_t b = JOBS_BUFS(obj);
+    ST64(b, first);
+    for (int i = 1, n = rt_game_cores(); i < n; i++) {
+        c->x[0] = heap, c->x[1] = size, c->x[2] = 0x10;
+        guest_call(c, LD64(LD64(heap) + 0x30));
+        ST64(b + 8ull * (uint64_t)i, c->x[0]);
+    }
+}
+
+// The destructor f_700156d7b0 (1.9.0): every core's buffer back to the heap (free_fn).
+void rt_jobs_scratch_free(Cpu *c, uint64_t obj, uint64_t free_fn) {
+    uint64_t b = JOBS_BUFS(obj);
+    for (int i = 0, n = rt_game_cores(); i < n; i++) {
+        uint64_t p = LD64(b + 8ull * (uint64_t)i);
+        if (!p) continue;
+        c->x[0] = p;
+        guest_call(c, free_fn);
+        ST64(b + 8ull * (uint64_t)i, 0);
+    }
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);

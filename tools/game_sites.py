@@ -265,6 +265,32 @@ SITES = [
     Site('cstate_get_bound', 'code', '71000d3f 9a883148 b9400100 a8c27bfd d65f03c0 94000000/fc000000 14000000/fc000000', 0),
     Site('cstate_slot_base', 'code', '8b080268 8b09090a 71000d3f 52800109 9a883148 5280014a b9400108 7100091f', 0),
     Site('cstate_slot_bound', 'code', '71000d3f 52800109 9a883148 5280014a b9400108 7100091f 9a890149 7100051f', 0),
+    # the job manager's per-core scratch (BOTW-JOBS-NATIVE.md #25; tools/patches.py _jobs_*, runtime/hle/percore.c):
+    # the constructor's zeroing, the init's allocations, the destructor's frees, both accessors' base and bound
+    Site('jobs_ctor_marks', 'code', 'b904527f a9417bfd f902267f f9022e7f f902327f f902367f f9023a7f b9047a7f', 0),
+    Site('jobs_ctor_marks_b', 'code', 'f902267f f9022e7f f902327f f902367f f9023a7f b9047a7f f94013f3 9100c3ff', 0),
+    Site('jobs_ctor_bufs', 'code', 'f9022e7f f902327f f902367f f9023a7f b9047a7f f94013f3 9100c3ff d65f03c0', 0),
+    Site('jobs_ctor_bufs_b', 'code', 'f902327f f902367f f9023a7f b9047a7f f94013f3 9100c3ff d65f03c0', 0),
+    Site('jobs_ctor_bufs_c', 'code', 'f902367f f9023a7f b9047a7f f94013f3 9100c3ff d65f03c0', 0),
+    Site('jobs_alloc_0', 'code', 'f9022ea0 aa1603e0 aa1703e1 f94002c8 52800202 f9401908 d63f0100 f90232a0', 0),
+    Site('jobs_alloc_1', 'code', 'd63f0100 f90232a0 aa1603e0 aa1703e1 f94002c8 52800202 f9401908 d63f0100', 0),
+    Site('jobs_alloc_1s', 'code', 'f90232a0 aa1603e0 aa1703e1 f94002c8 52800202 f9401908 d63f0100 f90236a0', 0),
+    Site('jobs_alloc_2', 'code', 'd63f0100 f90236a0 b4000014/ff00001f f900dab4 90000008/9f00001f f9400108/ffc003ff b9400100 '
+         '94000000/fc000000', 0),
+    Site('jobs_alloc_2s', 'code', 'f90236a0 b4000014/ff00001f f900dab4 90000008/9f00001f f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 2a1f03e1', 0),
+    Site('jobs_free_0', 'code', 'f9422e60 b4000000/ff00001f 94000000/fc000000 f9022e7f f9423260 b4000000/ff00001f '
+         '94000000/fc000000 f902327f', 0),
+    Site('jobs_free_1', 'code', 'f9423260 b4000000/ff00001f 94000000/fc000000 f902327f f9423660 b4000000/ff00001f '
+         '94000000/fc000000 f902367f', 0),
+    Site('jobs_free_2', 'code', 'f9423660 b4000000/ff00001f 94000000/fc000000 f902367f 9109c260 94000000/fc000000 '
+         '90000008/9f00001f 9102a260', 0),
+    Site('jobs_free_fn', 'call', '94000000/fc000000 f9022e7f f9423260 b4000000/ff00001f 94000000/fc000000 f902327f f9423660 '
+         'b4000000/ff00001f', 0),
+    Site('jobs_mark_base', 'code', '91112288 b85fc3a9 8b09090a 71000d3f 9a9f3129 9a88314a b940014a 6b13015f', 0),
+    Site('jobs_mark_bound', 'code', '71000d3f 9a9f3129 9a88314a b940014a 6b13015f 5400000a/ff00001f b8297913 a9424ff4', 0),
+    Site('jobs_buf_base', 'code', '91116013 f9419108 b9400100 94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 b9401fa8', 0),
+    Site('jobs_buf_bound', 'code', '71000d1f 9a9f3108 f8687a60 f9400bf3 a8c27bfd d65f03c0 94000000/fc000000 14000000/fc000000', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -301,7 +327,13 @@ OPTIONAL_GROUPS = [
      'arena_free_fn', 'arena_begin_rec', 'arena_end_rec',
      'cstate_ctor_a', 'cstate_ctor_b', 'cstate_set_base',
      'cstate_set_bound', 'cstate_get_base', 'cstate_get_bound',
-     'cstate_slot_base', 'cstate_slot_bound'),
+     'cstate_slot_base', 'cstate_slot_bound',
+     'jobs_ctor_marks', 'jobs_ctor_marks_b', 'jobs_ctor_bufs',
+     'jobs_ctor_bufs_b', 'jobs_ctor_bufs_c', 'jobs_alloc_0',
+     'jobs_alloc_1', 'jobs_alloc_1s', 'jobs_alloc_2',
+     'jobs_alloc_2s', 'jobs_free_0', 'jobs_free_1',
+     'jobs_free_2', 'jobs_free_fn', 'jobs_mark_base',
+     'jobs_mark_bound', 'jobs_buf_base', 'jobs_buf_bound'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -477,6 +509,24 @@ KNOWN = {
         'cstate_get_bound': 0x7000eedf58,
         'cstate_slot_base': 0x7000eedfa8,
         'cstate_slot_bound': 0x7000eedfb0,
+        'jobs_ctor_marks': 0x700156d720,
+        'jobs_ctor_marks_b': 0x700156d728,
+        'jobs_ctor_bufs': 0x700156d72c,
+        'jobs_ctor_bufs_b': 0x700156d730,
+        'jobs_ctor_bufs_c': 0x700156d734,
+        'jobs_alloc_0': 0x700156dd70,
+        'jobs_alloc_1': 0x700156dd88,
+        'jobs_alloc_1s': 0x700156dd8c,
+        'jobs_alloc_2': 0x700156dda4,
+        'jobs_alloc_2s': 0x700156dda8,
+        'jobs_free_0': 0x700156d8bc,
+        'jobs_free_1': 0x700156d8cc,
+        'jobs_free_2': 0x700156d8dc,
+        'jobs_free_fn': 0x7000000680,
+        'jobs_mark_base': 0x700156fb90,
+        'jobs_mark_bound': 0x700156fb9c,
+        'jobs_buf_base': 0x700156fc18,
+        'jobs_buf_bound': 0x700156fc38,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

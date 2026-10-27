@@ -519,6 +519,55 @@ _CSTATE_BOUND = _ctx_patch(0x71000d3f, lambda gen, a: '(void)(subs32(c, (uint32_
                            'cmp w9, #3: a core with a slot', 'per-core state')
 
 
+# The job manager's per-core scratch (BOTW-JOBS-NATIVE.md #25; runtime/hle/percore.c): each core's 0x2800-byte scratch
+# buffer (pointers at +0x458) and the most a job on it asked for (u32s at +0x448) live in runtime blocks with a slot
+# for every game core. The constructor zeroes every slot at its first store of each array; the init makes every core's
+# buffer at its first (the other two allocations and stores do nothing); the destructor frees every core's at its first
+# load (the other two find nothing); the accessors take the blocks and bound the core by the game's core count.
+def _jobs(obj, field):
+    return f'rt_percore_block({obj}, {field:#x}, {4 if field == 0x448 else 8}, 3, 0)'
+
+
+def _jobs_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'job manager scratch')
+
+
+def _jobs_zero(word, field, what):  # the constructor's first store into an array: every core's slot
+    st = 'ST32' if field == 0x448 else 'ST64'
+    step = 4 if field == 0x448 else 8
+    return _jobs_patch(word, lambda gen, a: (
+        f'uint64_t b = {_jobs("c->x[19]", field)}; for (int i = 0, n = rt_game_cores(); i < n; i++) {st}(b + {step}ull * i, 0);'),
+        what)
+
+
+def _jobs_none(word, what):
+    return _jobs_patch(word, lambda gen, a: '(void)0;', what)
+
+
+def _jobs_alloc(gen, a):  # str x0, [x21, #0x458]: core 0's buffer, then every other core's
+    return _jobs_patch(0xf9022ea0, lambda gen, a: (
+        'extern void rt_jobs_scratch_alloc(Cpu *, uint64_t, uint64_t, uint64_t, uint64_t); '
+        'rt_jobs_scratch_alloc(c, c->x[21], c->x[22], c->x[23], c->x[0]);'),
+        'str x0, [x21, #0x458]: every core\'s scratch buffer')(gen, a)
+
+
+def _jobs_free(gen, a):  # ldr x0, [x19, #0x458]: free every core's; x0 = 0 (nothing left for the game's frees)
+    fn = gen.sites['jobs_free_fn']
+    return _jobs_patch(0xf9422e60, lambda gen, a: (
+        'extern void rt_jobs_scratch_free(Cpu *, uint64_t, uint64_t); '
+        f'rt_jobs_scratch_free(c, c->x[19], {fn:#x}ull); c->x[0] = 0;'),
+        'ldr x0, [x19, #0x458]: free every core\'s scratch buffer')(gen, a)
+
+
+def _jobs_base(word, dst, obj, field, what):  # add x<dst>, x<obj>, #field: the game's array -> the block
+    return _jobs_patch(word, lambda gen, a: f'c->x[{dst}] = {_jobs(f"c->x[{obj}]", field)};', what)
+
+
+def _jobs_bound(word, reg):  # cmp w<reg>, #3: the core has a slot?
+    return _jobs_patch(word, lambda gen, a: f'(void)(subs32(c, (uint32_t)c->x[{reg}], (uint32_t)rt_game_cores()));',
+                       f'cmp w{reg}, #3: a core with a slot')
+
+
 PATCHES = {
     'pause_options_update': _pause_option_state,
     'opt_create_rows': _opt_rows,
@@ -615,6 +664,23 @@ PATCHES = {
     'cstate_get_bound': _CSTATE_BOUND,
     'cstate_slot_base': _cstate_base(0x8b080268, 19),
     'cstate_slot_bound': _CSTATE_BOUND,
+    'jobs_ctor_marks': _jobs_zero(0xb904527f, 0x448, 'str wzr, [x19, #0x450]: zero every core\'s mark'),
+    'jobs_ctor_marks_b': _jobs_none(0xf902267f, 'str xzr, [x19, #0x448]: (every core\'s zeroed)'),
+    'jobs_ctor_bufs': _jobs_zero(0xf9022e7f, 0x458, 'str xzr, [x19, #0x458]: zero every core\'s buffer pointer'),
+    'jobs_ctor_bufs_b': _jobs_none(0xf902327f, 'str xzr, [x19, #0x460]: (every core\'s zeroed)'),
+    'jobs_ctor_bufs_c': _jobs_none(0xf902367f, 'str xzr, [x19, #0x468]: (every core\'s zeroed)'),
+    'jobs_alloc_0': _jobs_alloc,
+    'jobs_alloc_1': _jobs_none(0xd63f0100, 'blr x8: (every core\'s buffer made at the first)'),
+    'jobs_alloc_1s': _jobs_none(0xf90232a0, 'str x0, [x21, #0x460]: (every core\'s buffer made at the first)'),
+    'jobs_alloc_2': _jobs_none(0xd63f0100, 'blr x8: (every core\'s buffer made at the first)'),
+    'jobs_alloc_2s': _jobs_none(0xf90236a0, 'str x0, [x21, #0x468]: (every core\'s buffer made at the first)'),
+    'jobs_free_0': _jobs_free,
+    'jobs_free_1': _jobs_patch(0xf9423260, lambda gen, a: 'c->x[0] = 0;', 'ldr x0, [x19, #0x460]: (freed at the first)'),
+    'jobs_free_2': _jobs_patch(0xf9423660, lambda gen, a: 'c->x[0] = 0;', 'ldr x0, [x19, #0x468]: (freed at the first)'),
+    'jobs_mark_base': _jobs_base(0x91112288, 8, 20, 0x448, 'add x8, x20, #0x448: every core\'s mark'),
+    'jobs_mark_bound': _jobs_bound(0x71000d3f, 9),
+    'jobs_buf_base': _jobs_base(0x91116013, 19, 0, 0x458, 'add x19, x0, #0x458: every core\'s buffer'),
+    'jobs_buf_bound': _jobs_bound(0x71000d1f, 8),
     'arena_setup': _arena_setup,
     'arena_reset': _arena_reset,
     'arena_free_0': _arena_free(0xf9404808, True),
