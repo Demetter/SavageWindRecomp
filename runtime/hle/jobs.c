@@ -618,7 +618,7 @@ uint32_t rt_view_rec_parts(void) {
 enum { VRI_CONSUME, VRI_PART, VRI_CTX, VRI_CTX_FINI, VRI_ITEM_END, VRI_LOCK, VRI_UNLOCK, VRI_RECORD, VRI_BEGIN, VRI_END, VRI_REC };
 #define VRI_MIN 8
 uint64_t g_cmd_arena;  // (runtime/hle/percore.c rt_arena_setup) the command arena the parts are recorded from
-typedef struct { const uint64_t *fns; uint64_t list, pass, view, x4; uint32_t total, parts; } VriTask;
+typedef struct { const uint64_t *fns; uint64_t list, pass, view, x4, dctx; uint32_t total, parts; } VriTask;
 static __thread int t_vri;     // (in the consumer entered again: its search failing again records the game's way)
 static uint64_t g_vri_lists[16];
 static void vri_part(Cpu *c, void *arg, uint32_t i) {
@@ -630,6 +630,12 @@ static void vri_part(Cpu *c, void *arg, uint32_t i) {
     ST32(range, start), ST32(range + 4, count);
     c->x[0] = ctx;
     guest_call(c, t->fns[VRI_CTX]);
+    // (the layer's settings: its context's graphics state +8 up to the command buffer's +0xb8, and +0xf9; the part's
+    // own command buffer fields stay as made - +0xb8, +0xe8, +0xf8 and the wrapper at +0x100)
+    memcpy((void *)(uintptr_t)(ctx + 8), (const void *)(uintptr_t)(t->dctx + 8), 0xb0);
+    memcpy((void *)(uintptr_t)(ctx + 0xc0), (const void *)(uintptr_t)(t->dctx + 0xc0), 0x28);
+    memcpy((void *)(uintptr_t)(ctx + 0x1a0), (const void *)(uintptr_t)(t->dctx + 0x1a0), 0x30);
+    ST8(ctx + 0xf9, LD8(t->dctx + 0xf9));
     // (f_7000fab13c's steps with the inline recording's mode: the list's record for the pass, a command buffer begun
     // with the part's start as its key, the range recorded inheriting the state the layer set where it is called - the
     // views' part mode would set the pass's defaults again over it - the buffer ended and added to the record)
@@ -654,9 +660,11 @@ static void vri_part(Cpu *c, void *arg, uint32_t i) {
     c->sp = sp;
 }
 int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
-    // (off unless SAVAGEWIND_VIEW_REC_INLINE=1: the parts' draws need the layer's draw context, not a new one - at
-    // Kakariko the material lists the lighting reads came out black: characters and foliage unlit. Open: which of the
-    // context's 0x1d0 bytes are the layer's settings to copy and which the bind caches each part starts empty)
+    // (off unless SAVAGEWIND_VIEW_REC_INLINE=1: at Kakariko characters and foliage come out unlit - the material lists
+    // the lighting reads - with a new draw context, with the layer's context settings copied in as below too, and with
+    // the consumer's x6. Not the context then; open: what else the inline recording depends on - being recorded into the
+    // layer's own command buffer at that point. The views' part mode was worse: the pass defaults over the layer's
+    // per-tile state)
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("SAVAGEWIND_VIEW_REC_INLINE") && atoi(getenv("SAVAGEWIND_VIEW_REC_INLINE"));
     if (!enabled) return 0;
@@ -688,7 +696,7 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     for (int k = 0; k < 16; k++)  // (another thread took the same list in the meantime)
         if (k != slot && __atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) { __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST); return 0; }
     uint32_t n0 = LD32(list + 0x50);
-    VriTask t = {fns, list, pass, view, x4, total, parts};
+    VriTask t = {fns, list, pass, view, x4, dctx, total, parts};
     if (!rt_jobs_fork_join(c, vri_part, &t, parts))
         for (uint32_t i = 0; i < parts; i++) vri_part(c, &t, i);
     t_vri = 1;
@@ -705,6 +713,78 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 4)
         LOG("[jobs] view recording: list %llx (%u draws) recorded in %u parts on every core\n", (unsigned long long)list,
             total, parts);
+    return 1;
+}
+
+// (research) SAVAGEWIND_LAYER_STEP_DL=1: the layers' draws keep agl's one display list per render step (tools/patches.py
+// _layer_step_dl), what running a layer's steps on every core builds on; SAVAGEWIND_LAYER_STEPS=1 then does that.
+int rt_layer_step_dl(void) {
+    const char *e = getenv("SAVAGEWIND_LAYER_STEP_DL");
+    return e && atoi(e);
+}
+
+// (research, off: SAVAGEWIND_LAYER_STEPS=1 with SAVAGEWIND_LAYER_STEP_DL=1) Not right yet: a step's draw methods use per-core
+// entries the layer's setup fills only for the core its job runs on (f_70010642a8: [sp+0x60] + core x 0xa00, the
+// pointer from f_7000ed6364 at +0x4f8 null on another core: a crash at Kakariko); the step display lists alone are fine.
+// A layer's render steps with a display list each (f_7000ef4a5c, tools/patches.py _layer_steps; registers as at its
+// loop head: x22 the renderer, x24 the job's draw context, x23 the layer, w21 the flags, w20 a list per step, w25 the
+// steps, x19 the begin's first word, [sp + 0xc] the steps' first key). The steps to draw are found as the loop finds
+// them - the layer's own tests, +0x78 (skip) unless flags bit 0, +0x80 (which pass: 4 / 2, against the flags) - and
+// recorded on every core: each with a draw context of its own and the step info made for it as the loop makes it, its
+// display list begun with key first + i and put in the renderer's list, which the submit sorts by key - the GPU gets
+// the steps in order, as from one thread. 0: the loop does it.
+enum { LS_INFO, LS_DRAW, LS_INSERT, LS_BEGIN, LS_END, LS_CTX, LS_CTX_FINI, LS_DLG_GOT };
+typedef struct { const uint64_t *fns; uint64_t r, layer, dlg0, dlg1; uint32_t key0, n, steps[64]; } LsTask;
+static void ls_step(Cpu *c, void *arg, uint32_t k) {
+    LsTask *t = arg;
+    const uint64_t *fns = t->fns;
+    uint32_t i = t->steps[k];
+    uint64_t sp = c->sp, arena = LD64(t->r + 0x7d8);
+    c->sp = (sp - 0x300) & ~15ull;
+    uint64_t ctx = c->sp, info = ctx + 0x1e0, dlg = ctx + 0x240;
+    c->x[0] = ctx;
+    guest_call(c, fns[LS_CTX]);
+    c->x[0] = info, c->x[1] = ctx, c->x[2] = LD8(t->r + 8), c->x[3] = 0, c->x[4] = LD64(t->r + 0x10),
+    c->x[5] = (LD32(t->r + 0x838) >> 3) & 1, c->x[6] = t->layer;
+    guest_call(c, fns[LS_INFO]);
+    ST32(info, i);
+    ST64(dlg, t->dlg0), ST64(dlg + 8, t->dlg1);
+    c->x[0] = arena, c->x[1] = ctx, c->x[2] = dlg, c->x[3] = t->key0 + i;
+    guest_call(c, fns[LS_BEGIN]);
+    uint32_t key = (uint32_t)c->x[0];
+    c->x[0] = t->layer, c->x[1] = info;
+    guest_call(c, fns[LS_DRAW]);
+    if (key != UINT32_MAX) {
+        c->x[0] = arena, c->x[1] = ctx, c->x[2] = key;
+        guest_call(c, fns[LS_END]);
+        uint64_t dl = c->x[0];
+        c->x[0] = t->r, c->x[1] = ctx, c->x[2] = dl, c->x[3] = t->layer;
+        guest_call(c, fns[LS_INSERT]);
+    }
+    c->x[0] = ctx;
+    guest_call(c, fns[LS_CTX_FINI]);
+    c->sp = sp;
+}
+int rt_layer_steps(Cpu *c, const uint64_t *fns) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("SAVAGEWIND_LAYER_STEPS") && atoi(getenv("SAVAGEWIND_LAYER_STEPS"));
+    uint32_t count = (uint32_t)c->x[25], flags = (uint32_t)c->x[21];
+    if (!enabled || !(c->x[20] & 1) || count < 2 || count > 64 || !on()) return 0;
+    LsTask t = {fns, c->x[22], c->x[23], c->x[19], LD64(LD64(fns[LS_DLG_GOT]) + 8), LD32(c->sp + 0xc), 0, {0}};
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t vt = LD64(t.layer);
+        bool skip = false;
+        if (!(flags & 1)) {
+            c->x[0] = t.layer, c->x[1] = i;
+            guest_call(c, LD64(vt + 0x78));
+            skip = c->x[0] & 1;
+        }
+        c->x[0] = t.layer, c->x[1] = i;
+        guest_call(c, LD64(vt + 0x80));
+        if (!skip && ((c->x[0] & 1 ? 4u : 2u) & flags)) t.steps[t.n++] = i;
+    }
+    if (t.n > 1 && rt_jobs_fork_join(c, ls_step, &t, t.n)) return 1;
+    for (uint32_t k = 0; k < t.n; k++) ls_step(c, &t, k);
     return 1;
 }
 

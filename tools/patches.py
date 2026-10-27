@@ -530,6 +530,37 @@ def _view_rec_inline(gen, a):
             f'  /* {a:#x}: bl {t:#x} (a draw list with no parts: its parts on every core) */')
 
 
+# The layers' draws, one display list per render step (agl::lyr::Renderer [+0x838] bit 11, which 1.9.0's constructor
+# f_7000ef3870 clears at `and w8, w8, #0xfffff7ff`): kept on with SAVAGEWIND_LAYER_STEP_DL=1 (runtime/hle/jobs.c
+# rt_layer_step_dl), the steps then each a display list of their own.
+def _layer_step_dl(gen, a):
+    assert _word(gen, a) == 0x12147908, hex(_word(gen, a))  # and w8, w8, #0xfffff7ff
+    return ('{ extern int rt_layer_step_dl(void); c->x[8] = (uint32_t)c->x[8] & (rt_layer_step_dl() ? ~0u : 0xfffff7ffu); }'
+            f'  /* {a:#x}: and w8, w8, #0xfffff7ff (the layers: a display list per step) */')
+
+
+# ... and the loop over its render steps (1.9.0 f_7000ef4a5c at the loop head, `tbnz w21, #0, <the step's own skip
+# test>`): with a display list per step, the steps recorded on every core (runtime/hle/jobs.c rt_layer_steps), then on to
+# the function's end; otherwise the loop as it is. fns: the step info, the step's draw, the list's insert, the display
+# list's begin and end, the draw context's constructor and destructor, and the GOT entry of the begin's second word
+# (`adrp x8; ...; ldr x8, [x8, #lo]` in the loop, 0x4c / 0x58 on).
+def _layer_steps(gen, a):
+    w = _word(gen, a)
+    assert w & 0xfff8001f == 0x37000015, hex(w)  # tbnz w21, #0, skip
+    skip = a + sext((w >> 5) & 0x3fff, 14) * 4
+    ldr = _word(gen, a + 0x58)
+    assert ldr & 0xffc003ff == 0xf9400108, hex(ldr)  # ldr x8, [x8, #lo]
+    got = _adrp_page(gen, a + 0x4c) + ((ldr >> 10) & 0xfff) * 8
+    end = a + 0xd8  # (the loop's exit: the function's epilogue)
+    assert _word(gen, end) == 0xa94c4ff4, hex(_word(gen, end))  # ldp x20, x19, [sp, #0xc0]
+    fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in ('layer_step_info', 'layer_step_draw', 'layer_step_insert',
+                                                       'view_rec_begin', 'view_rec_end', 'view_rec_ctx',
+                                                       'view_rec_ctx_fini')) + f', {got:#x}ull'
+    return (f'{{ extern int rt_layer_steps(Cpu *, const uint64_t *); static const uint64_t fns[] = {{{fns}}}; '
+            f'if (rt_layer_steps(c, fns)) goto L_{end:x}; if (c->x[21] & 1) goto L_{skip:x}; }}'
+            f'  /* {a:#x}: tbnz w21, #0 (the layer steps: on every core) */')
+
+
 # The game's memory heap size (1.9.0 nninitStartup 0x7000000710: `mov w0, #0xc3000000` before SetMemoryHeapSize): the
 # PC's application memory less what the Switch build kept back (runtime/hle/heaps.c rt_memory_heap_size). BOTW gives
 # what its fixed heaps leave to "the rest" heaps, whose contents grow with the core count (BOTW-JOBS-NATIVE.md step 4).
@@ -1444,6 +1475,8 @@ PATCHES = {
     'view_rec_items': _view_rec_items,
     'view_rec_cbs': _view_rec_cbs,
     'view_rec_inline': _view_rec_inline,
+    'layer_step_dl': _layer_step_dl,
+    'layer_steps': _layer_steps,
     'jobs_push': _jobs_entry('rt_jobs_push', 0xa9bc7bfd, 0x40, 'stp x29, x30, [sp, #-0x40]! (job pool push)'),
     'jobs_kick': _jobs_entry('rt_jobs_kick', 0xd10103ff, 0x40, 'sub sp, sp, #0x40 (job pool kick)'),
     'jobs_run': _jobs_entry('rt_jobs_run', 0xa9ba7bfd, 0x60, 'stp x29, x30, [sp, #-0x60]! (job worker run)'),

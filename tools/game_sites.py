@@ -783,6 +783,19 @@ SITES = [
          '910743ff a9434ff4', 0),
     Site('view_rec_lock', 'call', '94000000/fc000000 b94052c8 7100051f 5400000b/ff00001f 2a1f03f8 52800e19 b94042ca 6b18015f', 0),
     Site('view_rec_unlock', 'call', '94000000/fc000000 aa1703e0 a9444ff4 a94357f6 f9400bf9 a9425ff8 a8c57bfd d65f03c0', 0),
+    # agl::lyr::Renderer's constructor (f_7000ef3870) clears [+0x838] bit 11, the layer draw's one display list per
+    # render step (f_7000ef4be4 / f_7000ef4a5c, keys key + 1 + i, sorted back into order at submit): tools/patches.py
+    # _layer_step_dl
+    Site('layer_step_dl', 'code', '12147908 b9083a68 52800028 a9417bfd 39002668 f94013f3 9100c3ff d65f03c0', 0),
+    # ... and its step loop (f_7000ef4a5c, at the loop head `tbnz w21, #0`): tools/patches.py _layer_steps records the
+    # steps on every core - the step info f_7000ef6650, the step's draw f_7000ef0264, the display list's insert
+    # f_7000ef4764 (begin / end: view_rec_begin / _end; the draw context: view_rec_ctx / _ctx_fini)
+    Site('layer_steps', 'code', '37000015/fff8001f f94002e8 aa1703e0 f9403d08 d63f0100 b94023e1 2a0003fa 14000000/fc000000', 0),
+    Site('layer_step_info', 'call', '94000000/fc000000 f94002e8 aa1703e0 f9401108 d63f0100 7100041f b90023ff 5400000b/ff00001f', 0),
+    Site('layer_step_draw', 'call', '94000000/fc000000 3100075f 54000000/ff00001f f943eec0 aa1803e1 2a1a03e2 94000000/fc000000 '
+         'aa0003e2', 0),
+    Site('layer_step_insert', 'call', '94000000/fc000000 14000000/fc000000 910083e1 aa1703e0 94000000/fc000000 b94023e8 11000501 '
+         '6b19003f', 0),
     Site('view_rec_record', 'call', '94000000/fc000000 b94002e3 aa0003f3 9100e002 aa1503e0 aa1403e1 94000000/fc000000 '
          '2a0003fa', 0),
     Site('view_rec_begin', 'call', '94000000/fc000000 2a0003fa aa1903e0 aa1403e1 aa1303e2 aa1803e3 aa1703e4 52800025', 0),
@@ -950,7 +963,8 @@ OPTIONAL_GROUPS = [
      'view_rec_jobs', 'view_rec_parts', 'view_rec_items', 'view_rec_cbs',
      'view_rec_inline', 'view_rec_consume', 'view_rec_part', 'view_rec_ctx',
      'view_rec_ctx_fini', 'view_rec_item_end', 'view_rec_lock', 'view_rec_unlock',
-     'view_rec_record', 'view_rec_begin', 'view_rec_end'),
+     'view_rec_record', 'view_rec_begin', 'view_rec_end', 'layer_step_dl',
+     'layer_steps', 'layer_step_info', 'layer_step_draw', 'layer_step_insert'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1479,6 +1493,11 @@ KNOWN = {
         'view_rec_item_end': 0x7000eb0380,
         'view_rec_lock': 0x7000eaff08,
         'view_rec_unlock': 0x7000eaff18,
+        'layer_step_dl': 0x7000ef3a48,
+        'layer_steps': 0x7000ef4aec,
+        'layer_step_info': 0x7000ef6650,
+        'layer_step_draw': 0x7000ef0264,
+        'layer_step_insert': 0x7000ef4764,
         'view_rec_record': 0x7000fab224,
         'view_rec_begin': 0x7000ef349c,
         'view_rec_end': 0x7000ef3608,
