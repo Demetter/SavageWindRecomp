@@ -12,7 +12,30 @@
 volatile int g_fnprof;
 
 #define NSLOT (1 << 18)
-static struct { _Atomic uint64_t addr; _Atomic uint64_t count; } slots[NSLOT];
+static struct { _Atomic uint64_t addr; _Atomic uint64_t count; _Atomic uint8_t who; } slots[NSLOT];
+
+// SAVAGEWIND_FNPROF_WHO=<main handle hex>:<job worker handles hex, comma-separated>: each function is also marked with
+// the kinds of thread that entered it (1 the main thread, 2 a job worker, 4 any other), written as a third column
+// (which game code runs in BOTW's jobs)
+static uint32_t who_main, who_jobs[16];
+static int who_n = -1;
+extern uint32_t kernel_current_thread_handle(void);
+static uint8_t who_bit(void) {
+    if (who_n < 0) {
+        who_n = 0;
+        const char *e = getenv("SAVAGEWIND_FNPROF_WHO");
+        if (e) {
+            char *p;
+            who_main = (uint32_t)strtoul(e, &p, 16);
+            while (p && *p && who_n < 16) { if (*p == ':' || *p == ',') p++; who_jobs[who_n++] = (uint32_t)strtoul(p, &p, 16); }
+        }
+    }
+    if (!who_n) return 0;
+    uint32_t h = kernel_current_thread_handle();
+    if (h == who_main) return 1;
+    for (int i = 0; i < who_n; i++) if (h == who_jobs[i]) return 2;
+    return 4;
+}
 
 // SAVAGEWIND_FNPROF_BT=<hex addr>[,...]: also print the host backtrace (guest functions are f_<addr>) the first time
 // each listed function is entered inside the window - who calls it
@@ -97,6 +120,8 @@ void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
         uint64_t cur = atomic_load_explicit(&slots[h].addr, memory_order_relaxed);
         if (cur == a || (cur == 0 && atomic_compare_exchange_strong(&slots[h].addr, &cur, a)) || cur == a) {
             atomic_fetch_add_explicit(&slots[h].count, 1, memory_order_relaxed);
+            uint8_t w = who_bit();
+            if (w && !(atomic_load_explicit(&slots[h].who, memory_order_relaxed) & w)) atomic_fetch_or(&slots[h].who, w);
             return;
         }
     }
@@ -118,14 +143,14 @@ void fnprof_frame(uint64_t frame) {
     if ((long)frame == from) { g_fnprof = 1; LOG("[fnprof] on at frame %llu\n", (unsigned long long)frame); }
     if ((long)frame != to) return;
     g_fnprof = 0;
-    uint64_t (*rows)[2] = malloc(sizeof(uint64_t[2]) * NSLOT);
+    uint64_t (*rows)[3] = malloc(sizeof(uint64_t[3]) * NSLOT);
     int n = 0;
     for (int i = 0; i < NSLOT; i++)
-        if (slots[i].addr) { rows[n][0] = slots[i].addr; rows[n][1] = slots[i].count; n++; }
+        if (slots[i].addr) { rows[n][0] = slots[i].addr; rows[n][1] = slots[i].count; rows[n][2] = slots[i].who; n++; }
     qsort(rows, n, sizeof rows[0], cmp);
     const char *out = getenv("SAVAGEWIND_FNPROF_OUT") ? getenv("SAVAGEWIND_FNPROF_OUT") : "build/fnprof.txt";  // (parallel runs)
     FILE *f = fopen(out, "w");
-    for (int i = 0; f && i < n; i++) fprintf(f, "%llx %llu\n", (unsigned long long)rows[i][0], (unsigned long long)rows[i][1]);
+    for (int i = 0; f && i < n; i++) fprintf(f, "%llx %llu %llu\n", (unsigned long long)rows[i][0], (unsigned long long)rows[i][1], (unsigned long long)rows[i][2]);
     if (f) fclose(f);
     free(rows);
     LOG("[fnprof] %d functions, written %s (frames %ld-%ld)\n", n, out, from, to);
