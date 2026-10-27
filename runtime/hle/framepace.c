@@ -240,6 +240,8 @@ void rt_vfr_update(uint64_t vfr) {
     extern uint64_t g_fs_vfr;  // (SAVAGEWIND_FRAME_LOG=2, nvn/objects.c)
     g_fs_vfr = plat_now_ns();
     clock_probe(vfr);
+    extern void rt_percore_check(void);  // (runtime/hle/percore.c: SAVAGEWIND_PERCORE_POISON)
+    rt_percore_check();
     {   // (probe) SAVAGEWIND_CPU_CLOCK=1: every ~2 s, the main thread's and the process's clock while running (cycles /
         // CPU time), the main thread's share of the wall time, and cycles per frame: whether frames got slower
         // because the CPU ran slower or because they took more cycles

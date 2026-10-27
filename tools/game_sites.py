@@ -198,6 +198,40 @@ SITES = [
          'bd00ba62 bd009663 f9400bf3', 0),
     Site('core_id_tls', 'got', '90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 94000000/fc000000 b4000000/ff00001f '
          '51000400 b9001fa0 91042268', 2),
+    # the command contexts per core (BOTW-JOBS-NATIVE.md #8; tools/patches.py _ctx_*, runtime/hle/percore.c): each
+    # place that computes a context's address, the constructor's loop, the walks over three or four contexts
+    Site('ctx_ctor_base', 'code', '9100c278 5280071a 5280141b 52805108 aa1403e1 9b2862f6 aa1603e0 94000000/fc000000', 0),
+    Site('ctx_ctor_sys', 'code', '71000f9f 54000001/ff00001f 910006fc 92407f97 7100139f 54000001/ff00001f 14000000/fc000000 '
+         'd10063a8', 0),
+    Site('ctx_ctor_count', 'code', '7100139f 54000001/ff00001f 14000000/fc000000 d10063a8 52820000 aa1403e1 52800082 2a1f03e3', 0),
+    Site('ctx_set_all', 'code', 'b9403008 f9057801 7100091f f9401c09 52802808 9a9f810a 8b0a0129 f9004521', 0),
+    Site('ctx_get_a', 'code', '9100c101 12000388 3900c3e8 12000368 3900a3e8 94000000/fc000000 a9494ff4 a94857f6', 0),
+    Site('ctx_get_b', 'code', '52800084 2a1503e5 2a1403e6 b90023fb f9000bfa b9000bf8 b90003ff 9b286528 52800029 390063e9 '
+         '9100c101', 10),
+    Site('ctx_get_c', 'code', '52800044 2a1503e5 2a1403e6 b90023fb f9000bfa b9000bf8 b90003ff 9b286528 52800029 390063e9 '
+         '9100c101', 10),
+    Site('ctx_get_d', 'code', '9100c101 12000368 3900c3e8 12000348 3900a3e8 94000000/fc000000 a9494ff4 f9402bfb', 0),
+    Site('ctx_sys_a', 'code', '911f2001 3940a3ab f9000be7 52800024 2a0803e7 390063ff b90003ff 3900a3ea', 0),
+    Site('ctx_sys_b', 'code', '911f2001 b9000be6 3940a3ab 52800084 2a0803e6 3940c3ac 390063ff b90003ff', 0),
+    Site('ctx_sys_c', 'code', '911f2001 b90023e7 f9000be6 52800104 2a0503e6 2a0803e7 390063ff b90003ff', 0),
+    Site('ctx_sys_d', 'code', '911f2001 1a9f1584 f9000be7 b90003e6 2a0803e6 3900a3ea 5280002a 52800027', 0),
+    Site('ctx_check_all', 'code', 'a9be7bfd f9000bf3 910003fd aa0003f3 b5000001/ff00001f 9100c261 aa1303e0 94000000/fc000000', 0),
+    Site('ctx_check_one', 'call', '94000000/fc000000 37000000/fff8001f f9400bf3 2a1f03e0 a8c27bfd d65f03c0 910ae261 aa1303e0', 0),
+    Site('ctx_sys_count', 'code', 'b947ca6a 93407ee9 9b385920 f943ea6b 6b08015f 9a9f8128 9b182d01 94000000/fc000000', 0),
+    Site('ctx_sys_entries', 'code', 'f943ea6b 6b08015f 9a9f8128 9b182d01 94000000/fc000000 910006e8 2a0002b5 92407d17', 0),
+    Site('ctx_reset_base', 'code', '9b280037 910003e8 aa0003f3 91005108 910003e0 91004129 a90023e9 52808008', 0),
+    Site('ctx_reset_0', 'code', '94000000/fc000000 aa1403e0 52800021 94000000/fc000000 aa1403e0 52800041 94000000/fc000000 '
+         'aa1403e0 52800061 94000000/fc000000 aa1303e0', 0),
+    Site('ctx_reset_1', 'code', '94000000/fc000000 aa1403e0 52800041 94000000/fc000000 aa1403e0 52800061 94000000/fc000000 '
+         'aa1303e0', 0),
+    Site('ctx_reset_2', 'code', '94000000/fc000000 aa1403e0 52800061 94000000/fc000000 aa1303e0 94000000/fc000000 79561a82 '
+         'aa1603e0', 0),
+    Site('ctx_reset_3', 'code', '94000000/fc000000 aa1303e0 94000000/fc000000 79561a82 aa1603e0 aa1a03e1 94000000/fc000000 '
+         'aa1603e0', 0),
+    Site('ctx_reset_fn', 'call', '94000000/fc000000 aa1403e0 52800021 94000000/fc000000 aa1403e0 52800041 94000000/fc000000 '
+         'aa1403e0 52800061 94000000/fc000000 aa1303e0', 0),
+    Site('ctx_size_base', 'code', '9100c013 f9419108 b9400100 94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 52805109', 0),
+    Site('ctx_flag_base', 'code', '9b284d28 f9400bf3 b942ad08 12000100 a8c27bfd d65f03c0 94000000/fc000000 14000000/fc000000', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -218,7 +252,15 @@ OPTIONAL_GROUPS = [
      'vfr_get_ratio_time', 'vfr_use_buffer_b', 'vfr_use_buffer_a',
      'vfr_set_min_delta', 'vfr_get_and_set_min', 'vfr_set_delta',
      'vfr_update_interval', 'vfr_update_spread', 'vfr_init_spread',
-     'vfr_reset_spread', 'core_id_tls'),
+     'vfr_reset_spread', 'core_id_tls',
+     'ctx_ctor_base', 'ctx_ctor_sys', 'ctx_ctor_count',
+     'ctx_set_all', 'ctx_get_a', 'ctx_get_b',
+     'ctx_get_c', 'ctx_get_d', 'ctx_sys_a',
+     'ctx_sys_b', 'ctx_sys_c', 'ctx_sys_d',
+     'ctx_check_all', 'ctx_check_one', 'ctx_sys_count',
+     'ctx_sys_entries', 'ctx_reset_base', 'ctx_reset_0',
+     'ctx_reset_1', 'ctx_reset_2', 'ctx_reset_3',
+     'ctx_reset_fn', 'ctx_size_base', 'ctx_flag_base'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -347,6 +389,30 @@ KNOWN = {
         'vfr_init_spread': 0x700151d330,
         'vfr_reset_spread': 0x700151d9d4,
         'core_id_tls': 0x7001e348b0,
+        'ctx_ctor_base': 0x7000ed60f8,
+        'ctx_ctor_sys': 0x7000ed61a0,
+        'ctx_ctor_count': 0x7000ed61b0,
+        'ctx_set_all': 0x7000ed626c,
+        'ctx_get_a': 0x7000ed6410,
+        'ctx_get_b': 0x7000ed68e0,
+        'ctx_get_c': 0x7000ed69c8,
+        'ctx_get_d': 0x7000ed6aa8,
+        'ctx_sys_a': 0x7000ed6b00,
+        'ctx_sys_b': 0x7000ed6b5c,
+        'ctx_sys_c': 0x7000ed6bb8,
+        'ctx_sys_d': 0x7000ed6c20,
+        'ctx_check_all': 0x7000ed70a0,
+        'ctx_check_one': 0x7000ed71e0,
+        'ctx_sys_count': 0x7000ed7220,
+        'ctx_sys_entries': 0x7000ed722c,
+        'ctx_reset_base': 0x7000ed72a4,
+        'ctx_reset_0': 0x7000ed6674,
+        'ctx_reset_1': 0x7000ed6680,
+        'ctx_reset_2': 0x7000ed668c,
+        'ctx_reset_3': 0x7000ed6698,
+        'ctx_reset_fn': 0x7000ed7278,
+        'ctx_size_base': 0x7000ed73f0,
+        'ctx_flag_base': 0x7000eea510,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

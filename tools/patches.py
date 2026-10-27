@@ -401,6 +401,55 @@ def _vfr_spread(fn, what):
     return patch
 
 
+# The command contexts (BOTW-JOBS-NATIVE.md #8; runtime/hle/percore.c): the game's four 0x288-byte contexts at +0x30
+# of their singleton (three game cores and the system core's threads) live in a runtime block with a slot for every
+# game core and the system threads' last. Every place that computes a context's address takes it from the block, the
+# constructor builds every slot, and the walks over three or four contexts visit every one.
+_CTX_DECL = ('extern uint64_t rt_percore_block(uint64_t, uint32_t, uint32_t, uint32_t, int); '
+             'extern int rt_game_cores(void); ')
+
+
+def _ctx(obj):
+    return f'rt_percore_block({obj}, 0x30, 0x288, 4, 1)'
+
+
+def _ctx_patch(word, body, what):
+    def patch(gen, a):
+        w = _word(gen, a)
+        assert (w == word) if word is not None else (w >> 26 == 0x25), hex(w)  # (None: a bl)
+        return '{ ' + _CTX_DECL + body(gen, a) + ' }' + f'  /* {a:#x}: {what} (per-core contexts) */'
+    return patch
+
+
+def _ctx_get(reg):  # add x1, x8, #0x30 after x8 = this (reg) + core * 0x288
+    return _ctx_patch(0x9100c101, lambda gen, a: f'c->x[1] = {_ctx(f"c->x[{reg}]")} + (c->x[8] - c->x[{reg}]);',
+                      'add x1, x8, #0x30: the current core\'s context')
+
+
+_CTX_SYS = _ctx_patch(0x911f2001, lambda gen, a: f'c->x[1] = {_ctx("c->x[0]")} + 0x288ull * (uint64_t)rt_game_cores();',
+                      'add x1, x0, #0x7c8: the system core\'s context')
+
+
+def _ctx_check_all(gen, a):  # f_7000ed70a0 (1.9.0): one context, or all the game cores' (all must pass)
+    fn = _fn(gen, 'ctx_check_one')
+    return _ctx_patch(0xa9be7bfd, lambda gen, a: (
+        f'extern void {fn}(Cpu *); uint64_t self = c->x[0]; if (c->x[1]) {{ {fn}(c); return; }} '
+        f'uint64_t blk = {_ctx("self")}; int n = rt_game_cores(); '
+        f'for (int i = 0; i < n; i++) {{ c->x[0] = self; c->x[1] = blk + 0x288ull * (uint64_t)i; {fn}(c); '
+        f'if (i < n - 1 && !(c->x[0] & 1)) {{ c->x[0] = 0; return; }} }} return;'),
+        'stp x29, x30, [sp, #-0x20]!: check the game cores\' contexts')(gen, a)
+
+
+def _ctx_reset_all(gen, a):  # the first of four calls f_7000ed7278(this, 0..3): every context, the system's last
+    fn = _fn(gen, 'ctx_reset_fn')
+    return _ctx_patch(None, lambda gen, a: (
+        f'extern void {fn}(Cpu *); int n = rt_game_cores() + 1; '
+        f'for (int i = 0; i < n; i++) {{ c->x[0] = c->x[20]; c->x[1] = (uint64_t)i; c->x[30] = {a + 4:#x}ull; {fn}(c); }}'),
+        'bl: reset every context')(gen, a)
+
+
+_CTX_RESET_DONE = _ctx_patch(None, lambda gen, a: '(void)0;', 'bl: (done with every context at the first call)')
+
 PATCHES = {
     'pause_options_update': _pause_option_state,
     'opt_create_rows': _opt_rows,
@@ -454,6 +503,41 @@ PATCHES = {
     'vfr_update_spread': _vfr_spread('rt_vfr_spread_core0', 'updateInterval'),
     'vfr_init_spread': _vfr_spread('rt_vfr_init_spread', 'init (and buffer A to B)'),
     'vfr_reset_spread': _vfr_spread('rt_vfr_spread_core0', 'resetTimeMultipliers'),
+    'ctx_ctor_base': _ctx_patch(0x9100c278, lambda gen, a: f'c->x[24] = {_ctx("c->x[19]")};',
+                                'add x24, x19, #0x30: the constructor\'s contexts'),
+    'ctx_ctor_sys': _ctx_patch(0x71000f9f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[28], (uint32_t)rt_game_cores()));',
+                               'cmp w28, #3: the system core\'s context (no buffer)'),
+    'ctx_ctor_count': _ctx_patch(0x7100139f,
+                                 lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[28], (uint32_t)rt_game_cores() + 1));',
+                                 'cmp w28, #4: every context'),
+    'ctx_set_all': _ctx_patch(0xb9403008, lambda gen, a: 'extern void rt_ctx_set_entries(Cpu *); rt_ctx_set_entries(c); return;',
+                              'ldr w8, [x0, #0x30]: every context\'s entry'),
+    'ctx_get_a': _ctx_get(25),
+    'ctx_get_b': _ctx_get(25),
+    'ctx_get_c': _ctx_get(25),
+    'ctx_get_d': _ctx_get(23),
+    'ctx_sys_a': _CTX_SYS,
+    'ctx_sys_b': _CTX_SYS,
+    'ctx_sys_c': _CTX_SYS,
+    'ctx_sys_d': _CTX_SYS,
+    'ctx_check_all': _ctx_check_all,
+    'ctx_sys_count': _ctx_patch(0xb947ca6a,
+                                lambda gen, a: f'c->x[10] = LD32({_ctx("c->x[19]")} + 0x288ull * (uint64_t)rt_game_cores());',
+                                'ldr w10, [x19, #0x7c8]: the system core\'s context'),
+    'ctx_sys_entries': _ctx_patch(0xf943ea6b,
+                                  lambda gen, a: f'c->x[11] = LD64({_ctx("c->x[19]")} + 0x288ull * (uint64_t)rt_game_cores() + 8);',
+                                  'ldr x11, [x19, #0x7d0]: the system core\'s context'),
+    'ctx_reset_base': _ctx_patch(0x9b280037, lambda gen, a: (
+        f'c->x[23] = {_ctx("c->x[0]")} - 0x30 + (uint64_t)((int64_t)(int32_t)c->x[1] * (int64_t)(int32_t)c->x[8]);'),
+        'smaddl x23, w1, w8, x0: context w1'),
+    'ctx_reset_0': _ctx_reset_all,
+    'ctx_reset_1': _CTX_RESET_DONE,
+    'ctx_reset_2': _CTX_RESET_DONE,
+    'ctx_reset_3': _CTX_RESET_DONE,
+    'ctx_size_base': _ctx_patch(0x9100c013, lambda gen, a: f'c->x[19] = {_ctx("c->x[0]")};', 'add x19, x0, #0x30: the contexts'),
+    'ctx_flag_base': _ctx_patch(0x9b284d28, lambda gen, a: (
+        f'c->x[8] = {_ctx("c->x[19]")} - 0x30 + (uint64_t)((int64_t)(int32_t)c->x[9] * (int64_t)(int32_t)c->x[8]);'),
+        'smaddl x8, w9, w8, x19: the current core\'s context'),
 }
 
 
