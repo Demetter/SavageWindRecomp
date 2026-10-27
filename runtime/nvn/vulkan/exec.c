@@ -1366,7 +1366,30 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_xwait = cum_xwait; l_draws = cum_draws; l_subs = cum_submits;
 }
 
+// (measuring) SAVAGEWIND_LOG_VMA=1: with each stats line, Vulkan memory by type ("[vma]"): blocks, their bytes, the bytes
+// allocated in them, and whether the type is mapped into the process (host-visible: its blocks count as committed memory)
+static void vma_log(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_LOG_VMA") != NULL;
+    if (!on || !g_vk.vma) return;
+    VmaTotalStatistics t;
+    vmaCalculateStatistics(g_vk.vma, &t);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        const VmaDetailedStatistics *d = &t.memoryType[i];
+        if (!d->statistics.blockCount) continue;
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        LOG("[vma] type %u%s%s%s: %u blocks %.0f MB, %u allocations %.0f MB\n", i,
+            f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? " device-local" : "", f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? " host-visible" : "",
+            f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " cached" : "", d->statistics.blockCount, d->statistics.blockBytes / 1048576.0,
+            d->statistics.allocationCount, d->statistics.allocationBytes / 1048576.0);
+    }
+    LOG("[vma] transient chunks %d\n", atomic_load(&nchunks));
+}
+
 const char *renderer_stats(void) {
+    vma_log();
     static int dumps, always = -1;
     if (always < 0) always = getenv("SAVAGEWIND_LOG_CMD_COUNTS") != NULL;  // (debugging) every interval, not just the first 3
     if (dumps++ < 3 || always) {
