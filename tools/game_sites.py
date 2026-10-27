@@ -232,6 +232,29 @@ SITES = [
          'aa1403e0 52800061 94000000/fc000000 aa1303e0', 0),
     Site('ctx_size_base', 'code', '9100c013 f9419108 b9400100 94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 52805109', 0),
     Site('ctx_flag_base', 'code', '9b284d28 f9400bf3 b942ad08 12000100 a8c27bfd d65f03c0 94000000/fc000000 14000000/fc000000', 0),
+    # the command memory arenas per core (BOTW-JOBS-NATIVE.md #10; tools/patches.py _arena_*, runtime/hle/percore.c):
+    # the setup and its callees, the per-frame reset, the destructor's frees, the two accessors' record bases
+    Site('arena_setup', 'code', 'd10343ff a9077bfd a9086ffc a90967fa a90a5ff8 a90b57f6 a90c4ff4 9101c3fd 91000c28', 0),
+    Site('arena_malloc', 'call', '94000000/fc000000 f9003ee0 b5000013/ff00001f 7100069f 5400000a/ff00001f a94c4ff4 a94b57f6 '
+         'a94a5ff8', 0),
+    Site('arena_pool_init', 'call', '94000000/fc000000 d10063a0 aa1403e1 aa1f03e2 94000000/fc000000 90000008/9f00001f f94012e0 '
+         'f9400108/ffc003ff', 0),
+    Site('arena_pool_addr', 'call', '94000000/fc000000 90000008/9f00001f f94012e0 f9400108/ffc003ff f9400108 d63f0100 aa0003f9 '
+         'aa1403e0', 0),
+    Site('arena_pool_cpu', 'got', '90000008/9f00001f f94012e0 f9400108/ffc003ff f9400108 d63f0100 aa0003f9 aa1403e0 f90017f4', 2),
+    Site('arena_pool_offset', 'call', '94000000/fc000000 f9400ee9 d342fd28 7100051f 5400000b/ff00001f 8b000328 d3428529 5285252a', 0),
+    Site('arena_blocks_alloc', 'call', '94000000/fc000000 f9403ee8 2a1f03f8 aa1603f5 b9408afb 29156aff f9000bfa f94017f9', 0),
+    Site('arena_buffers_alloc', 'call', 'aa1503e2 52800103 94000000/fc000000 14000000/fc000000', 2),
+    Site('arena_reset', 'code', 'f9408c08 b9409809 eb09011f 54000002/ff00001f aa0903e8 f9008c09 f9409009 b900981f', 0),
+    Site('arena_free_0', 'code', 'f9404808 aa0003f3 b4000008/ff00001f d1002100 94000000/fc000000 f9004a7f b9008a7f f9405e68', 0),
+    Site('arena_free_1', 'code', 'f9405e68 b4000008/ff00001f d1002100 94000000/fc000000 f9005e7f b900b27f f9407268 '
+         'b4000008/ff00001f', 0),
+    Site('arena_free_2', 'code', 'f9407268 b4000008/ff00001f d1002100 94000000/fc000000 f900727f b900da7f f9408668 '
+         'b5000008/ff00001f', 0),
+    Site('arena_free_fn', 'call', '94000000/fc000000 f9004a7f b9008a7f f9405e68 b4000008/ff00001f d1002100 94000000/fc000000 '
+         'f9005e7f', 0),
+    Site('arena_begin_rec', 'code', '9b285b28 394446ca 6b18013f b940890b f940490c 1a9f8309 6b0a017f 5280030b', 0),
+    Site('arena_end_rec', 'code', '9b294d13 aa1403e0 94000000/fc000000 b9409a68 0b080008 11000d08 121e7508 b9009a68', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -260,7 +283,12 @@ OPTIONAL_GROUPS = [
      'ctx_check_all', 'ctx_check_one', 'ctx_sys_count',
      'ctx_sys_entries', 'ctx_reset_base', 'ctx_reset_0',
      'ctx_reset_1', 'ctx_reset_2', 'ctx_reset_3',
-     'ctx_reset_fn', 'ctx_size_base', 'ctx_flag_base'),
+     'ctx_reset_fn', 'ctx_size_base', 'ctx_flag_base',
+     'arena_setup', 'arena_malloc', 'arena_pool_init',
+     'arena_pool_addr', 'arena_pool_cpu', 'arena_pool_offset',
+     'arena_blocks_alloc', 'arena_buffers_alloc', 'arena_reset',
+     'arena_free_0', 'arena_free_1', 'arena_free_2',
+     'arena_free_fn', 'arena_begin_rec', 'arena_end_rec'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -413,6 +441,21 @@ KNOWN = {
         'ctx_reset_fn': 0x7000ed7278,
         'ctx_size_base': 0x7000ed73f0,
         'ctx_flag_base': 0x7000eea510,
+        'arena_setup': 0x7000ef3098,
+        'arena_malloc': 0x7000007c20,
+        'arena_pool_init': 0x7000ebf6e0,
+        'arena_pool_addr': 0x7000ebf3e0,
+        'arena_pool_cpu': 0x7001db2660,
+        'arena_pool_offset': 0x7000ebf97c,
+        'arena_blocks_alloc': 0x7000ef3728,
+        'arena_buffers_alloc': 0x7000ef37a8,
+        'arena_reset': 0x7000ef33e8,
+        'arena_free_0': 0x7000ef2f6c,
+        'arena_free_1': 0x7000ef2f88,
+        'arena_free_2': 0x7000ef2fa0,
+        'arena_free_fn': 0x7000000680,
+        'arena_begin_rec': 0x7000ef350c,
+        'arena_end_rec': 0x7000ef365c,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

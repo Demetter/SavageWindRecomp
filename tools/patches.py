@@ -450,6 +450,50 @@ def _ctx_reset_all(gen, a):  # the first of four calls f_7000ed7278(this, 0..3):
 
 _CTX_RESET_DONE = _ctx_patch(None, lambda gen, a: '(void)0;', 'bl: (done with every context at the first call)')
 
+
+# The command memory arenas (BOTW-JOBS-NATIVE.md #10; runtime/hle/percore.c): the per-core records at +0x88 of the one
+# arena object live in a runtime block with a slot for every game core. The setup (memory for every core), the
+# per-frame reset and the destructor's frees run in the runtime over every record; the two accessors take the current
+# core's record from the block.
+_ARENA_FNS = ('arena_malloc', 'arena_pool_init', 'arena_pool_addr', 'arena_pool_cpu', 'arena_pool_offset',
+              'arena_blocks_alloc', 'arena_buffers_alloc')
+
+
+def _arena_setup(gen, a):
+    assert _word(gen, a) == 0xd10343ff, hex(_word(gen, a))  # sub sp, sp, #0xd0
+    fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in _ARENA_FNS)
+    return (f'{{ extern void rt_arena_setup(Cpu *, const uint64_t *); static const uint64_t fn[] = {{{fns}}}; '
+            'rt_arena_setup(c, fn); return; }'
+            f'  /* {a:#x}: sub sp, sp, #0xd0 (command arenas setup: every core\'s memory and record) */')
+
+
+def _arena_reset(gen, a):
+    assert _word(gen, a) == 0xf9408c08, hex(_word(gen, a))  # ldr x8, [x0, #0x118]
+    return ('{ extern void rt_arena_reset(Cpu *); rt_arena_reset(c); return; }'
+            f'  /* {a:#x}: ldr x8, [x0, #0x118] (command arenas frame reset: every core\'s record) */')
+
+
+def _arena_free(word, first):  # the destructor's three `ldr x8, [obj, #blocks]`: the first frees every core's
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        if not first:
+            return f'{{ c->x[8] = 0; }}  /* {a:#x}: (every core\'s blocks freed at the first) */'
+        fn = gen.sites['arena_free_fn']
+        return ('{ extern void rt_arena_free_blocks(Cpu *, uint64_t, uint64_t); uint64_t self = c->x[0]; '
+                f'rt_arena_free_blocks(c, self, {fn:#x}ull); c->x[0] = self; c->x[8] = 0; }}'
+                f'  /* {a:#x}: ldr x8, [x0, #0x90] (command arenas: free every core\'s blocks) */')
+    return patch
+
+
+def _arena_rec(word, mov, dst, obj, core):  # smaddl x<dst>, w<core>, w<0x28>, x<obj>: the current core's record - 0x88
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        assert _word(gen, a + mov[0]) == mov[1], hex(_word(gen, a + mov[0]))  # (its `mov w, #0x28`)
+        return ('{ extern uint64_t rt_percore_slot(uint64_t, uint32_t, uint32_t, uint32_t, int, int64_t); '
+                f'c->x[{dst}] = rt_percore_slot(c->x[{obj}], 0x88, 0x28, 3, 0, (int32_t)c->x[{core}]) - 0x88; }}'
+                f'  /* {a:#x}: smaddl x{dst}, w{core}, w, x{obj} (command arenas: the current core\'s record) */')
+    return patch
+
 PATCHES = {
     'pause_options_update': _pause_option_state,
     'opt_create_rows': _opt_rows,
@@ -538,6 +582,13 @@ PATCHES = {
     'ctx_flag_base': _ctx_patch(0x9b284d28, lambda gen, a: (
         f'c->x[8] = {_ctx("c->x[19]")} - 0x30 + (uint64_t)((int64_t)(int32_t)c->x[9] * (int64_t)(int32_t)c->x[8]);'),
         'smaddl x8, w9, w8, x19: the current core\'s context'),
+    'arena_setup': _arena_setup,
+    'arena_reset': _arena_reset,
+    'arena_free_0': _arena_free(0xf9404808, True),
+    'arena_free_1': _arena_free(0xf9405e68, False),
+    'arena_free_2': _arena_free(0xf9407268, False),
+    'arena_begin_rec': _arena_rec(0x9b285b28, (-0xc, 0x52800508), 8, 22, 25),
+    'arena_end_rec': _arena_rec(0x9b294d13, (-0x4, 0x52800509), 19, 19, 8),
 }
 
 
