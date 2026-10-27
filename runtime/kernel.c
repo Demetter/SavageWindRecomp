@@ -716,6 +716,81 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     pthread_mutex_unlock(&g_klock);
 }
 
+// ------------------------------------------------------------------ the game's locks
+// nn::os InternalCriticalSection::Enter (under every nn::os::Mutex, SdkMutex and sead::CriticalSection; the SDK calls
+// it through its own import stub, so this replaces it everywhere) the way a PC lock works: a thread that finds the lock
+// taken spins on its word while the owner is running on a core, and goes to the kernel (svcArbitrateLock) only when
+// the owner isn't running or keeps it longer. The SDK's Enter went to the kernel at once: right for the console,
+// where the owner may be waiting for the very core the spinner holds. Here each contended hand-over through the
+// emulated kernel cost both sides its global lock, a wait-list scan and an OS wake: at Kakariko the main thread and
+// both job workers each met ~16 taken locks a frame (f_700117127c's per-element locks), 7-11 us each
+// (SAVAGEWIND_PROF_SVC=2). The word keeps the console's protocol (the owner's handle; 0x40000000: threads wait in the
+// kernel), so the SDK's own Leave, and any caller that still reaches its Enter, stay compatible. A spinner doesn't set
+// the waiters bit, so its owner's Leave stays one atomic store.
+// SAVAGEWIND_NATIVE_MUTEX=0: the SDK's Enter. SAVAGEWIND_MUTEX_SPIN_US: the longest spin (10).
+#define CS_WAITERS 0x40000000u
+static uint64_t cs_spin_ns;
+static bool cs_owner_running(uint32_t owner) {
+    if (!cores_on()) return true;
+    for (int i = 0; i < 4; i++) {
+        KThread *o = __atomic_load_n(&g_cores[i].owner, __ATOMIC_RELAXED);  // (threads are freed only at a reboot)
+        if (o && o->handle == owner) return true;
+    }
+    return false;
+}
+static void cs_enter(Cpu *c) {
+    uint64_t addr = c->x[0];
+    uint32_t *w = (uint32_t *)(uintptr_t)addr;
+    // the tag, as the SDK reads it: the current nn::os::ThreadType's handle
+    uint32_t tag = *(uint32_t *)(uintptr_t)(*(uint64_t *)(uintptr_t)(c->tpidrro + 0x1f8) + 0x1b0);
+    uint32_t v = 0;
+    if (__atomic_compare_exchange_n(w, &v, tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    for (uint64_t end = 0;;) {
+        if (v == 0) {
+            if (__atomic_compare_exchange_n(w, &v, tag, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+            continue;
+        }
+        if ((v & CS_WAITERS) || !cs_owner_running(v)) break;
+        uint64_t now = plat_now_ns();
+        if (!end) end = now + cs_spin_ns;
+        else if (now > end) break;
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+        v = __atomic_load_n(w, __ATOMIC_RELAXED);
+    }
+    // the console's way: mark the word, let the kernel queue this thread until the lock is handed over
+    for (;;) {
+        v = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (v == 0) {
+            if (__atomic_compare_exchange_n(w, &v, tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+            continue;
+        }
+        if (!(v & CS_WAITERS) && !__atomic_compare_exchange_n(w, &v, v | CS_WAITERS, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            continue;
+        c->x[0] = v & ~CS_WAITERS;
+        c->x[1] = addr;
+        c->x[2] = tag;
+        rt_svc(c, 0x1A, 0x70026796d4ull);  // (the SDK's svcArbitrateLock stub; only for logs)
+        if ((uint32_t)c->x[0]) FATAL("ArbitrateLock(%x, %llx, %x) failed: %x\n", v & ~CS_WAITERS, (unsigned long long)addr, tag,
+                                     (uint32_t)c->x[0]);
+        if ((__atomic_load_n(w, __ATOMIC_ACQUIRE) & ~CS_WAITERS) == tag) return;
+    }
+}
+
+void kernel_native_sync_init(void) {
+    static bool done;
+    const char *e = getenv("SAVAGEWIND_NATIVE_MUTEX");
+    if (done || (e && !strcmp(e, "0"))) return;
+    done = true;
+    const char *s = getenv("SAVAGEWIND_MUTEX_SPIN_US");
+    cs_spin_ns = (uint64_t)(s ? atoi(s) : 10) * 1000;
+    hle_override(guest_sym("_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5EnterEv"), cs_enter,
+                 "InternalCriticalSection::Enter (native)");
+}
+
 // ------------------------------------------------------------------ address arbiter
 enum { ARB_WAIT_LESS = 0, ARB_DEC_WAIT_LESS = 1, ARB_WAIT_EQ = 2 };
 enum { ARB_SIGNAL = 0, ARB_SIGNAL_INC_EQ = 1, ARB_SIGNAL_MOD_EQ = 2 };
@@ -863,8 +938,94 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
 }
 
+// (probe) SAVAGEWIND_PROF_SVC=2: where the game's blocking calls come from. Each wait (mutex 0x1a, condition 0x1c,
+// address 0x34, handles 0x18) is filed under its thread, its svc and the guest return addresses of the innermost
+// six frames (the frame-pointer chain: the SDK's wrappers, then the game's callers); every 10 s the sites that blocked
+// longest are written, per thread with more than 20 ms of them.
+#define SVC_SITES 8192
+#define SVC_FRAMES 6
+static struct { uint64_t key[2 + SVC_FRAMES]; uint64_t n, ns; } svc_sites[SVC_SITES];
+static pthread_mutex_t svc_sites_m = PTHREAD_MUTEX_INITIALIZER;
+static void svc_site_add(Cpu *c, unsigned tid, uint32_t imm, uint64_t dt) {
+    uint64_t k[2 + SVC_FRAMES] = {tid, imm, c->x[30]};
+    uint64_t fp = c->x[29], sp = c->sp;
+    for (int i = 1; i < SVC_FRAMES; i++) {
+        if (!fp || (fp & 7) || fp < sp || fp - sp > (16u << 20)) break;
+        k[2 + i] = *(uint64_t *)(uintptr_t)(fp + 8);
+        uint64_t nfp = *(uint64_t *)(uintptr_t)fp;
+        fp = nfp > fp ? nfp : 0;
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 2 + SVC_FRAMES; i++) h = (h ^ k[i]) * 1099511628211ull;
+    pthread_mutex_lock(&svc_sites_m);
+    for (unsigned j = 0; j < SVC_SITES; j++) {
+        unsigned s = (unsigned)(h + j) & (SVC_SITES - 1);
+        if (!svc_sites[s].n) memcpy(svc_sites[s].key, k, sizeof k);
+        else if (memcmp(svc_sites[s].key, k, sizeof k)) continue;
+        svc_sites[s].n++, svc_sites[s].ns += dt;
+        break;
+    }
+    pthread_mutex_unlock(&svc_sites_m);
+}
+static int svc_site_cmp(const void *a, const void *b) {
+    uint64_t x = svc_sites[*(const int *)a].ns, y = svc_sites[*(const int *)b].ns;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void svc_sites_dump(void) {
+    static int idx[SVC_SITES];
+    uint64_t per[32] = {0};
+    pthread_mutex_lock(&svc_sites_m);
+    int n = 0;
+    for (int s = 0; s < SVC_SITES; s++)
+        if (svc_sites[s].n) idx[n++] = s, per[svc_sites[s].key[0] & 31] += svc_sites[s].ns;
+    qsort(idx, n, sizeof idx[0], svc_site_cmp);
+    for (int t = 0; t < 32; t++) {
+        if (per[t] < 20000000) continue;
+        int shown = 0;
+        for (int i = 0; i < n && shown < 14; i++) {
+            if ((svc_sites[idx[i]].key[0] & 31) != (uint64_t)t) continue;
+            shown++;
+            LOG("[svcsite] t%d svc%02llx n=%llu %.1f ms avg %.1f us:", t, (unsigned long long)svc_sites[idx[i]].key[1],
+                (unsigned long long)svc_sites[idx[i]].n, svc_sites[idx[i]].ns / 1e6, svc_sites[idx[i]].ns / 1e3 / svc_sites[idx[i]].n);
+            for (int f = 0; f < SVC_FRAMES; f++) LOG(" %llx", (unsigned long long)svc_sites[idx[i]].key[2 + f]);
+            LOG("\n");
+        }
+    }
+    memset(svc_sites, 0, sizeof svc_sites);
+    pthread_mutex_unlock(&svc_sites_m);
+}
+
+// (probe) SAVAGEWIND_PROF_SVC=3: also a timeline of every syscall of the main thread and the two job workers (thread
+// ids 0x50, 0x57, 0x58 at Kakariko) for half a second, 60 s after the first one, written to svc_timeline.txt: start
+// and end (us), thread, svc, x0, x1, return address. tools: scratchpad jobtl.py rebuilds BOTW's job phases from it.
+static struct { uint64_t t0, t1, a0, a1, lr; uint32_t tid, imm; } svc_tl[400000];
+static int svc_tl_n;
+static void svc_tl_add(uint64_t t0, uint64_t t1, unsigned tid, uint32_t imm, uint64_t a0, uint64_t a1, uint64_t lr) {
+    static uint64_t start, stop;
+    static int dumped;
+    if (!start) start = t0 + 60000000000ull, stop = start + 500000000ull;
+    if (t0 < start) return;
+    if (t0 > stop) {
+        if (!__atomic_exchange_n(&dumped, 1, __ATOMIC_SEQ_CST)) {
+            FILE *f = fopen("svc_timeline.txt", "w");
+            int n = svc_tl_n < (int)(sizeof svc_tl / sizeof svc_tl[0]) ? svc_tl_n : (int)(sizeof svc_tl / sizeof svc_tl[0]);
+            for (int i = 0; f && i < n; i++)
+                fprintf(f, "%.3f %.3f %u %02x %llx %llx %llx\n", (svc_tl[i].t0 - start) / 1e3, (svc_tl[i].t1 - start) / 1e3,
+                        svc_tl[i].tid, svc_tl[i].imm, (unsigned long long)svc_tl[i].a0, (unsigned long long)svc_tl[i].a1,
+                        (unsigned long long)svc_tl[i].lr);
+            if (f) fclose(f);
+            LOG("[svctl] %d syscalls written to svc_timeline.txt\n", n);
+        }
+        return;
+    }
+    int i = __atomic_fetch_add(&svc_tl_n, 1, __ATOMIC_RELAXED);
+    if (i >= (int)(sizeof svc_tl / sizeof svc_tl[0])) return;
+    svc_tl[i].t0 = t0, svc_tl[i].t1 = t1, svc_tl[i].tid = tid, svc_tl[i].imm = imm, svc_tl[i].a0 = a0, svc_tl[i].a1 = a1,
+    svc_tl[i].lr = lr;
+}
+
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
-    if (prof_svc < 0) prof_svc = ENV("SAVAGEWIND_PROF_SVC") != NULL;
+    if (prof_svc < 0) prof_svc = ENV("SAVAGEWIND_PROF_SVC") ? atoi(ENV("SAVAGEWIND_PROF_SVC")) > 0 ? atoi(ENV("SAVAGEWIND_PROF_SVC")) : 1 : 0;
     if (prof_svc && imm < 0x80) {
         uint64_t a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], lr = c->x[30];
         uint32_t h0 = imm == 0x18 && a2 ? *(uint32_t *)(uintptr_t)a1 : 0;
@@ -880,8 +1041,15 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
         unsigned tid = t_cur ? (unsigned)(t_cur->id & 31) : 31;
         svc_wait_ns[tid][imm] += dt;
         svc_calls[tid][imm]++;
-        static _Atomic uint64_t last;
+        if (prof_svc > 1 && (imm == 0x1a || imm == 0x1c || imm == 0x34 || imm == 0x18)) svc_site_add(c, tid, imm, dt);
+        if (prof_svc > 2 && t_cur && (t_cur->id == 0x50 || t_cur->id == 0x57 || t_cur->id == 0x58))
+            svc_tl_add(t0, t0 + dt, (unsigned)t_cur->id, imm, a0, a1, lr);
+        static _Atomic uint64_t last, last_sites;
         uint64_t now = plat_now_ns();
+        if (prof_svc > 1 && now - last_sites > 10000000000ull) {
+            if (last_sites) svc_sites_dump();
+            last_sites = now;
+        }
         if (now - last > 2000000000ull) {
             last = now;
             for (int t = 0; t < 32; t++) {

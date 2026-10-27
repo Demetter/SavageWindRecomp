@@ -168,6 +168,7 @@ static void boot(const char *root) {
     { extern void language_booted(void); language_booted(); }  // (runtime/language.c)
     kernel_init();
     dispatch_init();
+    { extern void kernel_native_sync_init(void); kernel_native_sync_init(); }  // (runtime/kernel.c)
     { extern void jpeg_debug_init(void); jpeg_debug_init(); }
 
     uint32_t stack_size = 0x100000;
