@@ -744,6 +744,73 @@ def _obj12_base(word, reg):  # add x8, x<reg>, w0, uxtw #3 (then [x8, #0x70]): t
         f'add x8, x{reg}, w0, uxtw #3: the core\'s object')
 
 
+# #27 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): per-slot queues of a few 0x3f0-byte objects (slot = sead's core
+# table entry of the core, < 3): buffers (+0x128), locks (+0x328) and cursors (+0x2a0) in blocks with a slot for every
+# core. The append and the walker take the blocks and bound the slot by the game's core count; the init makes every
+# slot's buffer at its first; the constructor's end makes every slot's lock and zeroes the rest.
+def _q27(obj, field, stride):
+    return f'rt_percore_block({obj}, {field:#x}, {stride:#x}, 3, 0)'
+
+
+def _q27_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-slot queues')
+
+
+def _q27_base(word, dst, obj, field, stride, what):
+    return _q27_patch(word, lambda gen, a: f'c->x[{dst}] = {_q27(f"c->x[{obj}]", field, stride)};', what)
+
+
+def _q27_cur(word, dst, obj, idx):  # add x<dst>, x<obj>, x<idx>, lsl #2 (then +0x2a0): the slot's cursor
+    return _q27_patch(word, lambda gen, a: f'c->x[{dst}] = {_q27(f"c->x[{obj}]", 0x2a0, 4)} - 0x2a0 + (c->x[{idx}] << 2);',
+                      f'add x{dst}, x{obj}, x{idx}, lsl #2: the slot\'s cursor')
+
+
+_Q27_BOUND = _q27_patch(0x71000f3f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[25], (uint32_t)rt_game_cores()));',
+                        'cmp w25, #3: a slot with a block entry')
+
+
+def _q27_init_first(gen, a):  # str w21, [x20, #0x128]: slot 0's buffer (x0, just made), then every other slot's
+    alloc, tag = gen.sites['q27_alloc_fn'], gen.sites['q27_alloc_tag']
+    return _q27_patch(0xb9012a95, lambda gen, a: (
+        'extern void rt_q27_bufs(Cpu *, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t); uint64_t x0 = c->x[0]; '
+        f'rt_q27_bufs(c, c->x[20], (uint32_t)c->x[21], x0, c->x[19], {alloc:#x}ull, LD64({tag:#x}ull)); c->x[0] = x0;'),
+        'str w21, [x20, #0x128]: every slot\'s buffer')(gen, a)
+
+
+def _q27_ctor_tail(gen, a):  # b memset(+0x2a0, 0, 0x84): then every slot's lock, buffer and cursor
+    mset, lctor = gen.sites['q27_memset_fn'], gen.sites['q27_lock_ctor']
+    w = _word(gen, a)
+    assert w >> 26 == 0x05, hex(w)  # (a tail branch)
+    return ('{ extern void guest_call(Cpu *, uint64_t); extern void rt_q27_ctor(Cpu *, uint64_t, uint64_t); '
+            f'uint64_t obj = c->x[0] - 0x2a0; guest_call(c, {mset:#x}ull); rt_q27_ctor(c, obj, {lctor:#x}ull); return; }}'
+            f'  /* {a:#x}: b memset (per-slot queues: the constructor\'s end, every slot\'s lock) */')
+
+
+# #23 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): per-core 0x160-byte records at +0x2a0 of a singleton (four 0x58-byte
+# sub-entries each) in a block with a slot for every core. The constructor's end moves them to the block; the init sets
+# every sub-entry\'s state at its first store; the walk goes over every record; the accessors take the block and bound
+# the core by the game's core count.
+def _rec23_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core 0x160-byte records')
+
+
+_REC23 = 'rt_percore_block({obj}, 0x2a0, 0x160, 3, 0)'
+
+
+def _rec23_bound(word, reg):
+    return _rec23_patch(word, lambda gen, a: f'(void)(subs32(c, (uint32_t)c->x[{reg}], (uint32_t)rt_game_cores()));',
+                        f'cmp w{reg}, #3: a core with a slot')
+
+
+def _rec23_base(word, dst, obj):  # add x<dst>, x<obj>, #0x2a8: the records (+8) in the block
+    return _rec23_patch(word, lambda gen, a: f'c->x[{dst}] = {_REC23.format(obj=f"c->x[{obj}]")} + 8;',
+                        f'add x{dst}, x{obj}, #0x2a8: every core\'s record')
+
+
+def _rec23_none(word, what):
+    return _rec23_patch(word, lambda gen, a: '(void)0;', what + ': (every sub-entry at the first)')
+
+
 # #26 (BOTW-JOBS-NATIVE.md): a 0x58-byte string per core (sead FixedSafeString<64>: vtable, pointer to the inline
 # buffer at +0x14, capacity 0x40 at +0x10) in a function-local static at 0x7001e96c20 of f_7001594a84, indexed by the
 # core (unbounded) and made by its guarded init, unrolled for three. A block keyed by the static's address: the init
@@ -1094,6 +1161,50 @@ PATCHES = {
     'obj12_alloc2': _obj12_take(2), 'obj12_ctor2': _obj12_patch(None, lambda gen, a: '(void)0;', 'bl: (made at the first)'),
     'obj12_a': _obj12_base(0x8b204e88, 20), 'obj12_b': _obj12_base(0x8b204ee8, 23), 'obj12_c': _obj12_base(0x8b204f48, 26),
     'obj12_d': _obj12_base(0x8b204e88, 20), 'obj12_e': _obj12_base(0x8b204e88, 20),
+    'q27_add_bufs': _q27_base(0x9104a268, 8, 19, 0x128, 0x10, 'add x8, x19, #0x128: every slot\'s buffer'),
+    'q27_add_bound1': _Q27_BOUND,
+    'q27_add_locks': _q27_base(0x910ca268, 8, 19, 0x328, 0x40, 'add x8, x19, #0x328: every slot\'s lock'),
+    'q27_add_bound2': _Q27_BOUND,
+    'q27_add_cur': _q27_cur(0x8b190a69, 9, 19, 25),
+    'q27_walk_locks': _q27_base(0x910ca289, 9, 20, 0x328, 0x40, 'add x9, x20, #0x328: every slot\'s lock'),
+    'q27_walk_bufs': _q27_base(0x9104a288, 8, 20, 0x128, 0x10, 'add x8, x20, #0x128: every slot\'s buffer'),
+    'q27_walk_cur': _q27_cur(0x8b1c0a88, 8, 20, 28),
+    'q27_walk_bound': _q27_patch(0xf1000f9f, lambda gen, a: '(void)(subs64(c, c->x[28], (uint64_t)rt_game_cores()));',
+                                 'cmp x28, #3: every slot'),
+    'q27_init_first': _q27_init_first,
+    'q27_init_first_b': _q27_patch(0xf9009a80, lambda gen, a: '(void)0;', 'str x0, [x20, #0x130]: (stored at the first)'),
+    'q27_init_2': _q27_patch(None, lambda gen, a: 'c->x[0] = 0;', 'bl: (every slot\'s made at the first)'),
+    'q27_init_3': _q27_patch(None, lambda gen, a: 'c->x[0] = 0;', 'bl: (every slot\'s made at the first)'),
+    'q27_ctor_tail': _q27_ctor_tail,
+    'rec23_ctor_end': _rec23_patch(0xb908627f, lambda gen, a: (
+        'extern void rt_rec23_ctor_end(uint64_t); ST32(c->x[19] + 0x860, 0); rt_rec23_ctor_end(c->x[19] - 0x28);'),
+        'str wzr, [x19, #0x860]: then every core\'s records into the block (x19: this + 0x28, from the constructor\'s '
+        '`str x8, [x19, #0x28]!`)'),
+    'rec23_init_0': _rec23_patch(0xb902ca74, lambda gen, a: (
+        f'uint64_t b = {_REC23.format(obj="c->x[19]")}; '
+        'for (uint64_t j = 0, n = 4 * (uint64_t)rt_game_cores(); j < n; j++) ST32(b + 0x28 + 0x58 * j, (uint32_t)c->x[20]);'),
+        'str w20, [x19, #0x2c8]: every sub-entry\'s state'),
+    'rec23_init_1': _rec23_none(0xb9032274, 'str w20, [x19, #0x320]'),
+    'rec23_init_2': _rec23_none(0xb9037a74, 'str w20, [x19, #0x378]'),
+    'rec23_init_3': _rec23_none(0xb903d274, 'str w20, [x19, #0x3d0]'),
+    'rec23_init_4': _rec23_none(0xb9042a74, 'str w20, [x19, #0x428]'),
+    'rec23_init_5': _rec23_none(0xb9048274, 'str w20, [x19, #0x480]'),
+    'rec23_init_6': _rec23_none(0xb904da74, 'str w20, [x19, #0x4d8]'),
+    'rec23_init_7': _rec23_none(0xb9053274, 'str w20, [x19, #0x530]'),
+    'rec23_init_8': _rec23_none(0xb9058a74, 'str w20, [x19, #0x588]'),
+    'rec23_init_9': _rec23_none(0xb905e274, 'str w20, [x19, #0x5e0]'),
+    'rec23_init_10': _rec23_none(0xb9063a74, 'str w20, [x19, #0x638]'),
+    'rec23_init_11': _rec23_none(0xb9069274, 'str w20, [x19, #0x690]'),
+    'rec23_walk_base': _rec23_patch(0x8b17027b, lambda gen, a: (
+        f'c->x[27] = {_REC23.format(obj="c->x[19]")} - 0x2a0 + c->x[23];'), 'add x27, x19, x23: the record in the block'),
+    'rec23_walk_end': _rec23_patch(0xf11082ff, lambda gen, a: (
+        '(void)(subs64(c, c->x[23], 0x160ull * (uint64_t)rt_game_cores()));'), 'cmp x23, #0x420: every core\'s record'),
+    'rec23_a_base': _rec23_base(0x910aa2a8, 8, 21), 'rec23_b_base': _rec23_base(0x910aa288, 8, 20),
+    'rec23_a_b1': _rec23_bound(0x71000d3f, 9), 'rec23_b_b1': _rec23_bound(0x71000d3f, 9),
+    'rec23_a_b2': _rec23_bound(0x71000d3f, 9), 'rec23_b_b2': _rec23_bound(0x71000d3f, 9),
+    'rec23_a_b3': _rec23_bound(0x71000d3f, 9), 'rec23_b_b3': _rec23_bound(0x71000d3f, 9),
+    'rec23_a_b4': _rec23_bound(0x71000d3f, 9), 'rec23_b_b4': _rec23_bound(0x71000d3f, 9),
+    'rec23_a_b5': _rec23_bound(0x71000d5f, 10), 'rec23_b_b5': _rec23_bound(0x71000d5f, 10),
     'str26_init_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
                                     'add x22, x22, #0xc20: every core\'s string'),
     'str26_init_rest': _str26_rest,

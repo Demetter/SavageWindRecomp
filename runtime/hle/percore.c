@@ -506,6 +506,49 @@ void rt_obj12_make(Cpu *c, uint64_t obj, uint64_t first, uint64_t heap, uint64_t
     }
 }
 
+// ---- #27: per-slot queues of a few 0x3f0-byte objects (slot = sead's core table entry of the core): a buffer per slot
+// (u32 count, pointer) at +0x128, a 0x40-byte lock per slot at +0x328, a cursor per slot at +0x2a0. Jobs append to their
+// slot's under its lock (f_7001138a08), a walker drains every slot (f_700113dbdc).
+
+// The constructor's end (f_70011323c0 1.9.0, its tail memset of +0x2a0): every slot's buffer and cursor zeroed, every
+// slot's lock made (memset, then the lock's constructor).
+void rt_q27_ctor(Cpu *c, uint64_t obj, uint64_t lock_ctor) {
+    uint64_t bufs = rt_percore_block(obj, 0x128, 0x10, 3, 0), locks = rt_percore_block(obj, 0x328, 0x40, 3, 0),
+             curs = rt_percore_block(obj, 0x2a0, 4, 3, 0);
+    for (uint64_t i = 0, n = (uint64_t)rt_game_cores(); i < n; i++) {
+        ST32(bufs + 0x10 * i, 0), ST64(bufs + 0x10 * i + 8, 0), ST32(curs + 4 * i, 0);
+        for (uint64_t o = 0; o < 0x40; o += 8) ST64(locks + 0x40 * i + o, 0);
+        c->x[0] = locks + 0x40 * i;
+        guest_call(c, lock_ctor);
+    }
+}
+
+// The init f_7001134be0 (1.9.0), at its first buffer's store: that one is slot 0's; every other slot's the same size
+// (alloc(size, heap, 8, tag)).
+void rt_q27_bufs(Cpu *c, uint64_t obj, uint32_t count, uint64_t first, uint64_t heap, uint64_t alloc, uint64_t tag) {
+    uint64_t bufs = rt_percore_block(obj, 0x128, 0x10, 3, 0);
+    ST32(bufs, count), ST64(bufs + 8, first);
+    for (uint64_t i = 1, n = (uint64_t)rt_game_cores(); i < n; i++) {
+        c->x[0] = (uint64_t)count * 8, c->x[1] = heap, c->x[2] = 8, c->x[3] = tag;
+        guest_call(c, alloc);
+        if (c->x[0]) ST32(bufs + 0x10 * i, count), ST64(bufs + 0x10 * i + 8, c->x[0]);
+    }
+}
+
+// ---- #23: per-core 0x160-byte records of a singleton (`*0x7001e56b20`) at +0x2a0: four 0x58-byte sub-entries each
+// (their +0x28 a state, 8 = free). The constructor f_70013ffba0 (1.9.0) builds all twelve of the game's three records the
+// same way (a template and constants; nothing in them points into them); at its end the block takes the three it built
+// and every further core's a copy of record 0's.
+void rt_rec23_ctor_end(uint64_t obj) {
+    uint8_t made[3 * 0x160];
+    for (uint32_t o = 0; o < sizeof made; o += 8) *(uint64_t *)(made + o) = LD64(obj + 0x2a0 + o);  // (before the block)
+    uint64_t b = rt_percore_block(obj, 0x2a0, 0x160, 3, 0);
+    for (uint64_t i = 0, n = (uint64_t)rt_game_cores(); i < n; i++) {
+        const uint8_t *src = made + 0x160 * (i < 3 ? i : 0);
+        for (uint32_t o = 0; o < 0x160; o += 8) ST64(b + 0x160 * i + o, *(const uint64_t *)(src + o));
+    }
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);
