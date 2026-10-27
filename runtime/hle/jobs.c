@@ -67,6 +67,113 @@ static int g_stats;
 static struct { uint64_t groups, jobs, grab, thread, span, parts; } g_sb[SB];
 static uint64_t g_st_rounds, g_st_main_run, g_st_main_wait, g_st_span, g_st_barrier, g_st_t0, g_st_kick;
 static uint64_t g_st_first[64];  // (a round-list slot's first claim; 0: none yet)
+// (research) SAVAGEWIND_JOBS_TRACE=<hex>: groups whose first job's class ends in those hex digits, traced: each
+// thread's entry and exit (us from the round's kick, jobs it ran) and the group's completion, for 40 groups.
+static uint64_t g_tr_key, g_tr_mask;
+static int g_tr_left = 40;
+static bool trace_group(uint64_t g, uint32_t total) {
+    if (!g_tr_mask || __atomic_load_n(&g_tr_left, __ATOMIC_RELAXED) <= 0) return false;
+    if (total != LD32(g + 0x90) || !LD32(g + 0x80) || !LD64(g + 0x88)) return false;
+    uint64_t job0 = LD64(LD64(g + 0x88));
+    return job0 && (LD64(job0) & g_tr_mask) == g_tr_key;
+}
+// (research) SAVAGEWIND_JOBS_ROUNDS=<first round>:<rounds>: every group visit of those rounds (any thread), kept in
+// memory and written once they end ("[jobs-round]" lines: times in us from the round's kick), with each round's
+// frame, its run-and-wait's start and its end: the rounds' timelines, for their critical path.
+typedef struct { uint64_t g, kind; uint32_t round, slot, worker, type, total, jobs, done; float in, jd, out; } RoundEv;
+typedef struct { uint64_t frame, pool; uint32_t round, ngroups; float wait_in, end; } RoundRec;
+static RoundEv *g_rev;
+static RoundRec *g_rrec;
+static uint32_t g_rev_n, g_rrec_n;
+static uint64_t g_round_no, g_rt_first, g_rt_count;
+static bool round_traced(void) {
+    uint64_t r = __atomic_load_n(&g_round_no, __ATOMIC_RELAXED);
+    return g_rt_count && r >= g_rt_first && r < g_rt_first + g_rt_count;
+}
+static uint64_t job_kind(uint64_t g, uint32_t total) {  // (the first job's class, for a base group)
+    if (total != LD32(g + 0x90) || !LD32(g + 0x80) || !LD64(g + 0x88)) return 0;
+    uint64_t job0 = LD64(LD64(g + 0x88));
+    return job0 ? LD64(job0) : 0;
+}
+// (research) SAVAGEWIND_JOBS_JOBTIME=1: every job's time (a run-chunk call that ran one job: grab 1), by the job's
+// class and its two dispatch words (+0x18 and +0x20: a switch job's case, a delegate job's case and object), with the
+// longest; every 2 s the 16 with the most time a second ("[jobs-time]").
+static int g_jt;
+typedef struct { uint64_t vt, w18, w20, n, ns, max, obj, nvn, calls, sn, swait, shold; } JobTime;
+int g_nvn_time;                          // (runtime/nvn/nvn.h: NVN calls timed on their thread)
+__thread uint64_t t_nvn_ticks, t_nvn_calls;
+__thread uint64_t t_shadow_n, t_shadow_wait, t_shadow_hold;  // (runtime/nvn/cmdbuf.c: its records' lock)
+static double g_tick_ns;                 // (ns per plat_ticks() tick)
+#define JT_N 1024
+static JobTime g_jtab[JT_N];
+static pthread_mutex_t g_jt_m = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_jt_t0;
+static void jobtime_note(uint64_t g, uint32_t idx, uint64_t ns, uint64_t ticks, uint64_t calls, uint64_t sn,
+                         uint64_t swait, uint64_t shold) {
+    // (a base group: its job array +0x88 holds +0x80 entries, its job count +0x90; every pointer checked as guest memory)
+    uint32_t cap = LD32(g + 0x80);
+    uint64_t arr = LD64(g + 0x88);
+    if (!cap || idx >= cap || idx >= LD32(g + G_JOBS) || arr < GUEST_LO || arr + 8ull * cap > GUEST_HI) return;
+    uint64_t job = LD64(arr + 8ull * idx);
+    if (job < GUEST_LO || job + 0x28 > GUEST_HI || LD64(job) < GUEST_LO || LD64(job) >= GUEST_HI) return;
+    uint64_t vt = LD64(job), w18 = LD32(job + 0x18), w20 = LD32(job + 0x20);
+    if (vt == 0x7001d11e58ull && w20 == 4) {  // (1.9.0: the views' recording, f_7000fb5a20) its items and buckets
+        static uint64_t last;
+        uint64_t now = plat_now_ns(), obj = LD64(job + 0x18);
+        if (now - last > 2000000000ull && obj >= GUEST_LO && obj < GUEST_HI) {
+            last = now;
+            uint32_t cap = LD32(obj + 0x5e40), made = LD32(obj + 0x5e54), cnt = LD32(obj + 0x5e58);
+            uint64_t items = LD64(obj + 0x5e48), set = LD64(obj + 0x5e38);
+            char buf[512]; int k = 0;
+            for (uint32_t i = 0; i < cnt && i < cap && i < 24 && items >= GUEST_LO; i++)
+                k += snprintf(buf + k, sizeof buf - k, " %u+%u", LD32(items + 40ull * i + 0x18), LD32(items + 40ull * i + 0x1c));
+            LOG("[view-rec] items %u made %u cap %u, parts min %u max %u; ranges%s\n", cnt, made, cap,
+                LD32(obj + 0x5e68), LD32(obj + 0x5e6c), buf);
+            if (set >= GUEST_LO && set < GUEST_HI) {
+                uint32_t nb = LD32(set + 0x50), bc = LD32(set + 0x40); uint64_t ba = LD64(set + 0x48);
+                k = 0;
+                for (uint32_t b = 0; b < nb && b < bc && b < 24 && ba >= GUEST_LO; b++)
+                    k += snprintf(buf + k, sizeof buf - k, " %u", LD32(ba + 0x70ull * b + 0x58));
+                LOG("[view-rec] buckets %u (cap %u), command buffers each:%s\n", nb, bc, buf);
+            }
+        }
+    }
+    uint64_t h = (vt * 0x9E3779B97F4A7C15ull) ^ (w18 * 0xC2B2AE3D27D4EB4Full) ^ w20;
+    pthread_mutex_lock(&g_jt_m);
+    for (uint32_t s = (uint32_t)(h >> 50) & (JT_N - 1), k = 0; k < JT_N; k++, s = (s + 1) & (JT_N - 1)) {
+        JobTime *e = &g_jtab[s];
+        if (!e->n) *e = (JobTime){vt, w18, w20, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        if (e->vt != vt || e->w18 != w18 || e->w20 != w20) continue;
+        e->n++, e->ns += ns, e->nvn += (uint64_t)(ticks * g_tick_ns), e->calls += calls, e->sn += sn, e->swait += swait, e->shold += shold;
+        if (ns > e->max) e->max = ns, e->obj = job;
+        break;
+    }
+    uint64_t now = plat_now_ns();
+    if (!g_jt_t0) g_jt_t0 = now;
+    if (now - g_jt_t0 >= 2000000000ull) {
+        double s = (now - g_jt_t0) / 1e9;
+        bool shown[JT_N] = {0};
+        LOG("[jobs-time] the jobs with the most time (class, +0x18, +0x20: a second, mean, longest)\n");
+        for (int r = 0; r < 16; r++) {
+            int b = -1;
+            for (int k = 0; k < JT_N; k++)
+                if (g_jtab[k].n && !shown[k] && (b < 0 || g_jtab[k].ns > g_jtab[b].ns)) b = k;
+            if (b < 0) break;
+            shown[b] = true;
+            JobTime *e = &g_jtab[b];
+            LOG("[jobs-time]   %010llx %8llx %8llx: %6.0f /s, %7.1f ms/s, mean %6.1f us, longest %6.1f us (job %llx); "
+                "NVN calls %.0f a job, %.1f us of it; record lock %.1f a job, waited %.1f us, held %.1f us\n",
+                (unsigned long long)e->vt, (unsigned long long)e->w18, (unsigned long long)e->w20, e->n / s,
+                e->ns / 1e6 / s, e->ns / 1e3 / e->n, e->max / 1e3, (unsigned long long)e->obj,
+                (double)e->calls / e->n, e->nvn / 1e3 / e->n, (double)e->sn / e->n, e->swait * g_tick_ns / 1e3 / e->n,
+                e->shold * g_tick_ns / 1e3 / e->n);
+        }
+        memset(g_jtab, 0, sizeof g_jtab);
+        g_jt_t0 = now;
+    }
+    pthread_mutex_unlock(&g_jt_m);
+}
+
 static int sbucket(uint32_t n) { return n <= 1 ? 0 : n <= 4 ? 1 : n <= 8 ? 2 : n <= 16 ? 3 : n <= 48 ? 4 : 5; }
 #define SADD(v, x) __atomic_add_fetch(&(v), (x), __ATOMIC_RELAXED)
 // ... and by group kind (its class, the first job's class, its mask's worker count, its type): the 16 kinds with the
@@ -104,6 +211,23 @@ static bool on(void) {
         const char *e = getenv("SAVAGEWIND_JOBS_NATIVE"), *s = getenv("SAVAGEWIND_JOBS_SPIN");
         g_check = getenv("SAVAGEWIND_JOBS_CHECK") != NULL;
         g_stats = getenv("SAVAGEWIND_JOBS_STATS") != NULL;
+        g_jt = getenv("SAVAGEWIND_JOBS_JOBTIME") != NULL;
+        if (g_jt) {  // (the tick rate, against the clock over 20 ms)
+            uint64_t n0 = plat_now_ns(), k0 = plat_ticks();
+            while (plat_now_ns() - n0 < 20000000ull) {}
+            g_tick_ns = (double)(plat_now_ns() - n0) / (double)(plat_ticks() - k0);
+            g_nvn_time = 1;
+        }
+        const char *rt = getenv("SAVAGEWIND_JOBS_ROUNDS");
+        if (rt && sscanf(rt, "%llu:%llu", (unsigned long long *)&g_rt_first, (unsigned long long *)&g_rt_count) == 2 && g_rt_count) {
+            g_rev = calloc(400000, sizeof *g_rev);
+            g_rrec = calloc(g_rt_count, sizeof *g_rrec);
+        }
+        const char *tr = getenv("SAVAGEWIND_JOBS_TRACE");
+        if (tr && *tr) {
+            g_tr_key = strtoull(tr, NULL, 16);
+            g_tr_mask = strlen(tr) >= 16 ? ~0ull : (1ull << (4 * strlen(tr))) - 1;
+        }
         g_spin = s ? atoi(s) : 1000;
         g_on = !e || atoi(e) != 0;
         LOG("[jobs] %s\n", g_on ? "native scheduler (SAVAGEWIND_JOBS_NATIVE=0: the game's own)" : "the game's own scheduler");
@@ -165,7 +289,9 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     ST64(w + W_GROUP, g);
     ST64(w + W_OWNER, LD64(g + G_OWNER));
     uint32_t grab = LD32(g + G_GRAB + 4 * (i < 3 ? i : 0));  // (the game's own read past three: entry 0; all 8 as made)
-    uint64_t t0 = g_stats ? plat_now_ns() : 0;
+    bool rtr = g_rev && round_traced();
+    uint64_t t0 = g_stats || g_tr_mask || rtr ? plat_now_ns() : 0;
+    bool tr = g_tr_mask && trace_group(g, (uint32_t)call1(c, vfn(g, V_TOTAL), g));
     if (g_stats && slot < 64) {
         uint64_t z = 0;
         __atomic_compare_exchange_n(&g_st_first[slot], &z, t0, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
@@ -176,8 +302,14 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     c->sp -= 0x10;
     for (;;) {
         c->x[0] = g, c->x[1] = grab, c->x[2] = c->sp, c->x[3] = w;
+        uint32_t jt_idx = g_jt ? LD32(g + G_NEXT) : 0;  // (SAVAGEWIND_JOBS_JOBTIME: the job this call claims, as a rule)
+        uint64_t jt0 = g_jt ? plat_now_ns() : 0, jtk = t_nvn_ticks, jtc = t_nvn_calls;
+        uint64_t jsn = t_shadow_n, jsw = t_shadow_wait, jsh = t_shadow_hold;
         guest_call(c, vfn(g, V_RUN_CHUNK));
         bool last = c->x[0] & 1;
+        if (g_jt && LD32(c->sp) == 1)
+            jobtime_note(g, jt_idx, plat_now_ns() - jt0, t_nvn_ticks - jtk, t_nvn_calls - jtc, t_shadow_n - jsn,
+                         t_shadow_wait - jsw, t_shadow_hold - jsh);
         n += LD32(c->sp);
         if (last) break;
     }
@@ -200,6 +332,7 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
             if (kd >= 0) SADD(g_sk[kd].groups, 1), SADD(g_sk[kd].jobs, total), SADD(g_sk[kd].span, span);
         }
     }
+    uint64_t tr1 = tr || rtr ? plat_now_ns() : 0;
     if (done >= total) {
         call1(c, fns[F_SIGNAL], g + G_EVENT);
         plat_wake_u32_all(P32(g + G_DONE));
@@ -217,6 +350,21 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
              !(call1(c, vfn(g, V_IS_DONE), g) & 1) && !g_rt_unwind; v = __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE))
             wait_change(P32(g + G_DONE), v, core_held);
         if (g_stats) SADD(g_st_barrier, plat_now_ns() - b0);
+    }
+    if (rtr) {
+        uint32_t e = __atomic_fetch_add(&g_rev_n, 1, __ATOMIC_RELAXED);
+        uint64_t k = g_st_kick, t2 = plat_now_ns();
+        if (e < 400000)
+            g_rev[e] = (RoundEv){g, job_kind(g, total), (uint32_t)(__atomic_load_n(&g_round_no, __ATOMIC_RELAXED) - g_rt_first),
+                                 slot, i, type, total, n, done >= total, k ? (t0 - k) / 1e3f : -1, k ? (tr1 - k) / 1e3f : -1,
+                                 k ? (t2 - k) / 1e3f : -1};
+    }
+    if (tr) {
+        uint64_t k = g_st_kick, t2 = plat_now_ns();
+        LOG("[jobs-trace] group %llx type %u (%u jobs) worker %u: in %.1f, its jobs done %.1f, out %.1f us after the kick, "
+            "%u jobs%s\n", (unsigned long long)g, type, total, i, k ? (t0 - k) / 1e3 : -1.0, k ? (tr1 - k) / 1e3 : -1.0,
+            k ? (t2 - k) / 1e3 : -1.0, n, done >= total ? " (completed it)" : "");
+        if (done >= total) __atomic_sub_fetch(&g_tr_left, 1, __ATOMIC_RELAXED);
     }
     ST32(w + W_STATE, 10);
     ST32(w + W_STATE, 2);
@@ -309,7 +457,7 @@ static void open_round(Cpu *c, Pool *p) {
             guest_call(c, vfn(w, V_SEND));
         }
     }
-    if (g_stats) g_st_kick = plat_now_ns();
+    if (g_stats || g_tr_mask || g_rev) g_st_kick = plat_now_ns();
     __atomic_store_n(&p->open, 1, __ATOMIC_SEQ_CST);
     bump(&p->seq);
 }
@@ -370,6 +518,19 @@ void rt_jobs_core_groups_fini(Cpu *c, const uint64_t *fns) {
         call1(c, fns[BC_FINI], g + G_EVENT);
     }
     g_bcast_n = 0;
+}
+
+// The parts the views' recording cuts each draw list into (tools/patches.py _view_rec_parts; the Switch build: 3), each
+// a contiguous range recorded into its own command buffer by whichever core takes it: one per game core, the way a PC
+// engine records a pass's draws in parallel. SAVAGEWIND_VIEW_REC_PARTS=<n> (research): another count.
+uint32_t rt_view_rec_parts(void) {
+    extern int rt_game_cores(void);
+    static int n;
+    if (n) return (uint32_t)n;
+    const char *e = getenv("SAVAGEWIND_VIEW_REC_PARTS");
+    n = e && atoi(e) > 0 ? atoi(e) : rt_game_cores();
+    LOG("[jobs] view recording: draw lists in up to %d parts\n", n);
+    return (uint32_t)n;
 }
 
 // Whether sead thread id `id` is one of the job system's threads (BOTW-JOBS-NATIVE.md #31): the main thread's (it runs
@@ -470,7 +631,7 @@ int rt_jobs_run_wait(Cpu *c, const uint64_t *fns) {
     uint64_t w0 = LD64(LD64(pool + POOL_WORKERS));
     uint32_t count = LD32(pool + POOL_COUNT), valid = count >= 32 ? ~0u : (1u << count) - 1, k = 0, j = 0;
     run_begin(c, fns, w0);
-    uint64_t st_run = 0, st_t = g_stats ? plat_now_ns() : 0;
+    uint64_t st_run = 0, st_t = g_stats || g_rev ? plat_now_ns() : 0;
     for (;;) {
         uint32_t e = __atomic_load_n(&p->evt, __ATOMIC_ACQUIRE);
         if (g_stats) {
@@ -495,6 +656,29 @@ int rt_jobs_run_wait(Cpu *c, const uint64_t *fns) {
     uint32_t n = LD32(pool + POOL_LIST_N);
     if (g_check) check_round(c, pool, n);
     if (g_stats) stats_round(n, st_t, st_run);
+    if (g_rev) {
+        uint64_t r = g_round_no, k = g_st_kick, now = plat_now_ns();
+        if (r >= g_rt_first && r < g_rt_first + g_rt_count) {
+            extern uint64_t renderer_present_count(void);
+            g_rrec[g_rrec_n++] = (RoundRec){renderer_present_count(), pool, (uint32_t)(r - g_rt_first), n,
+                                            k && st_t ? (st_t - k) / 1e3f : -1, k ? (now - k) / 1e3f : -1};
+        }
+        __atomic_add_fetch(&g_round_no, 1, __ATOMIC_RELAXED);
+        if (r + 1 == g_rt_first + g_rt_count) {  // (the last traced round ended: everything written now)
+            for (uint32_t i = 0; i < g_rrec_n; i++)
+                LOG("[jobs-round] R %u frame %llu pool %llx groups %u run-and-wait at %.1f end %.1f\n", g_rrec[i].round,
+                    (unsigned long long)g_rrec[i].frame, (unsigned long long)g_rrec[i].pool, g_rrec[i].ngroups,
+                    g_rrec[i].wait_in, g_rrec[i].end);
+            uint32_t ne = g_rev_n < 400000 ? g_rev_n : 400000;
+            for (uint32_t i = 0; i < ne; i++) {
+                RoundEv *v = &g_rev[i];
+                LOG("[jobs-round] E %u slot %u group %llx kind %llx type %u total %u w%u in %.1f jd %.1f out %.1f jobs %u%s\n",
+                    v->round, v->slot, (unsigned long long)v->g, (unsigned long long)v->kind, v->type, v->total, v->worker,
+                    v->in, v->jd, v->out, v->jobs, v->done ? " done" : "");
+            }
+            g_rev = NULL;
+        }
+    }
     __atomic_store_n(P32(pool + POOL_LIST_N), 0, __ATOMIC_RELEASE);
     __atomic_add_fetch(&p->gen, 1, __ATOMIC_RELEASE);
     return 1;

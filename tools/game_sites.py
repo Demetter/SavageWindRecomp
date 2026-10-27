@@ -755,6 +755,17 @@ SITES = [
          '9100014a/ffc003ff a9027fea 5280800a', 0),
     Site('job_thread_proc', 'code', '7a481284 1a9f17e0 14000000/fc000000 2a1f03e0 a9414ff4 a8c27bfd d65f03c0', 1),
     Site('job_thread_res', 'code', 'b940d008 d37df129 f9410e8a f940014b b940016b 6b08017f 54000000/ff00001f 9100214a', 0),
+    # the views' render recording (tools/patches.py _view_rec_jobs): f_7000fb7544 makes three jobs that each take the
+    # next view item from a counter until none is left (f_7000fb5a20) - one per core of the Switch build's three
+    Site('view_rec_jobs', 'code', '52800063 2a1f03e4 b828681f 14000000/fc000000', 0),
+    # ... and the most parts it cuts each draw list into (f_7000fb98bc: min(draws / [+0x5e68], [+0x5e6c]) contiguous
+    # ranges, each recorded into a command buffer of its own): the constructor's `movk x8, #3, lsl #32` (+0x5e6c = 3)
+    Site('view_rec_parts', 'code', 'f2c00068 f92f267f f92f2a7f f92f2e7f f92f327f f92f3668 f901d273 a9424ff4', 0),
+    # ... the item and order arrays those parts go into, sized for 61 lists x 3 parts a unit (f_7000fb2804:
+    # `mov w9, #0xb7` before madd w1, w8, w9, w10 -> 183 n + 6), and each list's record of its parts' command buffers
+    # (f_7000faa800: `mov w1, #0x20`, 32 each). Both clamp an overflow to slot 0 without a word.
+    Site('view_rec_items', 'code', '528016e9 528000ca a909a2c8 910302c0 a90aa2c8 f94027e8 aa1503e2 91040277', 0),
+    Site('view_rec_cbs', 'code', '52800401 aa1403e2 52800103 91016100 94000000/fc000000 910006e8 92407d17 6b0802bf', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -913,7 +924,8 @@ OPTIONAL_GROUPS = [
      'heap_create_exp', 'heap_ctor_b', 'heap_ctor_c',
      'heap_root_flags',
      'root_heap_size',
-     'jobs_pool_got', 'job_thread_proc', 'job_thread_res'),
+     'jobs_pool_got', 'job_thread_proc', 'job_thread_res',
+     'view_rec_jobs', 'view_rec_parts', 'view_rec_items', 'view_rec_cbs'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1430,6 +1442,10 @@ KNOWN = {
         'jobs_pool_got': 0x700127f02c,
         'job_thread_proc': 0x70015198b4,
         'job_thread_res': 0x70015637f0,
+        'view_rec_jobs': 0x7000fb754c,
+        'view_rec_parts': 0x7000fb3ef4,
+        'view_rec_items': 0x7000fb3d04,
+        'view_rec_cbs': 0x7000faa864,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

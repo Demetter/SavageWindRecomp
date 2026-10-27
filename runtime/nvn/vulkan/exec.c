@@ -4883,6 +4883,196 @@ static void uniform_copy_check(int stage, int k, uint64_t addr, VkSpan span, uin
     if (n == 1 || !(n & ((1u << 16) - 1))) LOG("[ubo-audit] %llu byte-exact worker copies checked, zero mismatches\n", (unsigned long long)n);
 }
 
+// (research) SAVAGEWIND_VK_UBO_LIFE=<n>: does the game write a constant buffer's memory while the GPU work reading it
+// is still in flight? One in n constant-buffer copies (default 8) is recorded with a hash of the bytes the draw uses
+// and the submission it goes in; a thread waits for that submission to finish on the GPU and hashes the guest memory
+// again at once. Zero changes: the game's own buffering keeps a frame's constants until its GPU work is done, so the GPU
+// could read them in place (no snapshot); many: the snapshot is the game's only copy. Every 2 s "[ubo-life]".
+typedef struct { uint64_t addr, size, hash, seq; } UboLife;
+#define UBO_LIFE_N 65536
+static UboLife *ubo_life;
+static _Atomic uint64_t ubo_life_w, ubo_life_r, ubo_life_calls;
+static int ubo_life_every = -1;
+static uint64_t ubo_hash(const void *p, uint64_t n) {
+    const uint8_t *b = p;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+// (the changed ranges by address and size, and how many distinct ranges were checked: the most changed listed)
+#define UBO_LIFE_TAB 8192
+static struct { uint64_t addr, size, checked, changed; } ubo_life_tab[UBO_LIFE_TAB];
+static void ubo_life_count(uint64_t addr, uint64_t size, bool changed) {
+    uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ size;
+    for (uint32_t i = 0, s = (uint32_t)(h >> 40) & (UBO_LIFE_TAB - 1); i < 64; i++, s = (s + 1) & (UBO_LIFE_TAB - 1)) {
+        if (!ubo_life_tab[s].addr) ubo_life_tab[s].addr = addr, ubo_life_tab[s].size = size;
+        if (ubo_life_tab[s].addr == addr && ubo_life_tab[s].size == size) {
+            ubo_life_tab[s].checked++, ubo_life_tab[s].changed += changed;
+            return;
+        }
+    }
+}
+static bool uub_range_ever(uint64_t lo, uint64_t hi) {  // (racy read of the render thread's table: a probe)
+    for (int i = 0; i < nuub && i < UUB_MAX; i++)
+        if (lo < uubt[i].hi && uubt[i].lo < hi) return true;
+    return false;
+}
+static void ubo_life_report(void) {
+    uint64_t ranges = 0, changing = 0, always = 0;
+    for (int i = 0; i < UBO_LIFE_TAB; i++)
+        if (ubo_life_tab[i].addr) {
+            ranges++;
+            if (ubo_life_tab[i].changed) changing++;
+            if (ubo_life_tab[i].changed * 10 >= ubo_life_tab[i].checked * 9) always++;
+        }
+    LOG("[ubo-life]   %llu distinct ranges checked, %llu changed at least once, %llu changed in 90%%+ of checks\n",
+        (unsigned long long)ranges, (unsigned long long)changing, (unsigned long long)always);
+    bool shown[UBO_LIFE_TAB] = {0};
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < UBO_LIFE_TAB; i++)
+            if (!shown[i] && ubo_life_tab[i].changed && (best < 0 || ubo_life_tab[i].changed > ubo_life_tab[best].changed)) best = i;
+        if (best < 0) break;
+        shown[best] = true;
+        LOG("[ubo-life]   %llx +%llu: changed %llu of %llu%s\n", (unsigned long long)ubo_life_tab[best].addr,
+            (unsigned long long)ubo_life_tab[best].size, (unsigned long long)ubo_life_tab[best].changed,
+            (unsigned long long)ubo_life_tab[best].checked,
+            uub_range_ever(ubo_life_tab[best].addr, ubo_life_tab[best].addr + ubo_life_tab[best].size) ? " (UpdateUniformBuffer range)" : "");
+    }
+    memset(ubo_life_tab, 0, sizeof ubo_life_tab);
+}
+static void *ubo_life_thread(void *arg) {
+    (void)arg;
+    uint64_t checked = 0, changed = 0, changed_bytes = 0, t0 = plat_now_ns(), late = 0, changed_uub = 0;
+    for (;;) {
+        uint64_t r = atomic_load(&ubo_life_r), w = atomic_load(&ubo_life_w);
+        if (r == w) { plat_sleep_until_ns(plat_now_ns() + 200000); continue; }
+        UboLife e = ubo_life[r % UBO_LIFE_N];
+        atomic_store(&ubo_life_r, r + 1);
+        if (w - r > UBO_LIFE_N / 2) { late++; continue; }  // (fell behind: the entry may have been overwritten)
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                  .pSemaphores = &g_vk.timeline, .pValues = &e.seq};
+        if (vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull) != VK_SUCCESS) continue;
+        checked++;
+        bool ch = ubo_hash((const void *)(uintptr_t)e.addr, e.size) != e.hash;
+        if (ch) changed++, changed_bytes += e.size, changed_uub += uub_range_ever(e.addr, e.addr + e.size);
+        ubo_life_count(e.addr, e.size, ch);
+        if (plat_now_ns() - t0 > 2000000000ull) {
+            LOG("[ubo-life] %llu constant buffers checked at their GPU work's end: %llu changed while in flight (%.2f%%, "
+                "%llu bytes; %llu in UpdateUniformBuffer ranges), %llu skipped\n", (unsigned long long)checked,
+                (unsigned long long)changed, checked ? 100.0 * changed / checked : 0.0, (unsigned long long)changed_bytes,
+                (unsigned long long)changed_uub, (unsigned long long)late);
+            ubo_life_report();
+            checked = changed = changed_bytes = late = changed_uub = 0, t0 = plat_now_ns();
+        }
+    }
+    return NULL;
+}
+static void ubo_life_note(uint64_t addr, const void *bytes, uint64_t size) {
+    if (ubo_life_every < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_UBO_LIFE");
+        ubo_life_every = e ? (atoi(e) > 0 ? atoi(e) : 8) : 0;
+        if (ubo_life_every) {
+            ubo_life = calloc(UBO_LIFE_N, sizeof *ubo_life);
+            pthread_t th;
+            pthread_create(&th, NULL, ubo_life_thread, NULL);
+            pthread_detach(th);
+        }
+    }
+    if (!ubo_life_every || atomic_fetch_add(&ubo_life_calls, 1) % (uint64_t)ubo_life_every) return;
+    uint64_t i = atomic_fetch_add(&ubo_life_w, 1);
+    ubo_life[i % UBO_LIFE_N] = (UboLife){addr, size, ubo_hash(bytes, size), vk_pending_seq()};
+}
+
+// (research) SAVAGEWIND_VK_UBO_SUBMIT=1: does translation read a constant buffer the game wrote after it submitted the
+// list? The ranges translation binds are learned (ubo_seen); at each nvnQueueSubmitCommands the game thread hashes
+// every learned range (vk_ubo_submit_snapshot), one snapshot per submit queued with its lists; translating a list,
+// the first bind of each range compares the guest memory with its submit-time hash. A change: the draw reads data the
+// game wrote for its next frame (the console's GPU would have read the submit-time bytes). Every 2 s "[ubo-submit]".
+#define UBO_SEEN_N 8192
+static struct { _Atomic uint64_t addr; uint64_t size; } ubo_seen[UBO_SEEN_N];
+typedef struct { uint64_t addr, size, hash; _Atomic int done; } UboSnapE;
+typedef struct { UboSnapE e[UBO_SEEN_N]; } UboSnap;
+static UboSnap *ubo_snap_pool;  // (16 reused in turn: a list 16 submits behind compares with a newer snapshot)
+static uint32_t ubo_snap_next;
+static UboSnap *ubo_snap_q[64];
+static _Atomic uint32_t ubo_snap_w, ubo_snap_r;
+static UboSnap *_Atomic ubo_snap_cur;
+static int ubo_submit_on = -1;
+static _Atomic uint64_t ubo_sub_cmp, ubo_sub_changed, ubo_sub_bytes, ubo_sub_t0;
+static bool ubo_submit_enabled(void) {
+    if (ubo_submit_on < 0) ubo_submit_on = getenv("SAVAGEWIND_VK_UBO_SUBMIT") != NULL;
+    return ubo_submit_on;
+}
+static uint32_t ubo_slot(uint64_t addr, uint64_t size) {
+    uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    return (uint32_t)(h >> 40) & (UBO_SEEN_N - 1);
+}
+static void ubo_seen_add(uint64_t addr, uint64_t size) {
+    for (uint32_t i = 0, s = ubo_slot(addr, size); i < 32; i++, s = (s + 1) & (UBO_SEEN_N - 1)) {
+        uint64_t a = atomic_load(&ubo_seen[s].addr);
+        if (a == addr && ubo_seen[s].size == size) return;
+        if (!a) {
+            uint64_t z = 0;
+            if (atomic_compare_exchange_strong(&ubo_seen[s].addr, &z, addr)) { ubo_seen[s].size = size; return; }
+            if (z == addr) return;
+        }
+    }
+}
+// (objects.c nvnQueueSubmitCommands, the game's thread, before its lists are queued)
+void vk_ubo_submit_snapshot(int nlists) {
+    if (!ubo_submit_enabled() || nlists <= 0) return;
+    if (!ubo_snap_pool) ubo_snap_pool = calloc(16, sizeof *ubo_snap_pool);
+    UboSnap *s = &ubo_snap_pool[ubo_snap_next++ % 16];
+    for (int i = 0; i < UBO_SEEN_N; i++) {
+        uint64_t a = atomic_load(&ubo_seen[i].addr), n = ubo_seen[i].size;
+        s->e[i].addr = a, s->e[i].size = n, s->e[i].done = 0;
+        s->e[i].hash = a && n ? ubo_hash((const void *)(uintptr_t)a, n) : 0;
+    }
+    for (int i = 0; i < nlists; i++) {
+        uint32_t w = atomic_fetch_add(&ubo_snap_w, 1);
+        ubo_snap_q[w % 64] = s;
+    }
+}
+static void ubo_submit_list_begin(void) {  // (backend_execute: the next list's snapshot)
+    if (!ubo_submit_enabled()) return;
+    atomic_store(&ubo_snap_cur, NULL);
+    if (atomic_load(&ubo_snap_r) == atomic_load(&ubo_snap_w)) return;
+    uint32_t r = atomic_fetch_add(&ubo_snap_r, 1);
+    atomic_store(&ubo_snap_cur, ubo_snap_q[r % 64]);
+    uint64_t now = plat_now_ns(), t0 = atomic_load(&ubo_sub_t0);
+    if (!t0) atomic_store(&ubo_sub_t0, now);
+    else if (now - t0 > 2000000000ull) {
+        uint64_t n = atomic_exchange(&ubo_sub_cmp, 0), ch = atomic_exchange(&ubo_sub_changed, 0), b = atomic_exchange(&ubo_sub_bytes, 0);
+        extern NvnDescPool *g_texture_pools[64];
+        uint64_t reg = 0, pools = 0;
+        for (int i = 0; i < 64; i++)
+            if (g_texture_pools[i]) {
+                pools++;
+                for (int k = 0; k < g_texture_pools[i]->count; k++) reg += ((NvnTexEntry *)g_texture_pools[i]->entries)[k].tex != NULL;
+            }
+        LOG("[ubo-submit] %llu constant ranges compared with their submit-time bytes at their list's first bind: %llu changed "
+            "(%.2f%%, %llu bytes); texture pools %llu, textures registered %llu\n", (unsigned long long)n,
+            (unsigned long long)ch, n ? 100.0 * ch / n : 0.0, (unsigned long long)b, (unsigned long long)pools,
+            (unsigned long long)reg);
+        atomic_store(&ubo_sub_t0, now);
+    }
+}
+static void ubo_submit_check(uint64_t addr, uint64_t size) {
+    ubo_seen_add(addr, size);
+    UboSnap *s = atomic_load(&ubo_snap_cur);
+    if (!s) return;
+    for (uint32_t i = 0, k = ubo_slot(addr, size); i < 32; i++, k = (k + 1) & (UBO_SEEN_N - 1)) {
+        UboSnapE *e = &s->e[k];
+        if (!e->addr) return;
+        if (e->addr != addr || e->size != size) continue;
+        if (atomic_exchange(&e->done, 1)) return;
+        atomic_fetch_add(&ubo_sub_cmp, 1);
+        if (ubo_hash((const void *)(uintptr_t)addr, size) != e->hash) atomic_fetch_add(&ubo_sub_changed, 1), atomic_fetch_add(&ubo_sub_bytes, size);
+        return;
+    }
+}
+
 static uint64_t bound_cbuf_size(const ShaderInfo *si, int k, Range r) {
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
@@ -4908,6 +5098,7 @@ static uint64_t par_probe_fs(void) {
 }
 static __thread bool t_probe;
 static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz);
+static bool cm_bind(uint64_t lo, uint64_t size, VkDescriptorBufferInfo *out);  // (constants from the heap's copy)
 // (the probe's constant buffers: what was bound, by the hash of its bytes; and stage 0 c3's words, bound and in memory)
 static void probe_cbuf(int stage, int k, VkDescriptorBufferInfo d) {
     {
@@ -4992,6 +5183,8 @@ static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint3
         NvnShaderStage *ss = &st.program->stages[stage];
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
+        VkDescriptorBufferInfo copy;
+        if (cm_bind(ss->code_addr + ss->const_offset, size, &copy)) return copy;
         return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
     }
     int idx = k - 3;  // cbuf_base
@@ -5018,8 +5211,11 @@ static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint3
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
+    if (!t_uniform_audit && cm_bind(r.addr, size, &direct)) return direct;  // (the heap's copy: no per-draw snapshot)
     VkSpan span = guest_copy(r.addr, size);
     if (t_uniform_audit) uniform_copy_check(stage, k, r.addr, span, size);
+    if (ubo_life_every && !uub_touched(r.addr, r.addr + size)) ubo_life_note(r.addr, (const void *)(uintptr_t)r.addr, size);
+    if (ubo_submit_enabled()) ubo_submit_check(r.addr, size);
     return ubo_span(span, size);
 }
 
@@ -5211,11 +5407,15 @@ static uint64_t *vg_bits, *vok_bits, *vpend_bits;  // a bit per heap page: geome
 static uint32_t *vg_next;                          // page numbers for the next copy
 static size_t vg_nnext, vg_npages;
 
+static uint64_t *cb_bits, *cnew_bits;  // (constants from the copy, below) a bit per heap page: holds constants / queued
+static _Atomic uint64_t *cw_bits;      // ... written by this list's own commands
 static void vg_reset(uint64_t size) {
     free(vg_bits), free(vok_bits), free(vpend_bits), free(vg_next);
+    free(cb_bits), free(cnew_bits), free((void *)cw_bits);
     vg_npages = (size_t)(size >> 12);
     size_t words = (vg_npages + 63) / 64;
     vg_bits = calloc(words, 8), vok_bits = calloc(words, 8), vpend_bits = calloc(words, 8);
+    cb_bits = calloc(words, 8), cnew_bits = calloc(words, 8), cw_bits = calloc(words, 8);
     vg_next = malloc(vg_npages * sizeof *vg_next);
     vg_nnext = 0;
 }
@@ -5255,9 +5455,147 @@ static int cmp_u32(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
+// ---- constant buffers from the heap's copy (kb render.native-backend, phase 1)
+// A PC engine uploads the constants that changed once a frame and its draws read them where they are. BOTW's draws
+// read their constant buffers from the heap, and the translator used to copy each one per draw into transient memory
+// (~14,500 lookups and ~1,800 copies a frame at Kakariko): a snapshot, since the game rewrites some of them in place
+// while the GPU still works on the frame (~20% of the binds; no CPU / GPU overlap on the console). Here the pages that
+// hold constants are part of the heap's copy in video memory: each list, the ones the CPU wrote since the last are
+// copied from the CPU - their bytes as the list's translation began, not the GPU's later read of the live heap - and
+// draws bind the copy at the buffer's own offset (cbuf_info_: cm_bind). A buffer keeps the per-draw snapshot when its
+// pages aren't in the copy yet (queued for the next one), when this list's own commands write it (UpdateUniformBuffer,
+// CopyBufferToBuffer: the copy holds the list's start), or when a fix patches it. Off by default: watching the pages
+// BOTW rewrites every frame faults the game's own stores (write watch), which cost the game threads more than the
+// copies saved (28 Oct, Kakariko N = 6); the redesign copies those pages unwatched. SAVAGEWIND_VK_CONST_MIRROR=1: on;
+// =2: on in odd frames only (the in-run A/B).
+static pthread_mutex_t cm_lock = PTHREAD_MUTEX_INITIALIZER;  // (cm_new: pages any thread found holding constants)
+static uint32_t *cm_new, *cm_pages;
+static size_t cm_nnew, cm_newcap, cm_npages, cm_cap;
+static int cm_mode = -1;
+static bool cm_list;                                  // (backend_execute) this list's draws may bind the copy
+static _Atomic uint64_t cm_hit, cm_miss, cm_written;  // (counts: SAVAGEWIND_VK_PROF)
+static uint32_t *cw_words;                            // (render thread) cw_bits words set this list
+static size_t cw_nwords, cw_cap;
+
+static void cm_list_begin(void) {  // (backend_execute, before the list: no draw job of the last one runs)
+    if (cm_mode < 0) cm_mode = getenv("SAVAGEWIND_VK_CONST_MIRROR") ? atoi(getenv("SAVAGEWIND_VK_CONST_MIRROR")) : 0;
+    for (size_t i = 0; i < cw_nwords; i++) atomic_store_explicit(&cw_bits[cw_words[i]], 0, memory_order_relaxed);
+    cw_nwords = 0;
+    cm_list = perfx_trial(PERFX_CMIRROR) ? perfx(PERFX_CMIRROR) : cm_mode == 1 || (cm_mode == 2 && (renderer_present_count() & 1));
+    static int prof = -1;
+    static uint64_t t0;
+    if (prof < 0) prof = getenv("SAVAGEWIND_VK_PROF") != NULL;
+    uint64_t now = plat_now_ns();
+    if (prof && now - t0 > 2000000000ull) {
+        if (t0) {
+            uint64_t h = atomic_exchange(&cm_hit, 0), m = atomic_exchange(&cm_miss, 0), w = atomic_exchange(&cm_written, 0);
+            size_t pages = 0;
+            for (size_t i = 0; cb_bits && i < (vg_npages + 63) / 64; i++) pages += (size_t)__builtin_popcountll(cb_bits[i]);
+            LOG("[const-mirror] %llu binds from the heap's copy, %llu snapshots (not in the copy yet), %llu snapshots "
+                "(written by their list); %zu constant pages known\n", (unsigned long long)h, (unsigned long long)m,
+                (unsigned long long)w, pages);
+        }
+        t0 = now;
+    }
+}
+
+// This list's own commands write [lo, hi) (before the write: a draw job on another thread that finds the bit takes
+// the snapshot path, which knows the list's writes).
+static void cm_list_writes(uint64_t lo, uint64_t hi) {
+    if (!cw_bits || hi <= lo || lo < HEAP_BASE || hi > HEAP_BASE + ((uint64_t)vg_npages << 12)) return;
+    for (size_t p = (size_t)((lo - HEAP_BASE) >> 12); p <= (size_t)((hi - 1 - HEAP_BASE) >> 12); p++) {
+        uint64_t b = 1ull << (p & 63), old = atomic_fetch_or_explicit(&cw_bits[p >> 6], b, memory_order_release);
+        if (!old) {
+            if (cw_nwords == cw_cap) cw_cap = cw_cap ? cw_cap * 2 : 256, cw_words = realloc(cw_words, cw_cap * sizeof *cw_words);
+            cw_words[cw_nwords++] = (uint32_t)(p >> 6);
+        }
+    }
+}
+
+// The copy's view of constant buffer [lo, lo + size) for a draw, or false (then the per-draw snapshot).
+static bool cm_bind(uint64_t lo, uint64_t size, VkDescriptorBufferInfo *out) {
+    if (!cm_list || vram_state <= 0 || !vram_buf || vram_skip || !cb_bits || lo < HEAP_BASE) return false;
+    uint64_t off = lo - HEAP_BASE;
+    if (off + size > vram_size || off % g_vk.props.limits.minUniformBufferOffsetAlignment ||
+        size > g_vk.props.limits.maxUniformBufferRange)
+        return false;
+    size_t p = (size_t)(off >> 12), last = (size_t)((off + size - 1) >> 12);
+    for (size_t q = p; q <= last; q++)
+        if (atomic_load_explicit(&cw_bits[q >> 6], memory_order_acquire) & (1ull << (q & 63))) {
+            atomic_fetch_add_explicit(&cm_written, 1, memory_order_relaxed);
+            return false;
+        }
+    bool ok = true;
+    for (size_t q = p; q <= last; q++) {
+        uint64_t b = 1ull << (q & 63);
+        if ((__atomic_load_n(&vok_bits[q >> 6], __ATOMIC_ACQUIRE) & b) && (__atomic_load_n(&cb_bits[q >> 6], __ATOMIC_RELAXED) & b))
+            continue;
+        ok = false;
+        pthread_mutex_lock(&cm_lock);  // (a page not in the copy as constants yet: queued for the next copy)
+        if (!(cnew_bits[q >> 6] & b)) {
+            cnew_bits[q >> 6] |= b;
+            if (cm_nnew == cm_newcap) cm_newcap = cm_newcap ? cm_newcap * 2 : 512, cm_new = realloc(cm_new, cm_newcap * sizeof *cm_new);
+            cm_new[cm_nnew++] = (uint32_t)q;
+        }
+        pthread_mutex_unlock(&cm_lock);
+    }
+    if (!ok) { atomic_fetch_add_explicit(&cm_miss, 1, memory_order_relaxed); return false; }
+    if (t_xw < 0 && t_worker < 0) sub()->geometry = true;  // (this submission reads the copy: its refresh goes first)
+    else if (t_worker >= 0) subs[t_sub].geometry = true;
+    atomic_fetch_add_explicit(&cm_hit, 1, memory_order_relaxed);
+    *out = (VkDescriptorBufferInfo){vram_buf, off, size};
+    return true;
+}
+
+// (vg_copy, render thread) the pages found holding constants: copied with this list's pages, watched from the next
+static void cm_take_new(void) {
+    pthread_mutex_lock(&cm_lock);
+    for (size_t i = 0; i < cm_nnew; i++) {
+        uint32_t p = cm_new[i];
+        uint64_t b = 1ull << (p & 63);
+        cnew_bits[p >> 6] &= ~b;
+        if (p >= vg_npages) continue;
+        vg_bits[p >> 6] |= b;
+        __atomic_or_fetch(&cb_bits[p >> 6], b, __ATOMIC_RELAXED);
+        __atomic_and_fetch(&vok_bits[p >> 6], ~b, __ATOMIC_RELEASE);  // (current once copied, below)
+        if (!(vpend_bits[p >> 6] & b)) vpend_bits[p >> 6] |= b, vg_next[vg_nnext++] = p;
+    }
+    cm_nnew = 0;
+    pthread_mutex_unlock(&cm_lock);
+}
+
+// The constant pages of this list's copy, from the CPU: their bytes now, in transient memory, then copied into the heap's
+// copy in this submission's upload buffer, after the reads of earlier submissions and the geometry copies above.
+static void cm_record(void) {
+    if (!cm_npages) return;
+    VkSpan s = vk_transient((uint64_t)cm_npages << 12, 256);
+    VkBufferCopy rg[512];
+    uint32_t nrg = 0;
+    VkCommandBuffer cb = vk_upload_cmd();
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    for (size_t i = 0; i < cm_npages; i++) {
+        uint64_t off = (uint64_t)cm_pages[i] << 12;
+        memcpy((uint8_t *)s.ptr + (i << 12), (const void *)(uintptr_t)(HEAP_BASE + off), 0x1000);
+        if (nrg && rg[nrg - 1].dstOffset + rg[nrg - 1].size == off && rg[nrg - 1].srcOffset + rg[nrg - 1].size == s.off + (i << 12)) {
+            rg[nrg - 1].size += 0x1000;
+            continue;
+        }
+        if (nrg == 512) vkCmdCopyBuffer(cb, s.buf, vram_buf, nrg, rg), nrg = 0;
+        rg[nrg++] = (VkBufferCopy){s.off + (i << 12), off, 0x1000};
+    }
+    if (nrg) vkCmdCopyBuffer(cb, s.buf, vram_buf, nrg, rg);
+    stat_vram_bytes += (uint64_t)cm_npages << 12;
+    cm_npages = 0;
+}
+
 // This list's copy: the written pages (dirty, ascending heap addresses) that hold geometry, and the pages fetched in
 // place since the last copy. Written pages that hold none are no longer current.
 static void vg_copy(const uint64_t *dirty, size_t n) {
+    cm_take_new();
     for (size_t i = 0; i < n; i++) {
         size_t p = (size_t)((dirty[i] - HEAP_BASE) >> 12);
         if (p >= vg_npages) continue;
@@ -5271,6 +5609,15 @@ static void vg_copy(const uint64_t *dirty, size_t n) {
         uint32_t p = vg_next[i];
         vok_bits[p >> 6] |= 1ull << (p & 63);
         vpend_bits[p >> 6] &= ~(1ull << (p & 63));
+        if (cm_list && cb_bits && (cb_bits[p >> 6] >> (p & 63) & 1)) {  // (constants: from the CPU, cm_record)
+            if (cm_npages == cm_cap) {
+                cm_cap = cm_cap ? cm_cap * 2 : 512;
+                cm_pages = realloc(cm_pages, cm_cap * sizeof *cm_pages);
+                if (!cm_pages) FATAL("constant copy pages\n");
+            }
+            cm_pages[cm_npages++] = p;
+            continue;
+        }
         uint64_t off = (uint64_t)p << 12;
         if (vg_nrg && vg_rg[vg_nrg - 1].srcOffset + vg_rg[vg_nrg - 1].size == off) { vg_rg[vg_nrg - 1].size += 0x1000; continue; }
         if (vg_nrg == vg_rgcap) {
@@ -5291,6 +5638,7 @@ static void vg_copy(const uint64_t *dirty, size_t n) {
 static void vg_record(void) {
     for (uint32_t i = 0; i < vg_nrg; i += 512) vram_copy(vg_rg + i, vg_nrg - i < 512 ? vg_nrg - i : 512);
     vg_nrg = 0;
+    cm_record();
 }
 
 // (SAVAGEWIND_VK_GEOMETRY_LAYOUT=1, every 600 lists) How the geometry lies in the heap: its runs of pages with gaps under G
@@ -5359,7 +5707,9 @@ static void vram_copy(const VkBufferCopy *rg, uint32_t n) {
     if (gcp_active()) for(uint32_t i=0;i<n;i++) gcp_result(GCP_HEAP_READ, vk_pending_seq(), renderer_present_count(), 0, HEAP_BASE + rg[i].srcOffset, rg[i].size, rg[i].size);
     VkCommandBuffer cb = vk_upload_cmd();
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                           .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+                                           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,  // (constant buffers read the copy too)
                            .srcAccessMask = 0,
                            .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
@@ -5636,7 +5986,7 @@ static void vram_sync(void) {
         vram_free();
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = gmem_size,
                                  .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &vram_buf, &vram_mem, NULL) != VK_SUCCESS) {
             vram_buf = VK_NULL_HANDLE;
@@ -11185,6 +11535,7 @@ static void exec_list(uint64_t handle, int depth) {
                         !memcmp((void *)(uintptr_t)lo, x, r->x[3]), uub_log_full);
             }
             if (!memcmp((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3])) { stat_uub_same++; break; }
+            cm_list_writes(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (before the write: draw jobs read the bit)
             bc_uniform_update(r->x[0] + r->x[2], r->x[3], x);
             if ((mt_list || par_list) && !uub_log_full && !uub_log_add(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3])) {
                 dj_wait_all();  // (no room in the log: the jobs made so far are built before the write)
@@ -11258,6 +11609,7 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             par_sync();  // (the translation workers read guest memory for their draws before it)
             kernel_watch_write("CopyBufferToBuffer", r->x[1], r->x[2]);
+            cm_list_writes(r->x[1], r->x[1] + r->x[2]);
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
             vram_list_written(r->x[1], r->x[1] + r->x[2]);
             guest_copy_flush();
@@ -11317,6 +11669,8 @@ void backend_execute(uint64_t handle) {
     uint64_t survey_draws = op_counts[CMD_DRAW_ARRAYS] + op_counts[CMD_DRAW_ELEMENTS];
     uint64_t survey_readbacks = op_counts[CMD_COPY_TEXTURE_TO_BUFFER];
     perfx_list_begin();  // (SAVAGEWIND_PERFX: this list's translation and its draw jobs see one state)
+    ubo_submit_list_begin();  // (SAVAGEWIND_VK_UBO_SUBMIT: this list's submit-time snapshot)
+    cm_list_begin();  // (constant buffers from the heap's copy)
     uint64_t pp0 = pp_on ? plat_now_ns() : 0;
     perf_survey_delay(SURVEY_PRODUCER, 0);
     if (perf_survey_mode == SURVEY_STUB || perf_survey_mode == SURVEY_WAIT_JOBS) {

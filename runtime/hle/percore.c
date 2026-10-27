@@ -218,9 +218,12 @@ static uint64_t sbfx34(uint64_t v) { return (uint64_t)((int64_t)(v << 30) >> 30)
 // count, heap), [6] the command buffers(array, count, heap, 8). Both memories are sized for every core; the blocks
 // are carved out of the pool core after core, one running offset per pool (the second pool, +0x40, takes every other
 // block when it has memory).
+void cmdbuf_arena_region(uint64_t pool, uint64_t offset, uint64_t size);  // (runtime/nvn/cmdbuf.c)
+
 void rt_arena_setup(Cpu *c, const uint64_t *fn) {
     uint64_t obj = c->x[0], ctl = c->x[2], heap = c->x[5], blk = (c->x[1] + 3) & ~3ull;
-    uint32_t nbuf = (uint32_t)c->x[3];
+    uint32_t nbuf = (uint32_t)((uint64_t)(uint32_t)c->x[3] * (uint64_t)rt_game_cores() / 3);  // (command buffers a frame
+    // for every recorder: the Switch build's count is for three cores' worth of parts, the views' recording among them)
     uint8_t per = (uint8_t)c->x[4];
     int n = rt_game_cores();
     ST8(obj + 0x110, per);
@@ -261,6 +264,8 @@ void rt_arena_setup(Cpu *c, const uint64_t *fn) {
                 guest_call(c, fn[2]);
                 uint64_t e = blocks + 0x18ull * b;
                 ST64(e, LD64(out)), ST32(e + 8, LD32(out + 8)), ST64(e + 0x10, LD64(out + 0x10));
+                cmdbuf_arena_region(LD64(out), LD32(out + 8), blk);  // (this core's thread records there: its own
+                // region of command memory, runtime/nvn/cmdbuf.c)
                 pos[pool] = o + blk;
                 pool = (int32_t)(uint32_t)(LD64(obj + 0x50) >> 2) > 0 ? !pool : 0;
             }

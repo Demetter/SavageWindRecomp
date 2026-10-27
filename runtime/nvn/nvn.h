@@ -4,7 +4,20 @@
 #include "../hle.h"
 #include "tegra.h"
 
-#define NVN(name) HLE_FUNC(#name, hle_##name)
+// (research, SAVAGEWIND_JOBS_JOBTIME) every NVN call's time on its thread, so a job's time splits into the game's
+// code and the NVN layer's
+extern int g_nvn_time;
+extern __thread uint64_t t_nvn_ticks, t_nvn_calls;
+#define NVN(name)                                                                           \
+    static void hle_##name##_body(Cpu *c);                                                  \
+    HLE_FUNC(#name, hle_##name) {                                                           \
+        if (__builtin_expect(g_nvn_time, 0)) {                                              \
+            uint64_t t0_ = plat_ticks();                                                     \
+            hle_##name##_body(c);                                                           \
+            t_nvn_ticks += plat_ticks() - t0_, t_nvn_calls++;                                \
+        } else hle_##name##_body(c);                                                        \
+    }                                                                                       \
+    static void hle_##name##_body(Cpu *c)
 
 // argument helpers
 #define A(i) (c->x[(i)])

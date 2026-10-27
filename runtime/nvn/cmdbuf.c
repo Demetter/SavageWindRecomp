@@ -33,26 +33,125 @@
 static uint32_t cmd_cost(uint32_t op, uint32_t extra) { (void)op; return 8 + ((extra + 3) & ~3u); }
 
 typedef struct { uint8_t *mem; uint64_t size; uint64_t frame; } HBlock;
+struct Region;
 typedef struct Shadow {
     uint64_t lo, hi;  // the guest memory it stands for (written so far); lo == hi == 0: none
     uint64_t win;     // end of the memory the game added there (0: none)
     uint64_t free_to; // claims below this go over no other live shadow (shadow_claim takes no lock)
+    struct Region *rg;  // the region whose index holds it and whose blocks it takes
     HBlock *blocks;
     int nblocks, cap;
     int users;        // command buffers recording into it
     bool dead;        // overlapped: out of the live list (freed when its last user leaves)
 } Shadow;
 
-static Shadow **g_live;  // shadows of guest memory, sorted by lo, never overlapping
-static int g_nlive, g_caplive;
-static HBlock *g_free;   // blocks ready for reuse
-static int g_nfree, g_capfree;
-static uint64_t g_free_bytes;
-#define FREE_BUDGET (64ull << 20)  // dead blocks past this go back to the C heap
-static HBlock *g_grave;  // dead blocks, oldest first, until three frames have passed
-static int g_ngrave, g_capgrave;
-static pthread_mutex_t g_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
+// Command memory is owned per region, as a PC engine owns it per thread: each game core's command arena blocks are a
+// region of their own (rt_arena_setup registers them: cmdbuf_arena_region), recorded into only by that core's thread,
+// with its own lock, index of live shadows and block cache; everything else (the display lists the models record at
+// load, the main command buffers) is region 0. A frame's recordings then take no lock another core holds, and each
+// region's index is small (one core's lists of the last frames), where one index of every list made every chunk the
+// game added shift an array of ~31,000 under one lock (~1.5 us a time: the recording threads waited on each other).
+typedef struct Region {
+    pthread_mutex_t lock;
+    uint64_t lo, hi;       // the guest memory (region 0: all the rest); lo == hi: unused
+    Shadow **live;         // shadows of guest memory, sorted by lo, never overlapping
+    int nlive, caplive;
+    HBlock *free;          // blocks ready for reuse
+    int nfree, capfree;
+    uint64_t free_bytes, budget;  // (dead blocks past the budget go back to the C heap)
+    HBlock *grave;         // dead blocks, oldest first, until three frames have passed
+    int ngrave, capgrave;
+} __attribute__((aligned(64))) Region;
+#define MAX_REGIONS 256
+static Region g_rg[MAX_REGIONS];
+static _Atomic int g_nrg = 1;
+static pthread_once_t g_rg_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_rg_reg = PTHREAD_MUTEX_INITIALIZER;  // (registering regions)
+static void rg_init(void) {
+    for (int i = 0; i < MAX_REGIONS; i++) pthread_mutex_init(&g_rg[i].lock, NULL);
+    g_rg[0].budget = 64ull << 20;
+}
+
+// (research, SAVAGEWIND_JOBS_JOBTIME: runtime/hle/jobs.c) the locks' waits and holds on each thread, and by call site
+extern __thread uint64_t t_shadow_n, t_shadow_wait, t_shadow_hold;
+static __thread uint64_t t_shadow_t1;
+static _Atomic uint64_t g_site_n[8], g_site_hold[8];
+static inline void rg_lock(Region *r) {
+    if (__builtin_expect(g_nvn_time, 0)) {
+        uint64_t t0 = plat_ticks();
+        pthread_mutex_lock(&r->lock);
+        t_shadow_t1 = plat_ticks();
+        t_shadow_wait += t_shadow_t1 - t0, t_shadow_n++;
+    } else pthread_mutex_lock(&r->lock);
+}
+static inline void rg_unlock(Region *r, int site) {
+    if (__builtin_expect(g_nvn_time, 0)) {
+        uint64_t h = plat_ticks() - t_shadow_t1;
+        t_shadow_hold += h;
+        atomic_fetch_add_explicit(&g_site_n[site], 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_site_hold[site], h, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&r->lock);
+}
 uint64_t renderer_present_count(void);
+
+// Host objects written on every record (a command buffer's state, a shadow's extent) each on cache lines of their own:
+// threads recording side by side don't share a line.
+static void *line_alloc(size_t n) {
+    uint8_t *p = calloc(1, n + 64 + sizeof(void *));
+    if (!p) FATAL("nvn: out of host memory (%llu bytes)\n", (unsigned long long)n);
+    uint8_t *a = (uint8_t *)(((uintptr_t)p + sizeof(void *) + 63) & ~(uintptr_t)63);
+    ((void **)a)[-1] = p;
+    return a;
+}
+static void line_free(void *a) {
+    if (a) free(((void **)a)[-1]);
+}
+
+// The region of guest command memory [lo, hi): a registered arena block that holds lo, or region 0. A chunk past its
+// block's end (none expected: the arena hands out memory inside a core's block) stays with the block; the lists past
+// the end then die only when their own region's recording goes over them.
+static Region *region_of(uint64_t lo, uint64_t hi) {
+    int n = atomic_load_explicit(&g_nrg, memory_order_acquire);
+    for (int i = 1; i < n; i++) {
+        Region *r = &g_rg[i];
+        if (lo >= r->lo && lo < r->hi) {
+            if (hi > r->hi) {
+                static _Atomic int told;
+                if (!atomic_fetch_add(&told, 1))
+                    LOG("[cmdbuf] command memory %llx-%llx goes past its arena block's end %llx\n",
+                        (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)r->hi);
+            }
+            return r;
+        }
+    }
+    return &g_rg[0];
+}
+
+// A game core's command arena block (runtime/hle/percore.c rt_arena_setup): guest memory [storage + offset, + size) of
+// memory pool `pool` (a guest NVNmemoryPool*) becomes a region of its own.
+void cmdbuf_arena_region(uint64_t pool, uint64_t offset, uint64_t size) {
+    pthread_once(&g_rg_once, rg_init);
+    NvnPool *p = pool ? HOST(NvnPool, pool) : NULL;
+    if (!p || !size) return;
+    uint64_t lo = p->storage + offset, hi = lo + size;
+    pthread_mutex_lock(&g_rg_reg);
+    int n = atomic_load_explicit(&g_nrg, memory_order_relaxed), at = n;
+    for (int i = 1; i < n; i++)
+        if (g_rg[i].lo == g_rg[i].hi) { at = i; break; }  // (a block whose pool is gone)
+    if (at < MAX_REGIONS) {
+        Region *r = &g_rg[at];
+        rg_lock(r);
+        r->lo = lo, r->hi = hi, r->budget = 16ull << 20;
+        rg_unlock(r, 7);
+        LOG("[cmdbuf] region %d: command arena block %llx-%llx\n", at, (unsigned long long)lo, (unsigned long long)hi);
+        if (at == n) atomic_store_explicit(&g_nrg, n + 1, memory_order_release);
+    } else {
+        static int told;
+        if (!told++) LOG("[cmdbuf] more than %d command arena blocks: the rest share region 0\n", MAX_REGIONS - 1);
+    }
+    pthread_mutex_unlock(&g_rg_reg);
+}
 
 static void push_block(HBlock **v, int *n, int *cap, HBlock b) {
     if (*n == *cap) {
@@ -62,37 +161,50 @@ static void push_block(HBlock **v, int *n, int *cap, HBlock b) {
     (*v)[(*n)++] = b;
 }
 
-static void block_release(HBlock b) {  // (lock held)
+static void block_release(Region *r, HBlock b) {  // (r's lock held)
     b.frame = renderer_present_count();
-    push_block(&g_grave, &g_ngrave, &g_capgrave, b);
+    push_block(&r->grave, &r->ngrave, &r->capgrave, b);
 }
 
-static HBlock block_get(uint64_t want) {  // (lock held) a free block that fits without wasting much, or a new one
+static void cmd_stats(uint64_t now) {  // (test, SAVAGEWIND_CMD_STATS) what the command records hold, every 600 frames
+    static _Atomic uint64_t stats_at;
+    uint64_t at = atomic_load_explicit(&stats_at, memory_order_relaxed);
+    if (now < at || !atomic_compare_exchange_strong(&stats_at, &at, now + 600)) return;
+    int n = atomic_load_explicit(&g_nrg, memory_order_acquire), lists = 0, nfree = 0, grave = 0;
+    uint64_t freeb = 0;
+    for (int i = 0; i < n; i++) {  // (counts only: the other regions' lists change under their own locks)
+        Region *r = &g_rg[i];
+        lists += r->nlive, nfree += r->nfree, grave += r->ngrave, freeb += r->free_bytes;
+    }
+    LOG("[cmdbuf] frame %llu: %d lists' shadows in %d regions (region 0: %d); %d free blocks, %llu MB; %d in the "
+        "grave\n", (unsigned long long)now, lists, n, g_rg[0].nlive, nfree, (unsigned long long)(freeb >> 20), grave);
+    uint64_t c[8], h[8];
+    for (int i = 0; i < 8; i++)
+        c[i] = atomic_exchange(&g_site_n[i], 0), h[i] = atomic_exchange(&g_site_hold[i], 0);
+    LOG("[cmdbuf] lock holds by site (1 switch, 2 claim, 3 leave, 4 pool gone, 5 block, 6 reset), count/ticks:"
+        " %llu/%llu %llu/%llu %llu/%llu %llu/%llu %llu/%llu %llu/%llu\n",
+        (unsigned long long)c[1], (unsigned long long)h[1], (unsigned long long)c[2], (unsigned long long)h[2],
+        (unsigned long long)c[3], (unsigned long long)h[3], (unsigned long long)c[4], (unsigned long long)h[4],
+        (unsigned long long)c[5], (unsigned long long)h[5], (unsigned long long)c[6], (unsigned long long)h[6]);
+}
+
+static HBlock block_get(Region *r, uint64_t want) {  // (r's lock held) a free block that fits, or a new one
     uint64_t now = renderer_present_count();
     static int stats = -1;
-    static uint64_t stats_at;
     if (stats < 0) stats = getenv("SAVAGEWIND_CMD_STATS") != NULL;
-    if (stats && now >= stats_at) {  // (test) what the command records hold, every 600 frames
-        uint64_t live = 0;
-        for (int i = 0; i < g_nlive; i++)
-            for (int j = 0; j < g_live[i]->nblocks; j++) live += g_live[i]->blocks[j].size;
-        LOG("[cmdbuf] frame %llu: %d lists' shadows, %llu MB of records; %d free blocks, %llu MB\n",
-            (unsigned long long)now, g_nlive, (unsigned long long)(live >> 20), g_nfree,
-            (unsigned long long)(g_free_bytes >> 20));
-        stats_at = now + 600;
-    }
+    if (stats) cmd_stats(now);
     int k = 0;
-    for (; k < g_ngrave && now - g_grave[k].frame >= 3; k++) {
-        if (g_free_bytes + g_grave[k].size > FREE_BUDGET) { free(g_grave[k].mem); continue; }
-        g_free_bytes += g_grave[k].size;
-        push_block(&g_free, &g_nfree, &g_capfree, g_grave[k]);
+    for (; k < r->ngrave && now - r->grave[k].frame >= 3; k++) {
+        if (r->free_bytes + r->grave[k].size > r->budget) { free(r->grave[k].mem); continue; }
+        r->free_bytes += r->grave[k].size;
+        push_block(&r->free, &r->nfree, &r->capfree, r->grave[k]);
     }
-    if (k) memmove(g_grave, g_grave + k, (g_ngrave -= k) * sizeof *g_grave);
-    for (int i = g_nfree - 1; i >= 0; i--)
-        if (g_free[i].size >= want && g_free[i].size <= want * 4) {
-            HBlock b = g_free[i];
-            g_free[i] = g_free[--g_nfree];
-            g_free_bytes -= b.size;
+    if (k) memmove(r->grave, r->grave + k, (r->ngrave -= k) * sizeof *r->grave);
+    for (int i = r->nfree - 1; i >= 0; i--)
+        if (r->free[i].size >= want && r->free[i].size <= want * 4) {
+            HBlock b = r->free[i];
+            r->free[i] = r->free[--r->nfree];
+            r->free_bytes -= b.size;
             return b;
         }
     want = (want + 0xFF) & ~0xFFull;
@@ -101,22 +213,27 @@ static HBlock block_get(uint64_t want) {  // (lock held) a free block that fits 
     return b;
 }
 
-static void shadow_kill(Shadow *sh) {  // (lock held; already out of the live list) its records are dead
-    for (int i = 0; i < sh->nblocks; i++) block_release(sh->blocks[i]);
+static void shadow_free(Shadow *sh) {
+    free(sh->blocks);
+    line_free(sh);
+}
+
+static void shadow_kill(Shadow *sh) {  // (its region's lock held; already out of the live list) its records are dead
+    for (int i = 0; i < sh->nblocks; i++) block_release(sh->rg, sh->blocks[i]);
     sh->nblocks = 0;
     sh->dead = true;
-    if (!sh->users) { free(sh->blocks); free(sh); }
+    if (!sh->users) shadow_free(sh);
 }
 
-static void shadow_unuse(Shadow *sh) {  // (lock held)
-    if (!--sh->users && sh->dead) { free(sh->blocks); free(sh); }
+static void shadow_unuse(Shadow *sh) {  // (its region's lock held)
+    if (!--sh->users && sh->dead) shadow_free(sh);
 }
 
-static int live_index(uint64_t lo) {  // (lock held) the first live shadow not wholly before lo
-    int a = 0, b = g_nlive;
+static int live_index(Region *r, uint64_t lo) {  // (r's lock held) the first live shadow not wholly before lo
+    int a = 0, b = r->nlive;
     while (a < b) {
         int m = (a + b) / 2;
-        if (g_live[m]->hi <= lo && g_live[m]->lo < lo) a = m + 1; else b = m;
+        if (r->live[m]->hi <= lo && r->live[m]->lo < lo) a = m + 1; else b = m;
     }
     return a;
 }
@@ -125,38 +242,46 @@ static int live_index(uint64_t lo) {  // (lock held) the first live shadow not w
 // for guest memory [lo, hi): the same one when the game adds exactly that range again, unless that is the one
 // being recorded into (`recording`: its blocks still hold the start of the list); otherwise a new one, and the
 // shadows its first bytes go over die (shadow_claim: the others once written over). What `old` stands for shrinks
-// to the part used first.
+// to the part used first. (The two regions' locks are taken in one order: the lower one first.)
 static Shadow *shadow_switch(Shadow *old, uint64_t used, bool recording, uint64_t lo, uint64_t hi) {
-    pthread_mutex_lock(&g_shadow_lock);
+    pthread_once(&g_rg_once, rg_init);
+    Region *rn = lo < hi ? region_of(lo, hi) : old ? old->rg : &g_rg[0], *ro = old ? old->rg : NULL;
+    Region *r1 = rn, *r2 = ro && ro != rn ? ro : NULL;
+    if (r2 && r2 < r1) { Region *t = r1; r1 = r2; r2 = t; }
+    rg_lock(r1);
+    if (r2) rg_lock(r2);
     if (old && !old->dead && old->lo < old->hi && old->lo + used < old->hi) old->hi = old->lo + used;
     Shadow *sh = NULL;
     if (lo < hi) {
-        int a = live_index(lo);
-        Shadow *same = a < g_nlive && g_live[a]->lo == lo && g_live[a]->win == hi ? g_live[a] : NULL;
+        int a = live_index(rn, lo);
+        Shadow *same = a < rn->nlive && rn->live[a]->lo == lo && rn->live[a]->win == hi ? rn->live[a] : NULL;
         if (same && (same->users == (same == old)) && !(recording && same == old)) sh = same;
         else {
             int end = a;
-            while (end < g_nlive && g_live[end]->lo <= lo) end++;
-            for (int i = a; i < end; i++) shadow_kill(g_live[i]);
-            if (g_nlive - (end - a) + 1 > g_caplive) {
-                g_caplive = g_caplive ? g_caplive * 2 : 1024;
-                g_live = realloc(g_live, g_caplive * sizeof *g_live);
+            while (end < rn->nlive && rn->live[end]->lo <= lo) end++;
+            for (int i = a; i < end; i++) shadow_kill(rn->live[i]);
+            if (rn->nlive - (end - a) + 1 > rn->caplive) {
+                rn->caplive = rn->caplive ? rn->caplive * 2 : 1024;
+                rn->live = realloc(rn->live, rn->caplive * sizeof *rn->live);
             }
-            memmove(g_live + a + 1, g_live + end, (g_nlive - end) * sizeof *g_live);
-            g_nlive += 1 - (end - a);
-            sh = calloc(1, sizeof *sh);
+            memmove(rn->live + a + 1, rn->live + end, (rn->nlive - end) * sizeof *rn->live);
+            rn->nlive += 1 - (end - a);
+            sh = line_alloc(sizeof *sh);
             sh->lo = sh->hi = lo;
             sh->win = hi;
-            sh->free_to = a + 1 < g_nlive && g_live[a + 1]->lo < hi ? g_live[a + 1]->lo : hi;
-            g_live[a] = sh;
-            if (a > 0 && g_live[a - 1]->free_to > lo) g_live[a - 1]->free_to = lo;
+            sh->rg = rn;
+            sh->free_to = a + 1 < rn->nlive && rn->live[a + 1]->lo < hi ? rn->live[a + 1]->lo : hi;
+            rn->live[a] = sh;
+            if (a > 0 && rn->live[a - 1]->free_to > lo) rn->live[a - 1]->free_to = lo;
         }
     } else {
-        sh = calloc(1, sizeof *sh);
+        sh = line_alloc(sizeof *sh);
+        sh->rg = rn;
     }
     sh->users++;
     if (old) shadow_unuse(old);
-    pthread_mutex_unlock(&g_shadow_lock);
+    if (r2) rg_unlock(r2, 1);
+    rg_unlock(r1, 1);
     return sh;
 }
 
@@ -165,78 +290,99 @@ static void shadow_claim(Shadow *sh, uint64_t end) {
     if (end > sh->win) end = sh->win;  // (recording goes on past the window when the game adds no more: accounting only)
     if (end <= sh->hi || sh->dead) return;
     if (end <= sh->free_to) { sh->hi = end; return; }
-    pthread_mutex_lock(&g_shadow_lock);
+    Region *r = sh->rg;
+    rg_lock(r);
     if (!sh->dead) {
-        int i = live_index(sh->lo);
-        while (i < g_nlive && g_live[i] != sh) i++;
-        if (i < g_nlive) {
+        int i = live_index(r, sh->lo);
+        while (i < r->nlive && r->live[i] != sh) i++;
+        if (i < r->nlive) {
             int last = i + 1;
-            while (last < g_nlive && g_live[last]->lo < end) last++;
-            for (int k = i + 1; k < last; k++) shadow_kill(g_live[k]);
-            memmove(g_live + i + 1, g_live + last, (g_nlive - last) * sizeof *g_live);
-            g_nlive -= last - (i + 1);
+            while (last < r->nlive && r->live[last]->lo < end) last++;
+            for (int k = i + 1; k < last; k++) shadow_kill(r->live[k]);
+            memmove(r->live + i + 1, r->live + last, (r->nlive - last) * sizeof *r->live);
+            r->nlive -= last - (i + 1);
             sh->hi = end;
-            sh->free_to = i + 1 < g_nlive && g_live[i + 1]->lo < sh->win ? g_live[i + 1]->lo : sh->win;
+            sh->free_to = i + 1 < r->nlive && r->live[i + 1]->lo < sh->win ? r->live[i + 1]->lo : sh->win;
         }
     }
-    pthread_mutex_unlock(&g_shadow_lock);
+    rg_unlock(r, 2);
 }
 
 static void shadow_leave(Shadow *sh, uint64_t used) {  // (a command buffer is finalized)
-    pthread_mutex_lock(&g_shadow_lock);
+    Region *r = sh->rg;
+    rg_lock(r);
     if (!sh->dead && sh->lo < sh->hi && sh->lo + used < sh->hi) sh->hi = sh->lo + used;
     shadow_unuse(sh);
-    pthread_mutex_unlock(&g_shadow_lock);
+    rg_unlock(r, 3);
 }
 
-// A memory pool is finalized: the lists recorded in its memory [lo, hi) are dead.
+// A memory pool is finalized: the lists recorded in its memory [lo, hi) are dead, and the arena blocks in it are
+// regions no more.
 void cmdbuf_pool_gone(uint64_t lo, uint64_t hi) {
-    pthread_mutex_lock(&g_shadow_lock);
-    int a = live_index(lo), end = a;
-    while (end < g_nlive && g_live[end]->lo < hi) end++;
-    for (int i = a; i < end; i++) shadow_kill(g_live[i]);
-    memmove(g_live + a, g_live + end, (g_nlive - end) * sizeof *g_live);
-    g_nlive -= end - a;
-    pthread_mutex_unlock(&g_shadow_lock);
+    pthread_once(&g_rg_once, rg_init);
+    pthread_mutex_lock(&g_rg_reg);
+    int n = atomic_load_explicit(&g_nrg, memory_order_acquire);
+    for (int k = 0; k < n; k++) {
+        Region *r = &g_rg[k];
+        if (k && (r->lo == r->hi || r->hi <= lo || r->lo >= hi)) continue;
+        rg_lock(r);
+        int a = live_index(r, lo), end = a;
+        while (end < r->nlive && r->live[end]->lo < hi) end++;
+        for (int i = a; i < end; i++) shadow_kill(r->live[i]);
+        memmove(r->live + a, r->live + end, (r->nlive - end) * sizeof *r->live);
+        r->nlive -= end - a;
+        if (k && r->lo >= lo && r->hi <= hi) r->lo = r->hi = 0;
+        rg_unlock(r, 4);
+    }
+    pthread_mutex_unlock(&g_rg_reg);
 }
 
 // Block i of a shadow, at least `want` bytes (blocks past the one in use hold dead records).
 static HBlock shadow_block(Shadow *sh, int i, uint64_t want) {
-    pthread_mutex_lock(&g_shadow_lock);
+    Region *r = sh->rg;
+    rg_lock(r);
     if (i < sh->nblocks && sh->blocks[i].size < want) {
-        block_release(sh->blocks[i]);
-        sh->blocks[i] = block_get(want);
+        block_release(r, sh->blocks[i]);
+        sh->blocks[i] = block_get(r, want);
     }
     while (sh->nblocks <= i) {
         if (sh->nblocks == sh->cap) {
             sh->cap = sh->cap ? sh->cap * 2 : 4;
             sh->blocks = realloc(sh->blocks, sh->cap * sizeof *sh->blocks);
         }
-        HBlock nb = block_get(want);  // (before the count goes up: the stats line reads the blocks)
+        HBlock nb = block_get(r, want);  // (before the count goes up: the stats line reads the blocks)
         sh->blocks[sh->nblocks++] = nb;
     }
     HBlock b = sh->blocks[i];
-    pthread_mutex_unlock(&g_shadow_lock);
+    rg_unlock(r, 5);
     return b;
 }
 
 RT_ON_RESET(cmdbuf_shadow_reset) {  // (reboot: every list is dead; command buffers were guest objects)
-    pthread_mutex_lock(&g_shadow_lock);
-    for (int i = 0; i < g_nlive; i++) {
-        for (int k = 0; k < g_live[i]->nblocks; k++) free(g_live[i]->blocks[k].mem);
-        free(g_live[i]->blocks);
-        free(g_live[i]);
+    pthread_once(&g_rg_once, rg_init);
+    pthread_mutex_lock(&g_rg_reg);
+    int n = atomic_load_explicit(&g_nrg, memory_order_acquire);
+    for (int k = 0; k < n; k++) {
+        Region *r = &g_rg[k];
+        rg_lock(r);
+        for (int i = 0; i < r->nlive; i++) {
+            for (int j = 0; j < r->live[i]->nblocks; j++) free(r->live[i]->blocks[j].mem);
+            shadow_free(r->live[i]);
+        }
+        r->nlive = 0;
+        for (int i = 0; i < r->ngrave; i++) free(r->grave[i].mem);
+        r->ngrave = 0;
+        if (k) r->lo = r->hi = 0;
+        rg_unlock(r, 6);
     }
-    g_nlive = 0;
-    for (int i = 0; i < g_ngrave; i++) free(g_grave[i].mem);
-    g_ngrave = 0;
-    pthread_mutex_unlock(&g_shadow_lock);
+    atomic_store_explicit(&g_nrg, 1, memory_order_release);
+    pthread_mutex_unlock(&g_rg_reg);
 }
 
 static NvnCmdBuf *cb_of(uint64_t guest) { return HOST(NvnCmdBuf, guest); }
 
 NVN(nvnCommandBufferInitialize) {
-    NvnCmdBuf *cb = calloc(1, sizeof *cb);
+    NvnCmdBuf *cb = line_alloc(sizeof *cb);
     cb->guest = A(0);
     SET_HOST(A(0), cb);
     RET(1);
@@ -244,7 +390,7 @@ NVN(nvnCommandBufferInitialize) {
 NVN(nvnCommandBufferFinalize) {
     NvnCmdBuf *cb = cb_of(A(0));
     if (cb && cb->shadow) shadow_leave(cb->shadow, cb->gused);
-    free(cb);
+    line_free(cb);
     SET_HOST(A(0), 0);
 }
 NVN(nvnCommandBufferSetDebugLabel) { (void)c; }

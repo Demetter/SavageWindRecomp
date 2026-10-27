@@ -477,6 +477,42 @@ def _job_thread_res(gen, a):
             f'  /* {a:#x}: ldr w8, [x0, #0xd0] (ResourceMgrTask: a job system thread, any worker) */')
 
 
+# The views' render recording (1.9.0 f_7000fb7544): `mov w3, #3` is the job count it gives f_7000fb578c, three jobs of
+# case 4 that each claim the next view item from a counter (f_7000fb5a20: +0x5e50 against +0x5e58) and record it into a
+# command buffer of its own - a parallel loop sized for the Switch build's three cores. One job per game core instead,
+# so the items spread over every core like a PC engine's parallel command recording.
+def _view_rec_jobs(gen, a):
+    assert _word(gen, a) == 0x52800063, hex(_word(gen, a))  # mov w3, #3
+    return ('{ extern int rt_game_cores(void); c->x[3] = (uint32_t)rt_game_cores(); }'
+            f'  /* {a:#x}: mov w3, #3 (view recording jobs: one per game core) */')
+
+
+# The parts each draw list is cut into for that (1.9.0 f_7000fb3d88, the constructor: `mov x8, #1; movk x8, #3, lsl
+# #32; str x8, [x19, #0x5e68]`: at least 1 draw a part, at most 3 parts): f_7000fb98bc cuts a list into
+# min(draws / 1, 3) contiguous ranges, items the jobs above take - three cores' worth. As many parts as game cores here
+# (runtime/hle/jobs.c rt_view_rec_parts).
+def _view_rec_parts(gen, a):
+    assert _word(gen, a) == 0xf2c00068, hex(_word(gen, a))  # movk x8, #3, lsl #32
+    return ('{ extern uint32_t rt_view_rec_parts(void); '
+            'c->x[8] = (c->x[8] & 0xffffffffull) | ((uint64_t)rt_view_rec_parts() << 32); }'
+            f'  /* {a:#x}: movk x8, #3, lsl #32 (view recording: parts a draw list is cut into) */')
+
+
+# ... and what those parts are stored in, sized for three (both clamp an overflow to slot 0): the items and their order
+# (1.9.0 f_7000fb2804: `mov w9, #0xb7`, 61 lists x 3 parts for each unit of the scene's list count) and each list's
+# record of its parts' command buffers (f_7000faa800: `mov w1, #0x20`).
+def _view_rec_items(gen, a):
+    assert _word(gen, a) == 0x528016e9, hex(_word(gen, a))  # mov w9, #0xb7
+    return ('{ extern uint32_t rt_view_rec_parts(void); c->x[9] = 61u * rt_view_rec_parts(); }'
+            f'  /* {a:#x}: mov w9, #0xb7 (view recording items: 61 lists x the parts) */')
+
+
+def _view_rec_cbs(gen, a):
+    assert _word(gen, a) == 0x52800401, hex(_word(gen, a))  # mov w1, #0x20
+    return ('{ extern uint32_t rt_view_rec_parts(void); uint32_t p = rt_view_rec_parts(); c->x[1] = p > 32 ? p : 32; }'
+            f'  /* {a:#x}: mov w1, #0x20 (command buffers of a list: at least its parts) */')
+
+
 # The game's memory heap size (1.9.0 nninitStartup 0x7000000710: `mov w0, #0xc3000000` before SetMemoryHeapSize): the
 # PC's application memory less what the Switch build kept back (runtime/hle/heaps.c rt_memory_heap_size). BOTW gives
 # what its fixed heaps leave to "the rest" heaps, whose contents grow with the core count (BOTW-JOBS-NATIVE.md step 4).
@@ -1386,6 +1422,10 @@ PATCHES = {
     'jobs_bcast_fini': _jobs_bcast_fini,
     'job_thread_proc': _job_thread_proc,
     'job_thread_res': _job_thread_res,
+    'view_rec_jobs': _view_rec_jobs,
+    'view_rec_parts': _view_rec_parts,
+    'view_rec_items': _view_rec_items,
+    'view_rec_cbs': _view_rec_cbs,
     'jobs_push': _jobs_entry('rt_jobs_push', 0xa9bc7bfd, 0x40, 'stp x29, x30, [sp, #-0x40]! (job pool push)'),
     'jobs_kick': _jobs_entry('rt_jobs_kick', 0xd10103ff, 0x40, 'sub sp, sp, #0x40 (job pool kick)'),
     'jobs_run': _jobs_entry('rt_jobs_run', 0xa9ba7bfd, 0x60, 'stp x29, x30, [sp, #-0x60]! (job worker run)'),

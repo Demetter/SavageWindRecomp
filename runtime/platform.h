@@ -45,6 +45,13 @@ int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 
 // ---- time
 uint64_t plat_now_ns(void);                // monotonic
+static inline uint64_t plat_ticks(void) {  // the CPU's raw counter (rdtsc / cntvct): cheap timing in probes
+#if defined(__x86_64__)
+    return __builtin_ia32_rdtsc();
+#else
+    uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v;
+#endif
+}
 #ifdef _WIN32
 uint64_t plat_thread_cycles(void);         // scheduled CPU cycles; not elapsed time
 uint32_t plat_thread_id(void);

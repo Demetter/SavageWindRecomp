@@ -377,6 +377,7 @@ NVN(nvnQueueSubmitCommands) {
     const uint64_t *handles = AP(2);
     TL("submit %d lists (lr %llx)", n, (unsigned long long)c->x[30]);
     if (frame_split()) g_fs_submit = plat_now_ns();
+    { extern void vk_ubo_submit_snapshot(int); vk_ubo_submit_snapshot(n); }  // (SAVAGEWIND_VK_UBO_SUBMIT)
     if (async_exec()) {
         for (int i = 0; i < n; i++) queue_put(QOP_EXEC, handles[i], NULL);
         return;
