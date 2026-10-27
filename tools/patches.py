@@ -693,6 +693,10 @@ PATCHES = {
     'jobs_buf_base': _jobs_base(0x91116013, 19, 0, 0x458, 'add x19, x0, #0x458: every core\'s buffer'),
     'jobs_buf_bound': _jobs_bound(0x71000d1f, 8),
     'rec17_new': _rec17_new,
+    # the per-core draw contexts (BOTW-JOBS-NATIVE.md #16 / #18): their object (f_7000063ad4) sizes its per-core arrays
+    # by the count in the descriptor f_700105bf6c builds, a literal 3 - the game's core count instead
+    'drawctx_count': _ctx_patch(0x52800068, lambda gen, a: 'c->x[8] = (uint32_t)rt_game_cores();',
+                                'mov w8, #3: a draw context for every core', 'per-core draw contexts'),
     'arena_setup': _arena_setup,
     'arena_reset': _arena_reset,
     'arena_free_0': _arena_free(0xf9404808, True),

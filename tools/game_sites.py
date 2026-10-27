@@ -307,6 +307,9 @@ SITES = [
          '94000000/fc000000 911d8280', 0),
     Site('rec17_init_d', 'call', '94000000/fc000000 91140280 94000000/fc000000 9118c280 94000000/fc000000 911d8280 '
          '94000000/fc000000 91224280', 0),
+    # the per-core draw contexts' count (BOTW-JOBS-NATIVE.md #16 / #18; tools/patches.py drawctx_count): a literal 3 in
+    # the descriptor f_700105bf6c builds; the object sizes its per-core arrays (+0x10, +0x20, +0x1378) by it
+    Site('drawctx_count', 'code', '52800068 b9005be8 94000000/fc000000 910043e1 aa0003f8 94000000/fc000000 f90016d8 d503201f', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -352,7 +355,8 @@ OPTIONAL_GROUPS = [
      'jobs_mark_bound', 'jobs_buf_base', 'jobs_buf_bound',
      'rec17_new', 'rec17_alloc', 'rec17_alloc_tag',
      'rec17_init_a', 'rec17_init_b', 'rec17_init_c',
-     'rec17_init_d'),
+     'rec17_init_d',
+     'drawctx_count'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -553,6 +557,7 @@ KNOWN = {
         'rec17_init_b': 0x7000ec53f0,
         'rec17_init_c': 0x7000ec54c4,
         'rec17_init_d': 0x7000ecbfc0,
+        'drawctx_count': 0x700105c1b8,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

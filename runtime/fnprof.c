@@ -67,11 +67,12 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
         }
 }
 
-// SAVAGEWIND_FNPROF_ARGS=<hex addr>[,...]: log x0-x5 and the caller on each entry of those functions (the first
-// SAVAGEWIND_FNPROF_ARGS_MAX entries each, default 64) - what a function is called with, without a debugger - and
-// what one register points to: SAVAGEWIND_FNPROF_DEREF=<reg>:<qwords> (default 1:4, x1: often a descriptor or out
-// argument).
+// SAVAGEWIND_FNPROF_ARGS=<hex addr>[@<reg>:<hex offset>:<qwords>][,...]: log x0-x5 and the caller on each entry of
+// those functions (the first SAVAGEWIND_FNPROF_ARGS_MAX entries each, default 64) - what a function is called with,
+// without a debugger - and what one register points to, at an offset (a field deep in `this`: @0:840:2). Without
+// @: SAVAGEWIND_FNPROF_DEREF=<reg>:<qwords> (default 1:4, x1: often a descriptor or out argument), offset 0.
 static uint64_t args_addrs[64];
+static struct { int reg, n; uint64_t off; } args_deref[64];
 static int args_n = -1, args_max = 64, deref_reg = 1, deref_n = 4;
 static _Atomic int args_count[64];
 
@@ -84,7 +85,16 @@ static void args_check(uint64_t a, uint64_t lr) {
         if (deref_reg < 0 || deref_reg > 30) deref_reg = 1;
         if (deref_n < 0 || deref_n > 64) deref_n = 4;
         for (const char *p = e; p && *p && args_n < 64;) {
-            args_addrs[args_n++] = strtoull(p, (char **)&p, 16);
+            args_deref[args_n].reg = deref_reg, args_deref[args_n].n = deref_n, args_deref[args_n].off = 0;
+            args_addrs[args_n] = strtoull(p, (char **)&p, 16);
+            if (*p == '@') {
+                int reg = 0, n = 0;
+                unsigned long long off = 0;
+                if (sscanf(p + 1, "%d:%llx:%d", &reg, &off, &n) == 3 && reg >= 0 && reg <= 30 && n >= 0 && n <= 64)
+                    args_deref[args_n].reg = reg, args_deref[args_n].n = n, args_deref[args_n].off = off;
+                while (*p && *p != ',') p++;
+            }
+            args_n++;
             while (*p == ',' || *p == ' ') p++;
         }
     }
@@ -96,9 +106,10 @@ static void args_check(uint64_t a, uint64_t lr) {
             int n = snprintf(line, sizeof line, "[fnprof-args] %llx from %llx: %llx %llx %llx %llx %llx %llx [x%d:",
                              (unsigned long long)a, (unsigned long long)lr, (unsigned long long)c->x[0],
                              (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3],
-                             (unsigned long long)c->x[4], (unsigned long long)c->x[5], deref_reg);
-            uint64_t p = c->x[deref_reg];
-            for (int k = 0; k < deref_n && p >= GUEST_LO && p + 8 * (k + 1) <= GUEST_HI; k++) {
+                             (unsigned long long)c->x[4], (unsigned long long)c->x[5], args_deref[i].reg);
+            if (args_deref[i].off) n += snprintf(line + n, sizeof line - n, "+%llx", (unsigned long long)args_deref[i].off);
+            uint64_t p = c->x[args_deref[i].reg] + args_deref[i].off;
+            for (int k = 0; k < args_deref[i].n && p >= GUEST_LO && p + 8 * (k + 1) <= GUEST_HI; k++) {
                 uint64_t v = ((uint64_t *)(uintptr_t)p)[k];
                 n += snprintf(line + n, sizeof line - n, " %llx", (unsigned long long)v);
                 const char *s = (const char *)(uintptr_t)v;  // a pointer to text (a name): show it
