@@ -244,6 +244,38 @@ void rt_jobs_scratch_free(Cpu *c, uint64_t obj, uint64_t free_fn) {
     }
 }
 
+// ---- #17: per-core 0xd50-byte records (count and array at +0x418 / +0x420 of their owner; every user bounds the core
+// by the count, the destructor is a plain delete[] by the header's count). The game makes them with a literal 3:
+// f_700148e9f4 (1.9.0, holder x0, heap x1) is `new T[3]` with T's constructor inline. This makes the game's core count
+// of them. fn: [0] new[](size, heap, align, tag), [1] the tag's GOT slot, [2..5] the parts' constructors: +0;
+// +0x68 and +0x188; +0x2a8; eight at +0x3c8 + k x 0x130.
+void rt_rec17_new(Cpu *c, const uint64_t *fn) {
+    uint64_t holder = c->x[0], heap = c->x[1], n = (uint64_t)rt_game_cores();
+    c->x[0] = 8 + n * 0xd50, c->x[1] = heap, c->x[2] = 8, c->x[3] = LD64(fn[1]);
+    guest_call(c, fn[0]);
+    uint64_t p = c->x[0];
+    if (!p) return;
+    ST64(p, n);
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t e = p + 8 + i * 0xd50;
+        c->x[0] = e;
+        guest_call(c, fn[2]);
+        c->x[0] = e + 0x68;
+        guest_call(c, fn[3]);
+        c->x[0] = e + 0x188;
+        guest_call(c, fn[3]);
+        c->x[0] = e + 0x2a8;
+        guest_call(c, fn[4]);
+        for (uint64_t k = 0; k < 8; k++) {
+            c->x[0] = e + 0x3c8 + 0x130 * k;
+            guest_call(c, fn[5]);
+        }
+        ST32(e + 0xd48, 0);
+    }
+    ST32(holder, n), ST64(holder + 8, p + 8);
+    LOG("[percore] #17 records: %llu of 0xd50 at %llx\n", (unsigned long long)n, (unsigned long long)(p + 8));
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);

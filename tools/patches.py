@@ -563,6 +563,17 @@ def _jobs_base(word, dst, obj, field, what):  # add x<dst>, x<obj>, #field: the 
     return _jobs_patch(word, lambda gen, a: f'c->x[{dst}] = {_jobs(f"c->x[{obj}]", field)};', what)
 
 
+def _rec17_new(gen, a):
+    # The per-core 0xd50-byte records (BOTW-JOBS-NATIVE.md #17): their maker, `new T[3]` with T's constructor inline,
+    # runs in the runtime and makes the game's core count of them (every user goes by the holder's count).
+    assert _word(gen, a) == 0xa9bc7bfd, hex(_word(gen, a))  # stp x29, x30, [sp, #-0x40]!
+    fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in ('rec17_alloc', 'rec17_alloc_tag', 'rec17_init_a', 'rec17_init_b',
+                                                      'rec17_init_c', 'rec17_init_d'))
+    return (f'{{ extern void rt_rec17_new(Cpu *, const uint64_t *); static const uint64_t fn[] = {{{fns}}}; '
+            'rt_rec17_new(c, fn); return; }'
+            f'  /* {a:#x}: stp x29, x30, [sp, #-0x40]! (per-core 0xd50-byte records: one for every core) */')
+
+
 def _jobs_bound(word, reg):  # cmp w<reg>, #3: the core has a slot?
     return _jobs_patch(word, lambda gen, a: f'(void)(subs32(c, (uint32_t)c->x[{reg}], (uint32_t)rt_game_cores()));',
                        f'cmp w{reg}, #3: a core with a slot')
@@ -681,6 +692,7 @@ PATCHES = {
     'jobs_mark_bound': _jobs_bound(0x71000d3f, 9),
     'jobs_buf_base': _jobs_base(0x91116013, 19, 0, 0x458, 'add x19, x0, #0x458: every core\'s buffer'),
     'jobs_buf_bound': _jobs_bound(0x71000d1f, 8),
+    'rec17_new': _rec17_new,
     'arena_setup': _arena_setup,
     'arena_reset': _arena_reset,
     'arena_free_0': _arena_free(0xf9404808, True),

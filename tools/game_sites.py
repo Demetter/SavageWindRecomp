@@ -291,6 +291,22 @@ SITES = [
     Site('jobs_mark_bound', 'code', '71000d3f 9a9f3129 9a88314a b940014a 6b13015f 5400000a/ff00001f b8297913 a9424ff4', 0),
     Site('jobs_buf_base', 'code', '91116013 f9419108 b9400100 94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 b9401fa8', 0),
     Site('jobs_buf_bound', 'code', '71000d1f 9a9f3108 f8687a60 f9400bf3 a8c27bfd d65f03c0 94000000/fc000000 14000000/fc000000', 0),
+    # the per-core 0xd50-byte records (BOTW-JOBS-NATIVE.md #17; tools/patches.py _rec17_new, runtime/hle/percore.c):
+    # their maker (`new T[3]`), the allocator and its tag's GOT slot (an SDK import: read at run time), the parts' constructors
+    Site('rec17_new', 'code', 'a9bc7bfd f9000bf7 a90257f6 a9034ff4 910003fd 90000003/9f00001f aa0003f3 f9400063/ffc003ff '
+         '5284ff00', 0),
+    Site('rec17_alloc', 'call', '94000000/fc000000 b4000000/ff00001f 52800077 91002015 f9000017 aa0003f4 aa1503e0 '
+         '94000000/fc000000', 0),
+    Site('rec17_alloc_tag', 'ref', '90000003/9f00001f aa0003f3 f9400063/ffc003ff 5284ff00 52800102 94000000/fc000000 '
+         'b4000000/ff00001f 52800077', 2),
+    Site('rec17_init_a', 'call', '94000000/fc000000 9101c280 910ac296 94000000/fc000000 91064280 94000000/fc000000 aa1603e0 '
+         '94000000/fc000000', 0),
+    Site('rec17_init_b', 'call', '94000000/fc000000 91064280 94000000/fc000000 aa1603e0 94000000/fc000000 910f4280 '
+         '94000000/fc000000 91140280', 0),
+    Site('rec17_init_c', 'call', '94000000/fc000000 910f4280 94000000/fc000000 91140280 94000000/fc000000 9118c280 '
+         '94000000/fc000000 911d8280', 0),
+    Site('rec17_init_d', 'call', '94000000/fc000000 91140280 94000000/fc000000 9118c280 94000000/fc000000 911d8280 '
+         '94000000/fc000000 91224280', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -333,7 +349,10 @@ OPTIONAL_GROUPS = [
      'jobs_alloc_1', 'jobs_alloc_1s', 'jobs_alloc_2',
      'jobs_alloc_2s', 'jobs_free_0', 'jobs_free_1',
      'jobs_free_2', 'jobs_free_fn', 'jobs_mark_base',
-     'jobs_mark_bound', 'jobs_buf_base', 'jobs_buf_bound'),
+     'jobs_mark_bound', 'jobs_buf_base', 'jobs_buf_bound',
+     'rec17_new', 'rec17_alloc', 'rec17_alloc_tag',
+     'rec17_init_a', 'rec17_init_b', 'rec17_init_c',
+     'rec17_init_d'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -527,6 +546,13 @@ KNOWN = {
         'jobs_mark_bound': 0x700156fb9c,
         'jobs_buf_base': 0x700156fc18,
         'jobs_buf_bound': 0x700156fc38,
+        'rec17_new': 0x700148e9f4,
+        'rec17_alloc': 0x7000e8c7f0,
+        'rec17_alloc_tag': 0x7001d661a0,
+        'rec17_init_a': 0x7000ec4924,
+        'rec17_init_b': 0x7000ec53f0,
+        'rec17_init_c': 0x7000ec54c4,
+        'rec17_init_d': 0x7000ecbfc0,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },
