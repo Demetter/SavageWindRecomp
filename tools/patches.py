@@ -563,6 +563,120 @@ def _jobs_base(word, dst, obj, field, what):  # add x<dst>, x<obj>, #field: the 
     return _jobs_patch(word, lambda gen, a: f'c->x[{dst}] = {_jobs(f"c->x[{obj}]", field)};', what)
 
 
+# #2 (BOTW-JOBS-NATIVE.md): a counter per core (u32s at +0x400 of a sub-object of the `*0x7001e0cd20` singleton; a job
+# adds to its core's), summed and cleared once a frame (f_7000b1bfe0) and zeroed by the sub-object's init.
+def _cnt(obj):
+    return f'rt_percore_block({obj}, 0x400, 4, 3, 0)'
+
+
+def _cnt_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core counters')
+
+
+_CNT_SUM = ('{ uint64_t b = ' + _cnt('c->x[19]') + '; uint32_t s = 0; '
+            'for (int i = 0, n = rt_game_cores(); i < n; i++) s += LD32(b + 4ull * i); c->x[22] = s; }')
+_CNT_ZERO = 'uint64_t b = {blk}; for (int i = 0, n = rt_game_cores(); i < n; i++) ST32(b + 4ull * i, 0);'
+
+
+# #3 (BOTW-JOBS-NATIVE.md): a busy count per core in bytes at +0x1163 of the same singleton, the Switch's four: the
+# three game cores', then the total - the per-frame step f_7000b32200 sums the game cores' into it, f_7000cd90a0 reads
+# it, and the accessors' bound (< 4) lets a system-core thread (platform core 3) count into it too. The block has the
+# game's cores and the total last.
+def _busy(obj):
+    return f'rt_percore_block({obj}, 0x1163, 1, 4, 1)'
+
+
+def _busy_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core busy counts')
+
+
+_BUSY_BOUND = _busy_patch(0x7100111f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[8], (uint32_t)rt_game_cores() + 1));',
+                          'cmp w8, #4: a core with a slot (or the total)')
+_BUSY_BASE = _busy_patch(0x8b080268, lambda gen, a: f'c->x[8] = {_busy("c->x[19]")} - 0x1163 + c->x[8];',
+                         'add x8, x19, x8: the block (+ 0x1163 at the access)')
+
+
+def _busy_zero(word, what):  # a 32-bit store of 0 over all four: every core's count and the total
+    return _busy_patch(word, lambda gen, a: (
+        f'uint64_t b = {_busy("c->x[19]")}; for (int i = 0, n = rt_game_cores() + 1; i < n; i++) ST8(b + i, 0);'), what)
+
+
+# #7 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): a 0xe8-byte object per core, pointers at +8 of their owner. The
+# constructor runs in the runtime and makes one for every core; the destructor's first load frees every core's (the
+# others find nothing, the game's own stores into its array do nothing); the accessor takes the block.
+def _obj7_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core 0xe8-byte objects')
+
+
+def _obj7_ctor(gen, a):
+    assert _word(gen, a) == 0xa9bd7bfd, hex(_word(gen, a))  # stp x29, x30, [sp, #-0x30]!
+    fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in ('obj7_vtable', 'obj7_heap', 'obj7_new', 'obj7_init'))
+    return (f'{{ extern void rt_obj7_make(Cpu *, const uint64_t *); static const uint64_t fn[] = {{{fns}}}; '
+            'rt_obj7_make(c, fn); return; }'
+            f'  /* {a:#x}: stp x29, x30, [sp, #-0x30]! (per-core 0xe8-byte objects: one for every core) */')
+
+
+def _obj7_free(gen, a):  # ldr x20, [x0, #8]: free every core's (x0 kept: the destructor goes on with it)
+    fini, dele = gen.sites['obj7_fini'], gen.sites['obj7_delete']
+    return _obj7_patch(0xf9400414, lambda gen, a: (
+        'extern void rt_obj7_free(Cpu *, uint64_t, uint64_t, uint64_t); uint64_t self = c->x[0]; '
+        f'rt_obj7_free(c, self, {fini:#x}ull, {dele:#x}ull); c->x[0] = self; c->x[20] = 0;'),
+        'ldr x20, [x0, #8]: free every core\'s object')(gen, a)
+
+
+# #20 (BOTW-JOBS-NATIVE.md): a per-core watchdog entry of the draw contexts' owner - the tick of the core's last change
+# (+0xc3a8, 8 bytes), its state (+0xc3c0, 4) and a flag (+0xc3cc, 1) - indexed by the core, unbounded. Every accessor
+# forms `obj + core x scale` and adds the field's offset from a register: that base becomes `block - offset + core x
+# scale`. The constructor's three tick stores and the init's resets cover every core at their first store.
+_WD = {'tick': (0xc3a8, 8), 'state': (0xc3c0, 4), 'flag': (0xc3cc, 1)}
+
+
+def _wd(obj, field):
+    off, size = _WD[field]
+    return f'rt_percore_block({obj}, {off:#x}, {size}, 3, 0)'
+
+
+def _wd_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core watchdog')
+
+
+def _wd_base(word, dst, obj, field, idx, what):  # add x<dst>, x<obj>, <idx> (core x scale): -> block - offset + idx
+    off, size = _WD[field]
+    return _wd_patch(word, lambda gen, a: f'c->x[{dst}] = {_wd(f"c->x[{obj}]", field)} - {off:#x}ull + ({idx});',
+                     what + f': every core\'s {field}')
+
+
+def _wd_ticks(gen, a):  # str x0, [x23]: core 0's tick (x0, just read), then every other core's
+    return _wd_patch(0xf90002e0, lambda gen, a: (
+        f'extern void {_fn(gen, "wd_tick_fn")}(Cpu *); uint64_t b = {_wd("c->x[19]", "tick")}; ST64(b, c->x[0]); '
+        f'for (int i = 1, n = rt_game_cores(); i < n; i++) {{ c->x[30] = {a + 4:#x}ull; {_fn(gen, "wd_tick_fn")}(c); '
+        'ST64(b + 8ull * i, c->x[0]); }'), 'str x0, [x23]: every core\'s tick')(gen, a)
+
+
+# #11 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): the per-core linear allocators' records (0x58 bytes at +0x38 of
+# their object) live in a block with a slot for every core. The constructor, destructor, init and per-frame split run
+# in the runtime over every record; the accessors' `obj + core x 0x58` (the game's field offsets on top) take the block.
+def _lin_whole(word, fn, sites, what):  # a function replaced at its first instruction
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        args = ''
+        if sites:
+            args = ', fn'
+            fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in sites)
+            decl, table = f'extern void {fn}(Cpu *, const uint64_t *); ', f'static const uint64_t fn[] = {{{fns}}}; '
+        else:
+            decl, table = f'extern void {fn}(Cpu *); ', ''
+        return '{ ' + decl + table + f'{fn}(c{args}); return; }}' + f'  /* {a:#x}: per-core linear allocators: {what} */'
+    return patch
+
+
+def _lin_rec(word, obj, idx, mul):  # smaddl x8, w<idx>, w<mul (0x58)>, x<obj>
+    return _ctx_patch(word, lambda gen, a: (
+        f'c->x[8] = rt_percore_block(c->x[{obj}], 0x38, 0x58, 3, 0) - 0x38 + '
+        f'(uint64_t)((int64_t)(int32_t)c->x[{idx}] * (int64_t)(int32_t)c->x[{mul}]);'),
+        f'smaddl x8, w{idx}, w{mul}, x{obj}: the core\'s record', 'per-core linear allocators')
+
+
 def _rec17_new(gen, a):
     # The per-core 0xd50-byte records (BOTW-JOBS-NATIVE.md #17): their maker, `new T[3]` with T's constructor inline,
     # runs in the runtime and makes the game's core count of them (every user goes by the holder's count).
@@ -697,6 +811,93 @@ PATCHES = {
     # by the count in the descriptor f_700105bf6c builds, a literal 3 - the game's core count instead
     'drawctx_count': _ctx_patch(0x52800068, lambda gen, a: 'c->x[8] = (uint32_t)rt_game_cores();',
                                 'mov w8, #3: a draw context for every core', 'per-core draw contexts'),
+    'cnt_add_base': _cnt_patch(0x91100016, lambda gen, a: f'c->x[22] = {_cnt("c->x[0]")};',
+                               'add x22, x0, #0x400: every core\'s counter'),
+    'cnt_add_bound': _cnt_patch(0x71000d1f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[8], (uint32_t)rt_game_cores()));',
+                                'cmp w8, #3: a core with a slot'),
+    'cnt_sum_a': _cnt_patch(0xb9440276, lambda gen, a: _CNT_SUM, 'ldr w22, [x19, #0x400]: the sum over every core'),
+    'cnt_sum_b': _cnt_patch(0xb9440677, lambda gen, a: 'c->x[23] = 0;', 'ldr w23, [x19, #0x404]: (summed at the first)'),
+    'cnt_sum_c': _cnt_patch(0xb9440a78, lambda gen, a: 'c->x[24] = 0;', 'ldr w24, [x19, #0x408]: (summed at the first)'),
+    'cnt_clear_a': _cnt_patch(0xb9000abf, lambda gen, a: _CNT_ZERO.format(blk=_cnt('c->x[19]')),
+                              'str wzr, [x21, #8]: clear every core\'s counter'),
+    'cnt_clear_b': _cnt_patch(0xf90002bf, lambda gen, a: '(void)0;', 'str xzr, [x21]: (cleared at the first)'),
+    'cnt_init_a': _cnt_patch(0xf902027f, lambda gen, a: _CNT_ZERO.format(blk=_cnt('c->x[19]')),
+                             'str xzr, [x19, #0x400]: zero every core\'s counter'),
+    'cnt_init_b': _cnt_patch(0xf902067f, lambda gen, a: 'ST32(c->x[19] + 0x40c, 0);',
+                             'str xzr, [x19, #0x408]: (counters zeroed at the first) +0x40c'),
+    'busy_init': _busy_patch(0xb800b2bf, lambda gen, a: (
+        f'uint64_t b = {_busy("c->x[19]")}; for (int i = 0, n = rt_game_cores() + 1; i < n; i++) ST8(b + i, 0);'),
+        'stur wzr, [x21, #0xb]: zero every core\'s busy count'),
+    'obj7_ctor': _obj7_ctor,
+    'obj7_free_0': _obj7_free,
+    'obj7_free_1': _obj7_patch(0xf9400a74, lambda gen, a: 'c->x[20] = 0;', 'ldr x20, [x19, #0x10]: (freed at the first)'),
+    'obj7_free_1s': _obj7_patch(0xf900067f, lambda gen, a: '(void)0;', 'str xzr, [x19, #8]: (cleared at the first)'),
+    'obj7_free_2': _obj7_patch(0xf9400e74, lambda gen, a: 'c->x[20] = 0;', 'ldr x20, [x19, #0x18]: (freed at the first)'),
+    'obj7_free_2s': _obj7_patch(0xf9000a7f, lambda gen, a: '(void)0;', 'str xzr, [x19, #0x10]: (cleared at the first)'),
+    'obj7_free_3s': _obj7_patch(0xf9000e7f, lambda gen, a: '(void)0;', 'str xzr, [x19, #0x18]: (cleared at the first)'),
+    'obj7_get_base': _obj7_patch(0x91002268, lambda gen, a: 'c->x[8] = rt_percore_block(c->x[19], 8, 8, 3, 0);',
+                                 'add x8, x19, #8: every core\'s object'),
+    'obj7_get_bound': _obj7_patch(0x71000d3f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[9], (uint32_t)rt_game_cores()));',
+                                  'cmp w9, #3: a core with a slot'),
+    'wd_a_flag': _wd_base(0x8b204268, 8, 19, 'flag', '(uint64_t)(uint32_t)c->x[0]', 'add x8, x19, w0, uxtw'),
+    'wd_a_tick': _wd_base(0x8b140e75, 21, 19, 'tick', 'c->x[20] << 3', 'add x21, x19, x20, lsl #3'),
+    'wd_a_state': _wd_base(0x8b140a68, 8, 19, 'state', 'c->x[20] << 2', 'add x8, x19, x20, lsl #2'),
+    'wd_b_flag': _wd_base(0x8b204268, 8, 19, 'flag', '(uint64_t)(uint32_t)c->x[0]', 'add x8, x19, w0, uxtw'),
+    'wd_b_state': _wd_base(0x8b080a69, 9, 19, 'state', 'c->x[8] << 2', 'add x9, x19, x8, lsl #2'),
+    'wd_b_tick': _wd_base(0x8b080e76, 22, 19, 'tick', 'c->x[8] << 3', 'add x22, x19, x8, lsl #3'),
+    'wd_c_flag': _wd_base(0x8b204288, 8, 20, 'flag', '(uint64_t)(uint32_t)c->x[0]', 'add x8, x20, w0, uxtw'),
+    'wd_c_state': _wd_base(0x8b080a8a, 10, 20, 'state', 'c->x[8] << 2', 'add x10, x20, x8, lsl #2'),
+    'wd_c_tick': _wd_base(0x8b080e94, 20, 20, 'tick', 'c->x[8] << 3', 'add x20, x20, x8, lsl #3'),
+    'wd_d_flag': _wd_base(0x8b204268, 8, 19, 'flag', '(uint64_t)(uint32_t)c->x[0]', 'add x8, x19, w0, uxtw'),
+    'wd_d_state': _wd_base(0x8b080a69, 9, 19, 'state', 'c->x[8] << 2', 'add x9, x19, x8, lsl #2'),
+    'wd_d_tick': _wd_base(0x8b080e7c, 28, 19, 'tick', 'c->x[8] << 3', 'add x28, x19, x8, lsl #3'),
+    'wd_d_flag2': _wd_base(0x8b284269, 9, 19, 'flag', '(uint64_t)(uint32_t)c->x[8]', 'add x9, x19, w8, uxtw'),
+    'wd_ctor_tick0': _wd_ticks,
+    'wd_ctor_tick1': _wd_patch(0xf90006e0, lambda gen, a: '(void)0;', 'str x0, [x23, #8]: (every core\'s at the first)'),
+    'wd_ctor_tick2': _wd_patch(0xf9000ae0, lambda gen, a: '(void)0;', 'str x0, [x23, #0x10]: (every core\'s at the first)'),
+    'wd_init_state_base': _wd_patch(0x8b0802c8, lambda gen, a: f'c->x[8] = {_wd("c->x[22]", "state")};',
+                                    'add x8, x22, x8: every core\'s state'),
+    'wd_init_state_a': _wd_patch(0xb9000909, lambda gen, a: (
+        'for (int i = 0, n = rt_game_cores(); i < n; i++) ST32(c->x[8] + 4ull * i, (uint32_t)c->x[9]);'),
+        'str w9, [x8, #8]: every core\'s state to -1'),
+    'wd_init_state_b': _wd_patch(0xf9000109, lambda gen, a: '(void)0;', 'str x9, [x8]: (every core\'s at the first)'),
+    'wd_init_flag_base': _wd_patch(0x8b0802c8, lambda gen, a: f'c->x[8] = {_wd("c->x[22]", "flag")};',
+                                   'add x8, x22, x8: every core\'s flag'),
+    'wd_init_flag_a': _wd_patch(0x7900011f, lambda gen, a: (
+        'for (int i = 0, n = rt_game_cores(); i < n; i++) ST8(c->x[8] + i, 0);'), 'strh wzr, [x8]: every core\'s flag to 0'),
+    'wd_init_flag_b': _wd_patch(0x3900091f, lambda gen, a: '(void)0;', 'strb wzr, [x8, #2]: (every core\'s at the first)'),
+    # the core -> index map f_7000fba16c (#28): its table is the identity for the Switch's six (0..5) - the core itself
+    'core_index_map': _ctx_patch(0xb8687920, lambda gen, a: 'c->x[0] = (uint32_t)c->x[8];',
+                                 'ldr w0, [x9, x8, lsl #2]: the core itself (the table is 0, 1, .. 5)', 'core index map'),
+    'lin_ctor': _lin_whole(0xf0006b88, 'rt_lin_ctor', ('lin_vtable', 'lin_lock_ctor'), 'the constructor, every record'),
+    'lin_dtor': _lin_whole(0xa9be7bfd, 'rt_lin_dtor', ('lin_vtable', 'lin_alloc_fini', 'lin_free', 'lin_lock_dtor'),
+                           'the destructor, every record'),
+    'lin_init': _lin_whole(0xd10183ff, 'rt_lin_init', ('lin_alloc_make', 'lin_alloc_init', 'lin_malloc', 'lin_split',
+                                                       'lin_after'), 'the init, every record'),
+    'lin_split': _lin_whole(0x3945000a, 'rt_lin_split', (), 'the split among every core'),
+    'lin_rec_a': _lin_rec(0x9b280028, 0, 1, 8),
+    'lin_rec_b': _lin_rec(0x9b280028, 0, 1, 8),
+    'lin_rec_c': _lin_rec(0x9b295108, 20, 8, 9),
+    'lin_rec_d': _lin_rec(0x9b280028, 0, 1, 8),
+    'lin_rec_e': _ctx_patch(0x9100e008, lambda gen, a: 'c->x[8] = rt_percore_block(c->x[0], 0x38, 0x58, 3, 0);',
+                            'add x8, x0, #0x38: every core\'s record', 'per-core linear allocators'),
+    'busy_inc_bound': _BUSY_BOUND,
+    'busy_inc_base': _BUSY_BASE,
+    'busy_dec_bound': _BUSY_BOUND,
+    'busy_dec_base': _BUSY_BASE,
+    'busy_reset_a': _busy_zero(0xb800a2bf, 'stur wzr, [x21, #0xa]: zero every core\'s busy count and the total'),
+    'busy_reset_b': _busy_zero(0xb800229f, 'stur wzr, [x20, #2]: zero every core\'s busy count and the total'),
+    'busy_sum_a': _busy_patch(0x39402ea8, lambda gen, a: (
+        f'uint64_t b = {_busy("c->x[19]")}; uint32_t s = 0; '
+        'for (int i = 0, n = rt_game_cores(); i < n; i++) s += LD8(b + i); c->x[8] = s;'),
+        'ldrb w8, [x21, #0xb]: the sum of every core\'s busy count'),
+    'busy_sum_b': _busy_patch(0x394032a9, lambda gen, a: 'c->x[9] = 0;', 'ldrb w9, [x21, #0xc]: (summed at the first)'),
+    'busy_sum_c': _busy_patch(0x394036a9, lambda gen, a: 'c->x[9] = 0;', 'ldrb w9, [x21, #0xd]: (summed at the first)'),
+    'busy_total': _busy_patch(0x39003aa8, lambda gen, a: (
+        f'ST8({_busy("c->x[19]")} + (uint64_t)rt_game_cores(), (uint8_t)c->x[8]);'), 'strb w8, [x21, #0xe]: the total'),
+    'busy_sys': _busy_patch(0x38e86a68, lambda gen, a: (
+        f'c->x[8] = (uint32_t)(int32_t)(int8_t)LD8({_busy("c->x[19]")} + (uint64_t)rt_game_cores());'),
+        'ldrsb w8, [x19, x8]: the total busy count'),
     'arena_setup': _arena_setup,
     'arena_reset': _arena_reset,
     'arena_free_0': _arena_free(0xf9404808, True),
