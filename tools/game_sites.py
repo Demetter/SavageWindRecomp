@@ -714,6 +714,47 @@ SITES = [
          'b4000000/ff00001f', 0),
     Site('jobs_event_clear', 'call', '94000000/fc000000 390073bf 2a1f03fb 394073a8 35000008/ff00001f 2a1f03fb f9400288 910063a2', 0),
     Site('jobs_event_signal', 'call', '94000000/fc000000 b9010279 aa1403e0 b940fe61 94000000/fc000000 aa1303e0 b901027a b9010277', 0),
+    # sead's base heap constructor (BOTW-JOBS-NATIVE.md step 3; tools/patches.py _heap_ctor): every heap made with its
+    # own lock, so heaps the Switch shared between threads of one core stay safe when threads run in parallel
+    Site('heap_ctor', 'code', 'd10183ff a9037bfd a90457f6 a9054ff4 9100c3fd 90000008/9f00001f 90000015/9f00001f '
+         'f9400108/ffc003ff', 0),
+    # the job pool's thread loop (BOTW-JOBS-NATIVE.md step 4; tools/patches.py _jobs_thread_*): each worker's config entry
+    # (past three, worker 2's) and its affinity in the kernel's platform numbering (3 = the system core)
+    Site('jobs_thread_cfg', 'code', '8b160a88 b9401a82 aa1303e1 aa0003f9 b9400d03 b9400104 94000000/fc000000 f94003e8', 0),
+    Site('jobs_thread_mask', 'code', '1ac82128 b9000be8 94000000/fc000000 f9400328 aa1903e0 f9401908 d63f0100 910006d6 d2c00028 '
+         '8b08039c', 0),
+    # a broadcast to every core (BOTW-JOBS-NATIVE.md #30; tools/patches.py _jobs_bcast_*): f_700127d4d0's per-core job
+    # groups past three, made and finished by the runtime; the group constructor, set-grab-size and event finaliser
+    Site('jobs_bcast_next', 'code', '910202d6 eb08037f 54000003/ff00001f aa1503e0 94000000/fc000000 aa1503e0 94000000/fc000000 '
+         '90000008/9f00001f', 0),
+    Site('jobs_bcast_fini', 'code', '90000008/9f00001f 9104a320 f9400108/ffc003ff 91004115 f90087f5 94000000/fc000000 9102a320 '
+         'f90047f5', 0),
+    Site('jobs_group_ctor', 'call', '94000000/fc000000 9000001a/9f00001f 9100035a/ffc003ff f90007fa 910023e0 52800021 '
+         '94000000/fc000000 91020336', 0),
+    Site('jobs_group_grab', 'call', '94000000/fc000000 91020336 aa1603e0 94000000/fc000000 aa1603e0 52800021 f90047fa '
+         '94000000/fc000000', 0),
+    Site('jobs_group_fini', 'call', '94000000/fc000000 9102a320 f90047f5 94000000/fc000000 9100a320 f90007f5 94000000/fc000000 '
+         '90000000/9f00001f', 0),
+    # the game's memory heap size (BOTW-JOBS-NATIVE.md step 4; tools/patches.py _init_heap_size): nninitStartup's
+    # fixed request, the PC's application memory instead (runtime/hle/heaps.c rt_memory_heap_size)
+    Site('init_heap_size', 'code', '52b86000 94000000/fc000000 910023e0 52a04001 94000000/fc000000 f94007e0 52a04001 '
+         '94000000/fc000000', 0),
+    # the other ways sead makes a heap (BOTW-JOBS-NATIVE.md step 3; tools/patches.py _heap_lock_arg, _heap_root_flags):
+    # ExpHeap::create, two class constructors and the root heap, each made with its own lock
+    Site('heap_create_exp', 'code', 'd10283ff a9067bfd f9003bf7 a90857f6 a9094ff4 910183fd 2a0503f4 2a0403e5', 0),
+    Site('heap_ctor_b', 'code', 'd10183ff a9037bfd a90457f6 a9054ff4 9100c3fd 90000009/9f00001f 2a0603f4 f9400129/ffc003ff', 0),
+    Site('heap_ctor_c', 'code', 'd10143ff a9017bfd f90013f7 a90357f6 a9044ff4 910043fd 927df02a f104c55f', 0),
+    Site('heap_root_flags', 'code', '52800088 7901b66a 9000000a/9f00001f 7901b268 52800d09 52800208 f940014a/ffc003ff b9006669', 0),
+    # sead's root heap size (BOTW-JOBS-NATIVE.md step 4; tools/patches.py _root_heap_size): the game framework's fixed
+    # 0xC1000000, the PC's memory heap less the malloc block instead (runtime/hle/heaps.c rt_root_heap_size)
+    Site('root_heap_size', 'code', '52b82008 52800020 a9027fe8 94000000/fc000000 52800020 94000000/fc000000 52800020 '
+         '94000000/fc000000', 0),
+    # the job system's threads (BOTW-JOBS-NATIVE.md #31; tools/patches.py _job_thread_proc, _job_thread_res): the pool's
+    # GOT (BaseProcMgr::init's caller) and the two checks that compare against boot-time copies of three cores' threads
+    Site('jobs_pool_got', 'code', '90000008/9f00001f 90000009/9f00001f f9400108/ffc003ff f9400129/ffc003ff 9000000a/9f00001f '
+         '9100014a/ffc003ff a9027fea 5280800a', 0),
+    Site('job_thread_proc', 'code', '7a481284 1a9f17e0 14000000/fc000000 2a1f03e0 a9414ff4 a8c27bfd d65f03c0', 1),
+    Site('job_thread_res', 'code', 'b940d008 d37df129 f9410e8a f940014b b940016b 6b08017f 54000000/ff00001f 9100214a', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -863,7 +904,16 @@ OPTIONAL_GROUPS = [
      'obj28_destroy', 'obj28_destroy_fn', 'obj28_pick',
      'jobs_push', 'jobs_kick', 'jobs_run',
      'jobs_run_wait', 'jobs_group_setup', 'jobs_tick',
-     'jobs_event_clear', 'jobs_event_signal'),
+     'jobs_event_clear', 'jobs_event_signal',
+     'heap_ctor',
+     'jobs_thread_cfg', 'jobs_thread_mask',
+     'jobs_bcast_next', 'jobs_bcast_fini', 'jobs_group_ctor',
+     'jobs_group_grab', 'jobs_group_fini',
+     'init_heap_size',
+     'heap_create_exp', 'heap_ctor_b', 'heap_ctor_c',
+     'heap_root_flags',
+     'root_heap_size',
+     'jobs_pool_got', 'job_thread_proc', 'job_thread_res'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1363,6 +1413,23 @@ KNOWN = {
         'jobs_tick': 0x700159ff00,
         'jobs_event_clear': 0x7000ef6648,
         'jobs_event_signal': 0x7000ef6640,
+        'heap_ctor': 0x7000ea2a7c,
+        'jobs_thread_cfg': 0x700154fa24,
+        'jobs_thread_mask': 0x700154fae4,
+        'jobs_bcast_next': 0x700127e58c,
+        'jobs_bcast_fini': 0x700127e5a8,
+        'jobs_group_ctor': 0x7000ef5e98,
+        'jobs_group_grab': 0x7000ef6064,
+        'jobs_group_fini': 0x7000ef65a4,
+        'init_heap_size': 0x700000071c,
+        'heap_create_exp': 0x7000003f10,
+        'heap_ctor_b': 0x7000e9ef38,
+        'heap_ctor_c': 0x7000e9fb18,
+        'heap_root_flags': 0x7000004ba4,
+        'root_heap_size': 0x7000c617c0,
+        'jobs_pool_got': 0x700127f02c,
+        'job_thread_proc': 0x70015198b4,
+        'job_thread_res': 0x70015637f0,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

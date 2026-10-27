@@ -122,6 +122,7 @@ static void scenario_free_core_priority(void) {
 }
 
 int main(void) {
+    g_cores_on = 1;  // (the arbitration under test is off by default: kernel.c's SAVAGEWIND_CORES=1)
     for (test_b2 = 0; test_b2 <= 2; test_b2 += 2) {
         scenario(8, false, false, 1);       // priority, then FIFO
         scenario(8, true, false, 1);        // a blocked waiter's priority changes

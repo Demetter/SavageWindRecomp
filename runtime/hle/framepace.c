@@ -458,7 +458,7 @@ static void player_dump(uint64_t vfr) {
     if (bytes <= 0 || !f) return;
     uint64_t pinfo = *(uint64_t *)(uintptr_t)g_site.player_info;
     uint64_t actor = pinfo ? VF(uint64_t, pinfo, 0x60) : 0;
-    if (actor < 0x7000000000ull || actor + (uint64_t)bytes > 0x7320000000ull) return;
+    if (actor < GUEST_LO || actor + (uint64_t)bytes > GUEST_HI) return;
     uint64_t t = plat_now_ns();
     float ratio = VF(float, vfr, VFR_RATIO);
     uint32_t iv = VF(uint32_t, vfr, VFR_INTERVAL);

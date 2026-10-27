@@ -372,6 +372,189 @@ def _yaz0_stream_ret(gen, a):
     return '{ extern void rt_yaz0_done(Cpu *); rt_yaz0_done(c); return; }' + f'  /* {a:#x}: ret (Yaz0 stream decoder) */'
 
 
+# The game on the host's cores (BOTW-JOBS-NATIVE.md step 4). sead::CoreInfo::configure (1.9.0 0x7000eb92f0) stores the
+# core count 3 and fills sead's core table (core number -> slot) with {0, 1, 2}: here the count is the runtime's
+# (runtime/hle/cores.c rt_game_cores, from the host) and the table the identity for every core, the core number being
+# the game's core id (runtime/kernel.c core_of_platform); then sead's core-id TLS slot is allocated, as the game does.
+def _adrp_page(gen, a):
+    w = _word(gen, a)
+    assert w & 0x9f000000 == 0x90000000, hex(w)
+    imm = (((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3)
+    return (a & ~0xfff) + ((imm ^ 0x100000) - 0x100000) * 0x1000
+
+
+def _core_info_configure(gen, a):
+    count = _adrp_page(gen, a) + ((_word(gen, a + 8) >> 10) & 0xfff) * 4  # adrp x8; mov w9, #3; str w9, [x8, #lo]
+    assert _word(gen, a + 4) == 0x52800069 and _word(gen, a + 8) & 0xffc003ff == 0xb9000109
+    table = _adrp_page(gen, a + 0xc) + ((_word(gen, a + 0x10) >> 10) & 0xfff)  # adrp x10; add x10, x10, #lo
+    tls = _adrp_page(gen, a + 0x24) + ((_word(gen, a + 0x28) >> 10) & 0xfff)  # adrp x0; add x0, x0, #lo
+    w = _word(gen, a + 0x30)  # b AllocateTlsSlot
+    assert w >> 26 == 0x5, hex(w)
+    alloc = a + 0x30 + (((w & 0x3ffffff) ^ 0x2000000) - 0x2000000) * 4
+    return ('{ extern int rt_game_cores(void); extern void guest_call(Cpu *, uint64_t); int n = rt_game_cores(); '
+            f'ST32({count:#x}ull, n); for (int i = 0; i < n && i < 32; i++) ST32({table:#x}ull + 4 * i, i); '
+            f'c->x[0] = {tls:#x}ull; c->x[1] = 0; guest_call(c, {alloc:#x}ull); return; }}'
+            f'  /* {a:#x}: sead::CoreInfo::configure (the host\'s core count) */')
+
+
+# The job pool's threads (f_700154f964's loop, one per core): each reads its core and priority from a three-entry
+# config (x20 + i * 4: core, + 0xc: priority) - past three, worker 2's entry (core default, the workers' priority) - and
+# workers past the first get the affinity of their core, in the kernel's platform numbering where 3 is the system core:
+# core i < 3 is platform core i, core i >= 3 platform core i + 1 (runtime/kernel.c core_of_platform).
+def _jobs_thread_cfg(gen, a):
+    assert _word(gen, a) == 0x8b160a88, hex(_word(gen, a))  # add x8, x20, x22, lsl #2
+    return ('c->x[8] = c->x[20] + ((c->x[22] < 3 ? c->x[22] : 2) << 2);'
+            f'  /* {a:#x}: add x8, x20, x22, lsl #2 (job thread config; past three, worker 2\'s) */')
+
+
+def _jobs_thread_mask(gen, a):
+    assert _word(gen, a) == 0x1ac82128, hex(_word(gen, a))  # lsl w8, w9, w8
+    return ('{ uint32_t i = (uint32_t)c->x[8]; c->x[8] = (uint32_t)((uint32_t)c->x[9] << ((i < 3 ? i : i + 1) & 31)); }'
+            f'  /* {a:#x}: lsl w8, w9, w8 (job thread affinity: platform core, 3 = system) */')
+
+
+# A broadcast to every core (1.9.0 f_700127d4d0, BOTW-JOBS-NATIVE.md #30): one job group per core on the stack (three, at
+# sp + 8 + 0x80 * k, base x25), each pushed with its core's bit in a loop over sead's core count (k in x27, the count in
+# x8). Past three the groups come from the runtime (runtime/hle/jobs.c rt_jobs_core_group), made as the game makes its
+# own, and are finished after the round (rt_jobs_core_groups_fini) where the game finishes its three.
+def _bcast_fns(gen):
+    f = gen.sites['jobs_bcast_fini']  # adrp x8, base class's GOT page; ...; ldr x8, [x8, #lo]
+    w = _word(gen, f + 8)
+    assert w & 0xffc003ff == 0xf9400108, hex(w)
+    got = _adrp_page(gen, f) + ((w >> 10) & 0xfff) * 8
+    return ', '.join(f'{v:#x}ull' for v in (gen.sites['jobs_group_ctor'], gen.sites['jobs_group_grab'],
+                                             gen.sites['jobs_group_fini'], got, gen.sites['jobs_bcast_next']))
+
+
+def _jobs_bcast_next(gen, a):
+    assert _word(gen, a) == 0x910202d6, hex(_word(gen, a))  # add x22, x22, #0x80
+    return (f'{{ static const uint64_t fns[5] = {{{_bcast_fns(gen)}}}; '
+            'extern uint64_t rt_jobs_core_group(Cpu *, const uint64_t *, uint64_t, uint32_t); '
+            'uint64_t k = c->x[27], n = c->x[8]; if (k < 3) c->x[22] += 0x80; else if (k < (uint32_t)n) '
+            '{ c->x[22] = rt_jobs_core_group(c, fns, c->x[25], (uint32_t)k); c->x[8] = n; } }'
+            f'  /* {a:#x}: add x22, x22, #0x80 (the next core\'s group; past three, the runtime\'s) */')
+
+
+def _jobs_bcast_fini(gen, a):
+    page = _adrp_page(gen, a)  # adrp x8, #page
+    assert _word(gen, a) & 0x1f == 8, hex(_word(gen, a))
+    return (f'{{ static const uint64_t fns[5] = {{{_bcast_fns(gen)}}}; '
+            'extern void rt_jobs_core_groups_fini(Cpu *, const uint64_t *); rt_jobs_core_groups_fini(c, fns); '
+            f'c->x[8] = {page:#x}ull; }}  /* {a:#x}: adrp x8 (after the round: the runtime\'s groups finished) */')
+
+
+# The job system's threads (BOTW-JOBS-NATIVE.md #31): two checks compare the calling sead thread's id against copies of
+# the set taken at boot, sized for three cores - BaseProcMgr's "high priority thread" (1.9.0 f_700151985c: the main
+# thread, workers 1 and 2; outside them getProc refuses a proc and asks for ActorLinkConstDataAccess) and
+# ResourceMgrTask's load request (f_7001563770: the main thread, workers 0-2; a job thread doesn't wait for a load).
+# Both ask the pool instead (runtime/hle/jobs.c rt_jobs_job_thread), for every worker it has. The pool is the one
+# BaseProcMgr::init's caller reads the workers from (adrp; ...; ldr x8, [x8, #lo] at jobs_pool_got: the GOT entry, the
+# address of the pool's global; then ldr x21, [x8]).
+def _jobs_pool(gen):  # (C: the pool)
+    f = gen.sites['jobs_pool_got']
+    w = _word(gen, f + 8)
+    assert w & 0xffc003ff == 0xf9400108, hex(w)  # ldr x8, [x8, #lo]
+    return f'LD64(LD64({_adrp_page(gen, f) + ((w >> 10) & 0xfff) * 8:#x}ull))'
+
+
+def _job_thread_proc(gen, a):
+    assert _word(gen, a) == 0x1a9f17e0, hex(_word(gen, a))  # cset w0, eq (w20: the thread's id, x19: BaseProcMgr)
+    return ('{ extern int rt_jobs_job_thread(uint64_t, uint32_t, uint32_t); '
+            f'c->x[0] = (uint32_t)rt_jobs_job_thread({_jobs_pool(gen)}, LD32(c->x[19] + 0x16c), '
+            '(uint32_t)c->x[20]); }'
+            f'  /* {a:#x}: cset w0, eq (BaseProcMgr: a job system thread, any worker) */')
+
+
+def _job_thread_res(gen, a):
+    # ldr w8, [x0, #0xd0]: the thread's id (x0 the thread, x27 sead::ThreadMgr's GOT entry); then the loop over the
+    # task's list, a match going to the job-thread case (b.eq, 6 instructions on) and the end setting w24 = 1 (10 on)
+    assert (_word(gen, a) == 0xb940d008 and _word(gen, a + 0x18) & 0xff00001f == 0x54000000
+            and _word(gen, a + 0x28) == 0x52800038), hex(_word(gen, a))  # (... b.eq; ...; mov w24, #1)
+    hit = a + 0x18 + sext((_word(gen, a + 0x18) >> 5) & 0x7ffff, 19) * 4
+    return ('{ extern int rt_jobs_job_thread(uint64_t, uint32_t, uint32_t); uint32_t id = LD32(c->x[0] + 0xd0); '
+            f'c->x[8] = id; if (rt_jobs_job_thread({_jobs_pool(gen)}, '
+            f'LD32(LD64(LD64(c->x[27]) + 0x80) + 0xd0), id)) goto L_{hit:x}; c->x[24] = 1; goto L_{a + 0x2c:x}; }}'
+            f'  /* {a:#x}: ldr w8, [x0, #0xd0] (ResourceMgrTask: a job system thread, any worker) */')
+
+
+# The game's memory heap size (1.9.0 nninitStartup 0x7000000710: `mov w0, #0xc3000000` before SetMemoryHeapSize): the
+# PC's application memory less what the Switch build kept back (runtime/hle/heaps.c rt_memory_heap_size). BOTW gives
+# what its fixed heaps leave to "the rest" heaps, whose contents grow with the core count (BOTW-JOBS-NATIVE.md step 4).
+def _init_heap_size(gen, a):
+    assert _word(gen, a) == 0x52b86000, hex(_word(gen, a))  # mov w0, #0xc3000000
+    return ('{ extern uint64_t rt_memory_heap_size(void); c->x[0] = rt_memory_heap_size(); }'
+            f'  /* {a:#x}: mov w0, #0xc3000000 (the memory heap: the PC\'s) */')
+
+
+# sead's root heap size (1.9.0 0x7000c617c0 in the game framework's setup: `mov w8, #0xc1000000`, stored as the
+# framework argument's heap size): the PC's memory heap less nninitStartup's malloc block (runtime/hle/heaps.c
+# rt_root_heap_size). With the memory heap alone made bigger the root stayed 0xC1000000: at six cores the open-world
+# stage's "PlacementMgrThread" heap kept 1 MB of 42 and a stage thread's 1 MB stack no longer fitted.
+def _root_heap_size(gen, a):
+    assert _word(gen, a) == 0x52b82008, hex(_word(gen, a))  # mov w8, #0xc1000000
+    return ('{ extern uint64_t rt_root_heap_size(void); c->x[8] = rt_root_heap_size(); }'
+            f'  /* {a:#x}: mov w8, #0xc1000000 (sead\'s root heap: the PC\'s) */')
+
+
+# sead's base heap constructor (1.9.0 0x7000ea2a7c; w6 = enable lock): every sead heap made with its own lock
+# (runtime/hle/heaps.c rt_heaps_locked; SAVAGEWIND_HEAP_LOCKS=0 keeps the game's choice). The Switch runs the threads of
+# one core one at a time, and equal priorities take turns only when one blocks, so BOTW left heaps unlocked that several
+# threads of a core share (the KingSystem heap: the main thread and 0x11e; resource heaps: two loader threads of core 1).
+# With the game's threads scheduled by the OS each heap takes its own lock, as a PC game's allocators do; the
+# constructor already makes a recursive mutex for every heap.
+def _heap_ctor(gen, a):
+    assert _word(gen, a) == 0xd10183ff, hex(_word(gen, a))  # sub sp, sp, #0x60
+    return ('{ extern int rt_heaps_locked(void); extern void rt_heap_made(Cpu *); rt_heap_made(c); '
+            'if (rt_heaps_locked()) c->x[6] = 1; c->sp -= 0x60; }'
+            f'  /* {a:#x}: sub sp, sp, #0x60 (sead heap constructor: every heap locked and recorded) */')
+
+
+# The other ways sead makes a heap inline the base initialisation (its mutex, its flags at +0xd8 from a lock argument):
+# sead::ExpHeap::create (1.9.0 0x7000003f10, lock in w5), two class constructors (0x7000e9ef38: w6; 0x7000e9fb18: w3);
+# each gets its lock argument set at entry, as the base constructor does. The root heap (0x7000004a28) stores constant
+# flags 4 (no lock; its mutex is made all the same): with the lock bit as well.
+def _heap_lock_arg(word, frame, reg, what):
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        return ('{ extern int rt_heaps_locked(void); '
+                f'if (rt_heaps_locked()) c->x[{reg}] = 1; c->sp -= {frame:#x}; }}'
+                f'  /* {a:#x}: sub sp, sp, #{frame:#x} ({what}: its heap locked) */')
+    return patch
+
+
+def _heap_root_flags(gen, a):
+    assert _word(gen, a) == 0x52800088, hex(_word(gen, a))  # mov w8, #4
+    return ('{ extern int rt_heaps_locked(void); c->x[8] = rt_heaps_locked() ? 5 : 4; }'
+            f'  /* {a:#x}: mov w8, #4 (the root heap\'s flags: locked) */')
+
+
+# (research) Which threads use each sead heap whose lock is off (runtime/hle/heapprobe.c): with
+# SAVAGEWIND_GEN_HEAP_PROBE=1, tools/gen.py patches every heap operation's lock-flag check - `ldrh wT, [xN, #0xd8]`
+# (sead::Heap's flags, bit 0 = lock) followed within three instructions by `tbz / tbnz wT, #0` - to report the heap
+# when its lock is off. A probe build only; the sites are found by scanning, not kept in tools/game_sites.py.
+def heap_probe_table(m):
+    out = {}
+    for i in range(len(m.words) - 3):
+        x, a = m.words[i], m.lo + 4 * i
+        if (x & 0xffc00000) != 0x79400000 or (x >> 10) & 0xfff != 0x6c:  # ldrh wT, [xN, #0xd8]
+            continue
+        t, n = x & 31, (x >> 5) & 31
+        if t == 31 or n == 31:
+            continue
+        if any((y & 0x7e000000) == 0x36000000 and (y & 31) == t and not (y >> 19) & 31 and not y >> 31
+               for y in m.words[i + 1:i + 4]):
+            out[a] = _heap_probe(t, n)
+    return out
+
+
+def _heap_probe(t, n):
+    def patch(gen, a):
+        return (f'{{ uint64_t heap = c->x[{n}]; c->x[{t}] = LD16(heap + 0xd8); if (!(c->x[{t}] & 1)) {{ '
+                f'extern void rt_heap_probe(Cpu *, uint64_t, uint64_t); rt_heap_probe(c, heap, {a:#x}ull); }} }}'
+                f'  /* {a:#x}: ldrh w{t}, [x{n}, #0xd8] (heap lock flag, probe) */')
+    return patch
+
+
 # BOTW's job scheduler run natively (runtime/hle/jobs.c; BOTW-JOBS-NATIVE.md step 2): the entries of a job pool's push,
 # kick and run-and-wait and of a worker's run go to the runtime, which takes them unless the pool is in the game's
 # serial mode (or SAVAGEWIND_JOBS_NATIVE=0); then the game's code runs from its first instruction. Each gets the game
@@ -1189,6 +1372,20 @@ PATCHES = {
     'frame_wait': _frame_wait,
     'yaz0_stream': _yaz0_stream,
     'yaz0_stream_ret': _yaz0_stream_ret,
+    'heap_ctor': _heap_ctor,
+    'heap_create_exp': _heap_lock_arg(0xd10283ff, 0xa0, 5, 'sead::ExpHeap::create'),
+    'heap_ctor_b': _heap_lock_arg(0xd10183ff, 0x60, 6, 'a sead heap constructor'),
+    'heap_ctor_c': _heap_lock_arg(0xd10143ff, 0x50, 3, 'a sead heap constructor'),
+    'heap_root_flags': _heap_root_flags,
+    'init_heap_size': _init_heap_size,
+    'root_heap_size': _root_heap_size,
+    'core_info_configure': _core_info_configure,
+    'jobs_thread_cfg': _jobs_thread_cfg,
+    'jobs_thread_mask': _jobs_thread_mask,
+    'jobs_bcast_next': _jobs_bcast_next,
+    'jobs_bcast_fini': _jobs_bcast_fini,
+    'job_thread_proc': _job_thread_proc,
+    'job_thread_res': _job_thread_res,
     'jobs_push': _jobs_entry('rt_jobs_push', 0xa9bc7bfd, 0x40, 'stp x29, x30, [sp, #-0x40]! (job pool push)'),
     'jobs_kick': _jobs_entry('rt_jobs_kick', 0xd10103ff, 0x40, 'sub sp, sp, #0x40 (job pool kick)'),
     'jobs_run': _jobs_entry('rt_jobs_run', 0xa9ba7bfd, 0x60, 'stp x29, x30, [sp, #-0x60]! (job worker run)'),

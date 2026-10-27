@@ -227,12 +227,34 @@ void plat_thread_realtime(uint64_t period_ns) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
 
+int plat_physical_cores(void) {  // (cores of processor group 0 with a logical processor in the process's affinity)
+    DWORD_PTR all, sys;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &all, &sys)) return 1;
+    int cores = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+    char *buf = len ? malloc(len) : NULL;
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)buf, &len))
+        for (DWORD o = 0; o < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)(buf + o);
+            if (e->Processor.GroupMask[0].Group == 0 && (e->Processor.GroupMask[0].Mask & all)) cores++;
+            o += e->Size;
+        }
+    free(buf);
+    return cores > 0 ? cores : 1;
+}
+
+void plat_thread_priority(int level) {  // (THREAD_PRIORITY_LOWEST .. THREAD_PRIORITY_HIGHEST are -2 .. 2)
+    SetThreadPriority(GetCurrentThread(), level < -2 ? -2 : level > 2 ? 2 : level);
+}
+
 // ---- address waits
 bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns) {
     DWORD ms = (DWORD)((timeout_ns + 999999) / 1000000);
     return WaitOnAddress((volatile VOID *)addr, &expected, sizeof expected, ms) || GetLastError() != ERROR_TIMEOUT;
 }
 void plat_wake_u32_all(const uint32_t *addr) { WakeByAddressAll((PVOID)addr); }
+void plat_wake_u32_one(const uint32_t *addr) { WakeByAddressSingle((PVOID)addr); }
 
 // ---- process
 // Release builds are GUI-subsystem executables (no console window): stdout / stderr go to savagewind.log next to the

@@ -169,14 +169,15 @@ static void deadline(struct timespec *ts, int64_t timeout_ns) {
 // Sleep on the current thread's condition. Returns false on timeout. Caller holds g_klock.
 static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 // ------------------------------------------------------------------ cores
-// Horizon runs a thread only on the core its affinity mask allows, and two threads of one core never run at the same
-// time: the highest priority runnable thread runs, and equal priorities take turns when one yields or blocks. Games
-// rely on that: BOTW 1.8.2 shares a sead heap without a lock between threads pinned to one core, and its free list
-// broke when those threads ran in parallel here. So each of the four cores is a token a guest thread must hold to
-// run guest code. It is let go while the thread blocks or sleeps and handed to the best waiter (lowest priority
+// The game's threads are OS threads the OS schedules, as a PC game's are (BOTW-JOBS-NATIVE.md step 3). Horizon runs a
+// thread only on the core its affinity mask allows and two threads of one core never at the same time - the highest
+// priority runnable one runs, equal priorities take turns when one yields or blocks - and BOTW relied on that: it
+// shares sead heaps without a lock between threads pinned to one core (its free list broke when they ran in
+// parallel). Here every sead heap is made with its own lock instead (tools/patches.py _heap_ctor), and each thread
+// runs at a host priority from its guest one (host_priority below).
+// (comparison) SAVAGEWIND_CORES=1: the Switch's arbitration, emulated - each of the four cores a token a guest thread
+// must hold to run guest code, let go while it blocks or sleeps and handed to the best waiter (lowest priority
 // number, then first come); a thread that sees a better one waiting for its core at a syscall gives it up.
-// Generated code has no preemption points of its own, so a long stretch without syscalls keeps the core.
-// SAVAGEWIND_CORES=0 lets every thread run at once, as before.
 #define CORE_B2_BITS() b2_bits()
 // (cpu.h RT_PREEMPT_DUE: the generated code's indirect calls check these inline, kernel_preempt's condition)
 #define CORE_HELD_CHANGED(t) ((t)->cpu.best_wait = (t)->core_held >= 0 ? &g_core_best_wait[(t)->core_held].v : NULL)
@@ -258,10 +259,26 @@ static void core_yield(KThread *t, int64_t ns) {
     core_acquire(t);
 }
 
-// Moves t to another core (svcSetThreadCoreMask). The running thread changes cores at once; another one picks the
-// new core up the next time it acquires one.
-static void core_move(KThread *t, int core) {
-    if (core < 0 || core > 3 || t->core == core) return;
+// Cores as the game sees them (BOTW-JOBS-NATIVE.md): N game cores (rt_game_cores) and the system core. Affinity masks
+// and core numbers keep the Switch's platform numbering, where 3 is the system core - the SDK and a library of the
+// game ask for it by that number - so game cores past the third are platform cores 4 .. N (the job pool's core table,
+// tools/patches.py). A thread's core (KThread.core, what GetCurrentProcessorNumber reports and the game indexes its
+// per-core data by) is the game's core id: 0 .. N-1, and N for the system core's threads.
+int rt_game_cores(void);
+static int core_of_platform(int p) {
+    int n = rt_game_cores();
+    return p < 0 ? 0 : p < 3 ? p : p == 3 ? n : p - 1 < n ? p - 1 : n;
+}
+static int platform_of_core(int c) {
+    return c < 3 ? c : c >= rt_game_cores() ? 3 : c + 1;
+}
+static uint64_t platform_mask(void) { return (2ull << rt_game_cores()) - 1; }  // (game cores and the system core)
+
+// Moves t to another core (svcSetThreadCoreMask; core: a platform core). The running thread changes cores at once;
+// another one picks the new core up the next time it acquires one.
+static void core_move(KThread *t, int platform) {
+    int core = core_of_platform(platform);
+    if (platform < 0 || platform > 63 || t->core == core) return;
     if (t == t_cur && t->core_held >= 0) {
         core_release(t);
         t->core = core;
@@ -400,9 +417,12 @@ void rt_unwind_point(void) {
     if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
 }
 
+static void host_priority(KThread *t);
+
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
+    host_priority(t);
     crash_handler_install();
     rt_set_fpcr(0);
     core_acquire(t);
@@ -423,8 +443,9 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
     t->prio = t->base_prio = t->cpu.prio = prio;
-    t->core = core < 0 ? 0 : core & 3;  // (-2: the process's default core, 0)
+    t->core = core_of_platform(core);  // (-2: the process's default core, 0)
     t->core_held = -1;
+    t->host_level = 99;
     t->id = next_thread_id++;
     t->cpu.x[0] = arg;
     t->cpu.sp = stack_top & ~15ull;
@@ -455,7 +476,24 @@ static void thread_start(KThread *t) {
     pthread_attr_destroy(&attr);
 }
 
+static int g_main_prio = 44;  // (the game's main thread's priority: kernel_create_main_thread)
+
+// Each game thread runs at a host priority from its guest one, as a PC game sets its threads' priorities: relative to
+// the main thread's, 8 or more steps better (system and audio threads) highest, better above normal, the same (the
+// main thread, the job workers) normal, worse (loaders) below normal, 8 or more worse lowest. A thread sets its own:
+// when it starts, and at its next syscall after its priority changes. SAVAGEWIND_HOST_PRIO=0: all normal.
+static void host_priority(KThread *t) {
+    static int on = -1;
+    if (on < 0) on = !ENV("SAVAGEWIND_HOST_PRIO") || atoi(ENV("SAVAGEWIND_HOST_PRIO")) != 0;
+    if (!on || !t) return;
+    int d = g_main_prio - t->base_prio, level = d >= 8 ? 2 : d > 0 ? 1 : d == 0 ? 0 : d > -8 ? -1 : -2;
+    if (level == t->host_level) return;
+    t->host_level = level;
+    plat_thread_priority(level);
+}
+
 KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio) {
+    g_main_prio = prio;
     uint64_t stack = STACK_BASE + STACK_SIZE - ((stack_size + 0xFFFF) & ~0xFFFFull);
     region_add(stack, stack_size, 0xB, 3);
     KThread *t = thread_new(entry, 0, stack + stack_size, prio, 0);
@@ -478,6 +516,75 @@ KThread *kernel_current_thread(void) { return t_cur; }
 // Mutex word: owner handle | WAITERS_BIT. Waiting threads sleep on the global cond and are handed ownership.
 
 static uint32_t *u32p(uint64_t a) { return (uint32_t *)(uintptr_t)a; }
+
+// The game's locks as a PC's (kernel_native_sync_init; SAVAGEWIND_NATIVE_MUTEX=0: the console's, below). The word
+// keeps the console's layout - the owner's handle | WAITERS_BIT - so the SDK's inline lock code (nn::os's
+// ReaderWriterLock) works unchanged, but a released lock is no longer handed to a sleeping thread. That hand-over is
+// the console's, where a core runs one thread at a time; with the game's threads running in parallel it made a lock
+// convoy: the lock belonged to a thread still waking up (~9 us) while each other contender, seeing the waiters bit,
+// slept behind it, all through the kernel's one lock and wait list (Kakariko, six job workers: the main thread blocked
+// there 18% of its time, the per-element locks of f_700117127c). Here a released lock is free and one sleeper is woken
+// to compete for it; a running thread may take it first. A thread that slept takes it with the waiters bit set, so its
+// release wakes the next sleeper. Sleepers wait on the word itself: no global lock, no wait list. No priority
+// inheritance, as with a PC's locks.
+#define CS_WAITERS WAITERS_BIT
+#define LOCK_SLICE_NS 50000000ull  // (sleeps in slices so a reboot doesn't wait them out)
+static bool g_native_mutex;
+static uint64_t cs_spin_ns;
+static bool cs_owner_running(uint32_t owner) {  // ((comparison) with the emulated cores: is the owner on one)
+    if (!cores_on()) return true;
+    for (int i = 0; i < 4; i++) {
+        KThread *o = __atomic_load_n(&g_cores[i].owner, __ATOMIC_RELAXED);  // (threads are freed only at a reboot)
+        if (o && o->handle == owner) return true;
+    }
+    return false;
+}
+
+// Takes the lock at w for tag, sleeping on the word while another thread holds it.
+static void nmutex_sleep_lock(uint32_t *w, uint32_t tag) {
+    KThread *t = t_cur;
+    bool held = t && t->core_held >= 0;
+    if (held) core_release(t);
+    for (;;) {
+        uint32_t v = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (v == 0) {
+            if (__atomic_compare_exchange_n(w, &v, tag | CS_WAITERS, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+            continue;
+        }
+        if (!(v & CS_WAITERS) && !__atomic_compare_exchange_n(w, &v, v | CS_WAITERS, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            continue;
+        if (g_rt_unwind) break;
+        plat_wait_u32(w, v | CS_WAITERS, LOCK_SLICE_NS);
+    }
+    if (held) core_acquire(t);
+}
+
+// Takes the lock at w for tag: at once if it's free, else after a short spin (taking it the moment it is free,
+// sleepers or not), else asleep.
+static void nmutex_lock(uint32_t *w, uint32_t tag) {
+    uint32_t v = 0;
+    if (__atomic_compare_exchange_n(w, &v, tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    uint64_t end = plat_now_ns() + cs_spin_ns;
+    for (unsigned i = 1;; i++) {
+        v = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (v == 0) {
+            if (__atomic_compare_exchange_n(w, &v, tag, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+            continue;
+        }
+        if (!(i & 15) && (plat_now_ns() > end || !cs_owner_running(v & ~CS_WAITERS))) break;
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+    nmutex_sleep_lock(w, tag);
+}
+
+// Lets the lock at w go: free, and one sleeper woken if any may be waiting.
+static void nmutex_unlock(uint32_t *w) {
+    if (__atomic_exchange_n(w, 0, __ATOMIC_RELEASE) & CS_WAITERS) plat_wake_u32_one(w);
+}
 
 // Try to take mutex `m` for `tag`, or mark it contended. Returns true if acquired. Uses CAS so a
 // concurrent user-space unlock (owner storing 0) is never overwritten.
@@ -579,12 +686,12 @@ static uint32_t block_current(int64_t timeout_ns) {
     uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
-    // A short spin before sleeping, for a thread whose last block was short: the game's main thread waits ~30 times a
-    // frame for its workers' jobs, ~40 us each, and a sleep on its condition plus the wake cost ~8 us each on Windows
-    // (SAVAGEWIND_PROF_SVC). The thread lets its core go while it spins, as when it sleeps. SAVAGEWIND_SPIN_US=<us>
-    // (default 40; 0: no spinning).
+    // (comparison) SAVAGEWIND_SPIN_US=<us>: a short spin before sleeping, for a thread whose last block was short (40
+    // suited the emulated cores, a spinning thread letting its core go: the main thread's ~30 job waits a frame then
+    // skipped the ~8 us sleep and wake). With the game's threads OS-scheduled it burns CPU the main thread needs (4-core
+    // Kakariko 236.6 fps without it, 222.2 with 40), so a thread blocks at once.
     static int spin_us = -1;
-    if (spin_us < 0) spin_us = getenv("SAVAGEWIND_SPIN_US") ? atoi(getenv("SAVAGEWIND_SPIN_US")) : 40;
+    if (spin_us < 0) spin_us = getenv("SAVAGEWIND_SPIN_US") ? atoi(getenv("SAVAGEWIND_SPIN_US")) : 0;
     uint64_t b0 = plat_now_ns();
     if (spin_us > 0 && t->block_ns < (uint64_t)spin_us * 2000 && t->wait_kind != WAIT_NONE && !t->cancel) {
         bool held = t->core_held >= 0;
@@ -636,6 +743,10 @@ static uint32_t block_current(int64_t timeout_ns) {
 }
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
+    if (g_native_mutex) {  // (the console's contract kept: on return the caller holds the lock, or it had changed)
+        if (__atomic_load_n(u32p(addr), __ATOMIC_ACQUIRE) == (owner | WAITERS_BIT)) nmutex_sleep_lock(u32p(addr), tag);
+        return R_OK;
+    }
     klock();
     uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (v != (owner | WAITERS_BIT)) {
@@ -653,6 +764,10 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 }
 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
+    if (g_native_mutex) {
+        nmutex_unlock(u32p(addr));
+        return R_OK;
+    }
     klock();
     mutex_release(addr);
     pthread_mutex_unlock(&g_klock);
@@ -670,6 +785,13 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_addr = key;
     t->wait_mutex = mutex;
     t->wait_tag = tag;
+    if (g_native_mutex) {  // (native locks: let go as a PC lock; signalled, the thread takes it again itself)
+        nmutex_unlock(u32p(mutex));
+        uint32_t r = block_current(timeout);
+        pthread_mutex_unlock(&g_klock);
+        if (r != R_TIMEOUT) nmutex_lock(u32p(mutex), tag);
+        return r;
+    }
     mutex_release(mutex);
     uint32_t r = block_current(timeout);
     // A wait that timed out returns without the mutex, as on the console: user mode takes it again (BOTW 1.8.2's
@@ -700,10 +822,10 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
             if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key && (!best || t->prio < best->prio)) best = t;
         if (!best) break;
         woken++;
-        // the woken thread must reacquire its mutex
+        // the woken thread must reacquire its mutex (native locks: it takes it itself)
         uint64_t m = best->wait_mutex;
         best->wait_result = R_OK;
-        if (mutex_acquire_or_mark(m, best->wait_tag)) {
+        if (g_native_mutex || mutex_acquire_or_mark(m, best->wait_tag)) {
             best->wait_kind = WAIT_NONE;
             wake(best);
         } else {
@@ -719,67 +841,24 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
 }
 
 // ------------------------------------------------------------------ the game's locks
-// nn::os InternalCriticalSection::Enter (under every nn::os::Mutex, SdkMutex and sead::CriticalSection; the SDK calls
-// it through its own import stub, so this replaces it everywhere) the way a PC lock works: a thread that finds the lock
-// taken spins on its word while the owner is running on a core, and goes to the kernel (svcArbitrateLock) only when
-// the owner isn't running or keeps it longer. The SDK's Enter went to the kernel at once: right for the console,
-// where the owner may be waiting for the very core the spinner holds. Here each contended hand-over through the
-// emulated kernel cost both sides its global lock, a wait-list scan and an OS wake: at Kakariko the main thread and
-// both job workers each met ~16 taken locks a frame (f_700117127c's per-element locks), 7-11 us each
-// (SAVAGEWIND_PROF_SVC=2). The word keeps the console's protocol (the owner's handle; 0x40000000: threads wait in the
-// kernel), so the SDK's own Leave, and any caller that still reaches its Enter, stay compatible. A spinner doesn't set
-// the waiters bit, so its owner's Leave stays one atomic store.
-// SAVAGEWIND_NATIVE_MUTEX=0: the SDK's Enter. SAVAGEWIND_MUTEX_SPIN_US: the longest spin (10).
-#define CS_WAITERS 0x40000000u
-static uint64_t cs_spin_ns;
-static bool cs_owner_running(uint32_t owner) {
-    if (!cores_on()) return true;
-    for (int i = 0; i < 4; i++) {
-        KThread *o = __atomic_load_n(&g_cores[i].owner, __ATOMIC_RELAXED);  // (threads are freed only at a reboot)
-        if (o && o->handle == owner) return true;
-    }
-    return false;
+// nn::os InternalCriticalSection::Enter and Leave (under every nn::os::Mutex, SdkMutex and sead::CriticalSection; the
+// SDK calls them through its own import stubs, so this replaces them everywhere): the native lock above (nmutex_lock /
+// nmutex_unlock). The SDK's Enter went to the kernel at once and its Leave handed the lock over through it - right for
+// the console, where the owner may be waiting for the very core the waiter holds. Measured before (27 Oct, Kakariko):
+// with three job workers the main thread and each worker met ~16 taken locks a frame (f_700117127c's per-element
+// locks), 7-11 us each through the kernel; with six the main thread blocked there 18% of its time and the frame was
+// slower than with three. SAVAGEWIND_NATIVE_MUTEX=0: the SDK's Enter and Leave and the kernel's hand-over, together.
+// SAVAGEWIND_MUTEX_SPIN_US: the longest spin before sleeping (10).
+static uint32_t cs_tag(Cpu *c) {  // (as the SDK reads it: the current nn::os::ThreadType's handle)
+    return *(uint32_t *)(uintptr_t)(*(uint64_t *)(uintptr_t)(c->tpidrro + 0x1f8) + 0x1b0);
 }
 static void cs_enter(Cpu *c) {
-    uint64_t addr = c->x[0];
-    uint32_t *w = (uint32_t *)(uintptr_t)addr;
-    // the tag, as the SDK reads it: the current nn::os::ThreadType's handle
-    uint32_t tag = *(uint32_t *)(uintptr_t)(*(uint64_t *)(uintptr_t)(c->tpidrro + 0x1f8) + 0x1b0);
-    uint32_t v = 0;
-    if (__atomic_compare_exchange_n(w, &v, tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
-    for (uint64_t end = 0;;) {
-        if (v == 0) {
-            if (__atomic_compare_exchange_n(w, &v, tag, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
-            continue;
-        }
-        if ((v & CS_WAITERS) || !cs_owner_running(v)) break;
-        uint64_t now = plat_now_ns();
-        if (!end) end = now + cs_spin_ns;
-        else if (now > end) break;
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__)
-        __asm__ volatile("yield");
-#endif
-        v = __atomic_load_n(w, __ATOMIC_RELAXED);
-    }
-    // the console's way: mark the word, let the kernel queue this thread until the lock is handed over
-    for (;;) {
-        v = __atomic_load_n(w, __ATOMIC_RELAXED);
-        if (v == 0) {
-            if (__atomic_compare_exchange_n(w, &v, tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
-            continue;
-        }
-        if (!(v & CS_WAITERS) && !__atomic_compare_exchange_n(w, &v, v | CS_WAITERS, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-            continue;
-        c->x[0] = v & ~CS_WAITERS;
-        c->x[1] = addr;
-        c->x[2] = tag;
-        rt_svc(c, 0x1A, 0x70026796d4ull);  // (the SDK's svcArbitrateLock stub; only for logs)
-        if ((uint32_t)c->x[0]) FATAL("ArbitrateLock(%x, %llx, %x) failed: %x\n", v & ~CS_WAITERS, (unsigned long long)addr, tag,
-                                     (uint32_t)c->x[0]);
-        if ((__atomic_load_n(w, __ATOMIC_ACQUIRE) & ~CS_WAITERS) == tag) return;
-    }
+    nmutex_lock((uint32_t *)(uintptr_t)c->x[0], cs_tag(c));
+    rt_unwind_point();  // (a reboot cut a sleep short)
+}
+static void cs_leave(Cpu *c) {
+    uint32_t *w = (uint32_t *)(uintptr_t)c->x[0], v = cs_tag(c);
+    if (!__atomic_compare_exchange_n(w, &v, 0, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) nmutex_unlock(w);
 }
 
 void kernel_native_sync_init(void) {
@@ -789,8 +868,11 @@ void kernel_native_sync_init(void) {
     done = true;
     const char *s = getenv("SAVAGEWIND_MUTEX_SPIN_US");
     cs_spin_ns = (uint64_t)(s ? atoi(s) : 10) * 1000;
+    g_native_mutex = true;  // (the kernel's lock and condition-variable calls follow: svc 0x1a-0x1c)
     hle_override(guest_sym("_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5EnterEv"), cs_enter,
                  "InternalCriticalSection::Enter (native)");
+    hle_override(guest_sym("_ZN2nn2os6detail36InternalCriticalSectionImplByHorizon5LeaveEv"), cs_leave,
+                 "InternalCriticalSection::Leave (native)");
 }
 
 // ------------------------------------------------------------------ address arbiter
@@ -930,6 +1012,7 @@ static _Atomic uint64_t svc_wait_ns[32][0x80], svc_calls[32][0x80];
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
+    host_priority(t_cur);  // (a priority set by another thread since its last syscall)
     // ArbitrateUnlock and SignalProcessWideKey give the core up after they let go, not before: a thread that yielded
     // first kept its waiters waiting until it got its core back (the game's audio thread held the audio renderer's
     // mutex up to 40 ms that way).
@@ -1091,6 +1174,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     switch (imm) {
     case 0x01: {  // SetHeapSize
         uint64_t size = x[1];
+        LOG("[kernel] SetHeapSize %#llx (lr %llx)\n", (unsigned long long)size, (unsigned long long)c->x[30]);
         if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
         heap_size = size;
         backend_heap_set(size);  // (the renderer may back the heap with GPU memory: Linux, exec.c)
@@ -1102,6 +1186,35 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     case 0x02: case 0x03: x[0] = R_OK; break;  // SetMemoryPermission / SetMemoryAttribute
     case 0x04:  // MapMemory(dst, src, size): src is inaccessible while mapped, so copying is equivalent
+        if (ENV("SAVAGEWIND_LOG_MAPS") || !x[0] || !x[1])
+            LOG("[kernel] MapMemory dst %llx src %llx size %llx (%d regions)\n", (unsigned long long)x[0],
+                (unsigned long long)x[1], (unsigned long long)x[2], nregions);
+        {  // (a guest call chain: the frame records x29 -> {fp, lr}) for the report, and the heap dump's trigger
+            extern void rt_heap_dump(Cpu *, const char *);
+            static uint64_t dump_at = 1;
+            if (dump_at == 1) dump_at = ENV("SAVAGEWIND_HEAP_DUMP_AT") ? strtoull(ENV("SAVAGEWIND_HEAP_DUMP_AT"), NULL, 16) : 0;
+            bool failed = !x[0] || !x[1], hit = false;
+            uint64_t fp = c->x[29], frames[16];
+            int nf = 0;
+            for (; nf < 16 && fp && !(fp & 7) && fp >= c->sp && fp - c->sp < (16u << 20); nf++) {
+                frames[nf] = *(uint64_t *)(uintptr_t)(fp + 8);
+                hit |= dump_at && frames[nf] == dump_at;
+                uint64_t nfp = *(uint64_t *)(uintptr_t)fp;
+                fp = nfp > fp ? nfp : 0;
+            }
+            if (failed) {
+                LOG("[kernel] MapMemory caller lr %llx, frames:", (unsigned long long)c->x[30]);
+                for (int i = 0; i < nf; i++) LOG(" %llx", (unsigned long long)frames[i]);
+                LOG("\n");
+            }
+            if (failed || hit) {
+                uint64_t a0 = x[0], a1 = x[1], a2 = x[2];
+                rt_heap_dump(c, failed ? "a thread's memory was not allocated" : "SAVAGEWIND_HEAP_DUMP_AT");
+                x[0] = a0, x[1] = a1, x[2] = a2;
+                if (hit) dump_at = 0;  // (once)
+            }
+            if (failed) FATAL("MapMemory of a null range: the memory it maps was not allocated\n");
+        }
         kernel_watch_write("MapMemory", x[0], x[2]);
         memcpy((void *)x[0], (void *)x[1], x[2]);
         region_add(x[0], x[2], 0xB, 3);
@@ -1180,15 +1293,15 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x0E: {  // GetThreadCoreMask(_, _, handle)
         KObject *o = handle_get((uint32_t)x[2]);
         x[0] = o ? R_OK : R_INVALID_HANDLE;
-        x[1] = o ? (uint64_t)((KThread *)o)->core : 0;
-        x[2] = 0xF;
+        x[1] = o ? (uint64_t)platform_of_core(((KThread *)o)->core) : 0;
+        x[2] = platform_mask();
         break;
     }
     case 0x0F: {  // SetThreadCoreMask(handle, ideal core, affinity mask)
         KObject *o = handle_get((uint32_t)x[0] == 0xFFFF8000u ? kernel_current_thread_handle() : (uint32_t)x[0]);
         if (!o || o->type != KOBJ_THREAD) { x[0] = R_INVALID_HANDLE; break; }
         int32_t ideal = (int32_t)x[1];
-        uint64_t mask = x[2] & 0xF;
+        uint64_t mask = x[2] & platform_mask();
         int core = ideal >= 0 ? ideal : -1;
         if (ENV("SAVAGEWIND_LOG_CORES"))
             LOG("[kernel] SetThreadCoreMask %x: ideal %d mask %llx (prio %d)\n", ((KThread *)o)->handle, ideal,
@@ -1198,7 +1311,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         x[0] = R_OK;
         break;
     }
-    case 0x10: x[0] = t_cur->core; break;  // GetCurrentProcessorNumber
+    case 0x10: x[0] = t_cur->core; break;  // GetCurrentProcessorNumber (the game's core id; only game code asks)
     case 0x11: case 0x12: case 0x17: {  // SignalEvent / ClearEvent / ResetSignal
         klock();
         KObject *o = handle_get((uint32_t)x[0]);
@@ -1296,13 +1409,13 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         uint64_t v = 0;
         uint32_t r = R_OK;
         switch (id0) {
-        case 0: v = 0xF; break;
+        case 0: v = platform_mask(); break;  // (core mask: the game's cores and the system core)
         case 1: v = 0xFFFFFFFFFFFFFFFFull; break;
         case 2: v = ALIAS_BASE; break;
         case 3: v = ALIAS_SIZE; break;
         case 4: v = HEAP_BASE; break;
         case 5: v = HEAP_MAX; break;
-        case 6: case 21: v = 0xCD500000ull; break;  // application memory (3.2 GB, as on hardware)
+        case 6: case 21: v = HEAP_MAX - 0x2B00000ull; break;  // application memory (the PC's: rt.h HEAP_MAX)
         case 7: case 22: v = heap_size + 0x4000000; break;
         case 8: v = 0; break;
         case 9: v = 0; break;
@@ -1319,6 +1432,8 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 28: v = 0; break;  // AliasRegionExtraSize (HOS 18+; BOTW 1.8.2's SDK asks): none
         default: r = R_INVALID_ENUM; LOG("[kernel] GetInfo unknown id %u/%llu\n", id0, x[3]);
         }
+        if (ENV("SAVAGEWIND_LOG_MAPS") && (id0 == 5 || id0 == 6 || id0 == 7 || id0 == 21 || id0 == 22))
+            LOG("[kernel] GetInfo %u = %#llx (lr %llx)\n", id0, (unsigned long long)v, (unsigned long long)c->x[30]);
         x[0] = r;
         x[1] = v;
         break;

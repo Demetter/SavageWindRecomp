@@ -69,12 +69,25 @@ void plat_sleep_until_ns(uint64_t t) {
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 }
 
+int plat_physical_cores(void) {  // (logical processors, halved while SMT is active)
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    FILE *f = fopen("/sys/devices/system/cpu/smt/active", "r");
+    int smt = 0;
+    if (f) { if (fscanf(f, "%d", &smt) != 1) smt = 0; fclose(f); }
+    if (smt == 1 && n > 1) n /= 2;
+    return n > 0 ? (int)n : 1;
+}
+
+// A thread's nice value (raising it above normal needs the privilege; without it the thread stays normal).
+void plat_thread_priority(int level) { setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -4 * level); }
+
 // ---- address waits
 bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns) {
     struct timespec ts = {.tv_sec = (time_t)(timeout_ns / 1000000000u), .tv_nsec = (long)(timeout_ns % 1000000000u)};
     return syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, &ts, NULL, 0) == 0 || errno != ETIMEDOUT;
 }
 void plat_wake_u32_all(const uint32_t *addr) { syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0); }
+void plat_wake_u32_one(const uint32_t *addr) { syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0); }
 
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the
 // vsync thread on time while the guest threads load every core.

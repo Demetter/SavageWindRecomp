@@ -25,9 +25,9 @@ void plat_trace_flush(void);
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
-// guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+// guest lives in a 13 GB window at 0x70_0000_0000 claimed at startup (see main.c).
 #define GUEST_LO     0x7000000000ull
-#define GUEST_HI     0x7320000000ull
+#define GUEST_HI     0x7340000000ull
 // The exefs modules (main, subsdk0..9, sdk) sit back to back from MAIN_BASE, main first, as tools/layout.py
 // places them; the game code library says where each one is (runtime/gamelib.h). Both bounds: tools/layout.py too.
 #define MAIN_BASE    0x7000000000ull
@@ -41,7 +41,11 @@ void plat_trace_flush(void);
 #define ALIAS_BASE   0x7100000000ull   // alias region (svcMapMemory targets)
 #define ALIAS_SIZE   0x0100000000ull
 #define HEAP_BASE    0x7240000000ull
-#define HEAP_MAX     0x00D0000000ull   // 3.25 GB
+// The game's memory: the PC's, not the Switch's 3.25 GB. BOTW gives the memory left after its fixed heaps to "the rest"
+// heaps (the open-world stage's among them), and on N cores its per-core structures take more of those
+// (BOTW-JOBS-NATIVE.md step 4: a stage thread's stack no longer fitted at six cores). 3.75 GB keeps every size under
+// 4 GB until the game's own size arithmetic above that is checked.
+#define HEAP_MAX     0x00F0000000ull   // 3.75 GB
 
 // ---- loader.c
 typedef struct Module {

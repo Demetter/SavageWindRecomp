@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
 
@@ -57,6 +58,18 @@ void plat_sleep_until_ns(uint64_t t) {
     mach_wait_until(t * tb.denom / tb.numer);
 }
 
+int plat_physical_cores(void) {
+    int n = 0;
+    size_t size = sizeof n;
+    return sysctlbyname("hw.physicalcpu", &n, &size, NULL, 0) == 0 && n > 0 ? n : 1;
+}
+
+// The thread's scheduling priority around the default 31 (SCHED_OTHER takes 15 .. 47 for a process's own threads).
+void plat_thread_priority(int level) {
+    struct sched_param sp = {.sched_priority = 31 + 4 * (level < -2 ? -2 : level > 2 ? 2 : level)};
+    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+}
+
 // ---- address waits: the kernel's ulock, what libc++'s std::atomic::wait uses on Apple platforms
 extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
 extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
@@ -69,6 +82,7 @@ bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns)
     return r != -ETIMEDOUT;
 }
 void plat_wake_u32_all(const uint32_t *addr) { __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL | ULF_NO_ERRNO, (void *)addr, 0); }
+void plat_wake_u32_one(const uint32_t *addr) { __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, (void *)addr, 0); }
 
 // Real-time (time-constraint) thread: exempt from the timer coalescing macOS applies to
 // ordinary threads when the app isn't frontmost, which otherwise stretches 16ms waits to ~100ms.

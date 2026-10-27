@@ -45,6 +45,7 @@ struct KThread {
     uint64_t core_ticket;
     pthread_cond_t core_cond;  // separate from kernel waits: protected by the core mutex
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
+    int host_level;  // the host priority it last set itself (kernel.c host_priority; 99: none yet)
     uint64_t woken_ns;  // (SAVAGEWIND_PROF_SVC) when a waker signalled it
     uint64_t block_ns;  // how long its last block lasted (block_current: it spins first after short ones)
 };

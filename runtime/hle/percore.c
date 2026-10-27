@@ -25,8 +25,13 @@ typedef struct {
     uint64_t obj;  // (0: free; written last, with release)
     uint64_t block;
     uint32_t field, bytes;  // (the object's own array: obj + field, bytes long)
+    uint32_t span, stride;  // (the block's slots: span bytes; the guard after them)
     uint8_t reported;       // (check: a missed write logged)
+    uint8_t overrun;        // (guard: a write past the slots logged)
 } Entry;
+#define GUARD 64
+#define GUARD_BYTE 0xfd
+static int g_guard = -1;  // (check) SAVAGEWIND_PERCORE_GUARD=1: GUARD bytes after every block's slots, checked each frame
 typedef struct {
     uint32_t mask, used;
     Entry e[];
@@ -114,14 +119,16 @@ static uint64_t block_of(uint64_t obj, uint32_t field, uint32_t stride, uint32_t
         return e->block;
     }
     size_t slots = (size_t)rt_game_cores() + (with_system ? 1 : 0);
-    void *b = calloc(1, slots * stride + 64);
+    if (g_guard < 0) g_guard = getenv("SAVAGEWIND_PERCORE_GUARD") && atoi(getenv("SAVAGEWIND_PERCORE_GUARD"));
+    void *b = calloc(1, slots * stride + 64 + GUARD);
     if (!b) FATAL("percore: out of memory\n");
     uint64_t block = ((uint64_t)(uintptr_t)b + 63) & ~63ull;
+    if (g_guard) memset((void *)(uintptr_t)(block + slots * stride), GUARD_BYTE, GUARD);
     if (g_poison < 0) g_poison = getenv("SAVAGEWIND_PERCORE_POISON") && atoi(getenv("SAVAGEWIND_PERCORE_POISON"));
     uint32_t bytes = live ? 0 : switch_slots * stride;  // (a live array: nothing poisoned, nothing checked)
     if (g_poison && bytes) poison(obj + field, bytes, 1);
     e = add(obj, field);
-    e->block = block, e->field = field, e->bytes = bytes;
+    e->block = block, e->field = field, e->bytes = bytes, e->span = (uint32_t)(slots * stride), e->stride = stride;
     __atomic_store_n(&e->obj, obj, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_m);
     LOG("[percore] %llx +%#x: %zu slots of %#x (the game's %u%s)%s\n", (unsigned long long)obj, field, slots, stride,
@@ -141,9 +148,27 @@ uint64_t rt_percore_slot(uint64_t obj, uint32_t field, uint32_t stride, uint32_t
     return block + (uint64_t)idx * stride;
 }
 
-// (check) once a frame (runtime/hle/framepace.c): every ~600 frames, the poisoned arrays still poisoned?
+// (check) once a frame (runtime/hle/framepace.c): with the guard, every block's guard intact (a write past its slots:
+// a core the game indexes beyond the block, which would corrupt the host heap); every ~600 frames, the poisoned
+// arrays still poisoned?
 void rt_percore_check(void) {
     static uint64_t frames;
+    if (g_guard > 0) {
+        pthread_mutex_lock(&g_m);
+        for (uint32_t i = 0; g_tab && i <= g_tab->mask; i++) {
+            Entry *e = &g_tab->e[i];
+            if (!e->obj || e->overrun) continue;
+            const uint8_t *g = (const uint8_t *)(uintptr_t)(e->block + e->span);
+            for (int k = 0; k < GUARD; k++)
+                if (g[k] != GUARD_BYTE) {
+                    LOG("[percore] OVERRUN: %llx +%#x (%u-byte slots, %u slots): written %d bytes past the last slot\n",
+                        (unsigned long long)e->obj, e->field, e->stride, e->span / (e->stride ? e->stride : 1), k);
+                    e->overrun = 1;
+                    break;
+                }
+        }
+        pthread_mutex_unlock(&g_m);
+    }
     if (g_poison <= 0 || ++frames % 600) return;
     pthread_mutex_lock(&g_m);
     for (uint32_t i = 0; g_tab && i <= g_tab->mask; i++) {

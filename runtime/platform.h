@@ -54,12 +54,15 @@ static inline uint32_t plat_thread_id(void) { return 0; }
 #endif
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);  // periodic timing thread (vsync): don't coalesce its timers
+void plat_thread_priority(int level);  // the calling thread: -2 lowest, -1 below normal, 0 normal, 1 above, 2 highest
+int plat_physical_cores(void);  // physical cores the process may run on (at least 1)
 
 // ---- address waits (the OS's futex: WaitOnAddress, futex, __ulock)
 // Blocks while *addr == expected, until a wake on addr or timeout_ns passes (it may also return early); false on
 // timeout.
 bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns);
 void plat_wake_u32_all(const uint32_t *addr);
+void plat_wake_u32_one(const uint32_t *addr);
 
 // ---- process
 void plat_init(void);                                // first thing in main()

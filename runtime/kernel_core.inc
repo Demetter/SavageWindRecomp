@@ -39,8 +39,8 @@ static void core_best_update(Core *k) {  // (k->m held)
         __atomic_store_n(&g_core_best_wait[k - g_cores].v, best, __ATOMIC_RELAXED);
 }
 
-static bool cores_on(void) {
-    if (g_cores_on < 0) g_cores_on = !(getenv("SAVAGEWIND_CORES") && !strcmp(getenv("SAVAGEWIND_CORES"), "0"));
+static bool cores_on(void) {  // (kernel.c "cores": off unless SAVAGEWIND_CORES=1)
+    if (g_cores_on < 0) g_cores_on = getenv("SAVAGEWIND_CORES") && strcmp(getenv("SAVAGEWIND_CORES"), "0");
     return g_cores_on;
 }
 

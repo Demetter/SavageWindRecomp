@@ -716,6 +716,8 @@ def _job_init(name, path, base, simd, sites, hle, native_fns, forwarders):
     global _wm
     _wm = Module(name, path, base, simd)
     _wm.sites, _wm.patches = sites, patches.table(sites) if sites else {}
+    if sites and os.environ.get('SAVAGEWIND_GEN_HEAP_PROBE'):  # (research: runtime/hle/heapprobe.c)
+        _wm.patches.update(patches.heap_probe_table(_wm))
     _wm.hle, _wm.native, _wm.forwarders = hle, native_fns, forwarders
 
 
@@ -758,6 +760,8 @@ def generate(name, nso, base, outdir, opts, sites=None):
     if name == 'main':
         m.sites = sites if sites is not None else main_sites(m.nso, base, opts)[1]
         m.patches = patches.table(m.sites) if m.sites else {}
+        if m.sites and os.environ.get('SAVAGEWIND_GEN_HEAP_PROBE'):  # (research: runtime/hle/heapprobe.c)
+            m.patches.update(patches.heap_probe_table(m))
     starts = m.boundaries()
     hle = {}
     if opts.hle and os.path.exists(opts.hle):
