@@ -372,6 +372,35 @@ def _yaz0_stream_ret(gen, a):
     return '{ extern void rt_yaz0_done(Cpu *); rt_yaz0_done(c); return; }' + f'  /* {a:#x}: ret (Yaz0 stream decoder) */'
 
 
+# ksys::VFR per core with N slots (runtime/hle/vfr.c; BOTW-JOBS-NATIVE.md): its getters and per-core methods run in
+# the runtime, which keeps a slot for every core the game has (sead's object has three); where the game's own code walks
+# all three cores (copying buffer A to B, spreading core 0 to every core) a call does it for every core first. Each
+# method is given sead's core-id TLS slot variable (core_id_tls), so it picks its core as the game's getters do.
+
+def _vfr_method(fn, word, what):
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        tls = gen.sites['core_id_tls']
+        return (f'{{ extern void {fn}(Cpu *, uint64_t); {fn}(c, {tls:#x}ull); return; }}'
+                f'  /* {a:#x}: VFR {what} (runtime/hle/vfr.c) */')
+    return patch
+
+
+def _vfr_update_interval(gen, a):
+    assert _word(gen, a) == 0xa9be7bfd, hex(_word(gen, a))  # stp x29, x30, [sp, #-0x20]!
+    return ('{ extern void rt_vfr_copy_a_to_b(Cpu *); rt_vfr_copy_a_to_b(c); '
+            'uint64_t ea = c->sp - 0x20; ST64(ea, c->x[29]); ST64(ea + 8, c->x[30]); c->sp = ea; }'
+            f'  /* {a:#x}: stp x29, x30, [sp, #-0x20]! (VFR updateInterval: buffer A to B, every core) */')
+
+
+def _vfr_spread(fn, what):
+    def patch(gen, a):
+        assert _word(gen, a) == 0xbd409a60, hex(_word(gen, a))  # ldr s0, [x19, #0x98]
+        return (f'{{ extern void {fn}(Cpu *); {fn}(c); c->v[0] = VV(LD32(c->x[19] + 0x98)); }}'
+                f'  /* {a:#x}: ldr s0, [x19, #0x98] (VFR {what}: core 0 to every core) */')
+    return patch
+
+
 PATCHES = {
     'pause_options_update': _pause_option_state,
     'opt_create_rows': _opt_rows,
@@ -410,6 +439,21 @@ PATCHES = {
     'cam_pitch_item': _cam_pitch_aim,
     'cam_reverse_x': _cam_reverse(0),
     'cam_reverse_y': _cam_reverse(1),
+    'vfr_get_delta_frame': _vfr_method('rt_vfr_delta_frame', 0xa9be7bfd, 'getDeltaFrame'),
+    'vfr_get_raw_delta_frame': _vfr_method('rt_vfr_raw_delta_frame', 0xa9be7bfd, 'getRawDeltaFrame'),
+    'vfr_get_delta_time': _vfr_method('rt_vfr_delta_time', 0xa9be7bfd, 'getDeltaTime'),
+    'vfr_get_interval': _vfr_method('rt_vfr_interval', 0xa9be7bfd, 'getInterval'),
+    'vfr_get_ratio': _vfr_method('rt_vfr_ratio', 0xa9be7bfd, 'getIntervalRatio'),
+    'vfr_get_ratio_time': _vfr_method('rt_vfr_ratio_time', 0xa9be7bfd, 'getIntervalRatio x frame time'),
+    'vfr_use_buffer_a': _vfr_method('rt_vfr_use_a', 0xa9be7bfd, 'useBufferA'),
+    'vfr_use_buffer_b': _vfr_method('rt_vfr_use_b', 0xa9be7bfd, 'useBufferB'),
+    'vfr_set_min_delta': _vfr_method('rt_vfr_set_min_delta', 0xb9407808, 'setMinDelta(core, mask)'),
+    'vfr_get_and_set_min': _vfr_method('rt_vfr_get_and_set_min', 0xfc1c0fe8, 'getDeltaAndSetMin'),
+    'vfr_set_delta': _vfr_method('rt_vfr_set_delta', 0xd100c3ff, 'setDelta'),
+    'vfr_update_interval': _vfr_update_interval,
+    'vfr_update_spread': _vfr_spread('rt_vfr_spread_core0', 'updateInterval'),
+    'vfr_init_spread': _vfr_spread('rt_vfr_init_spread', 'init (and buffer A to B)'),
+    'vfr_reset_spread': _vfr_spread('rt_vfr_spread_core0', 'resetTimeMultipliers'),
 }
 
 

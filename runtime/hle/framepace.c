@@ -57,6 +57,9 @@ extern volatile int g_movie_playing;  // runtime/hle/movie.c: video decoders run
 extern volatile int g_movie_fps;      // runtime/hle/movie.c: the playing movie's frame rate
 
 #define VF(T, base, off) (*(T *)(uintptr_t)((base) + (off)))
+// VFR's per-core deltas (runtime/hle/vfr.c: they live there, a slot for each of the game's cores)
+float rt_vfr_core0_delta_frame(void);
+float rt_vfr_core_delta_frame(int core);
 #define PAUSE_STATE g_site.pause_state  // (u32: 0 playing, 2 in the pause menu or the map)
 
 static int env_int(const char *name, int def) {
@@ -198,7 +201,9 @@ void framepace_presented(uint64_t t, bool on_grid) {
     prev = t;
     if (s > 0.25) s = 0.25;
     smooth = smooth > 0 ? smooth + (s - smooth) * 0.25 : s;
-    float step = (float)((on_grid ? s : smooth) * 30);
+    static int measured = -1;  // (probe) SAVAGEWIND_STEP_MEASURED=1
+    if (measured < 0) measured = env_int("SAVAGEWIND_STEP_MEASURED", 0);
+    float step = (float)((on_grid && !measured ? s : smooth) * 30);
     g_step = step < 0.1f ? 0.1f : step > 1.5f ? 1.5f : step;
     g_grid_streak = on_grid ? g_grid_streak + 1 : 0;
     static int fixed = -1;
@@ -235,6 +240,29 @@ void rt_vfr_update(uint64_t vfr) {
     extern uint64_t g_fs_vfr;  // (SAVAGEWIND_FRAME_LOG=2, nvn/objects.c)
     g_fs_vfr = plat_now_ns();
     clock_probe(vfr);
+    {   // (probe) SAVAGEWIND_CPU_CLOCK=1: every ~2 s, the main thread's and the process's clock while running (cycles /
+        // CPU time), the main thread's share of the wall time, and cycles per frame: whether frames got slower
+        // because the CPU ran slower or because they took more cycles
+        static int on = -1;
+        static uint64_t t0, c0, n0, pc0, pn0, frames;
+        if (on < 0) on = env_int("SAVAGEWIND_CPU_CLOCK", 0);
+        if (on) {
+            extern uint64_t perf_thread_cycles(void), perf_thread_cpu_ns(void), perf_process_cycles(void),
+                perf_process_cpu_ns(void);
+            uint64_t now = plat_now_ns();
+            frames++;
+            if (!t0) t0 = now, c0 = perf_thread_cycles(), n0 = perf_thread_cpu_ns(), pc0 = perf_process_cycles(),
+                     pn0 = perf_process_cpu_ns(), frames = 0;
+            else if (now - t0 > 2000000000ull) {
+                uint64_t c = perf_thread_cycles(), n = perf_thread_cpu_ns(), pc = perf_process_cycles(), pn = perf_process_cpu_ns();
+                LOG("[clock] main %.2f GHz running %.0f%% of the time, %.2f Mcycles a frame; process %.2f GHz on %.2f "
+                    "processors, %.2f Mcycles a frame (%llu frames)\n", n > n0 ? (c - c0) / (double)(n - n0) : 0,
+                    100.0 * (n - n0) / (now - t0), (c - c0) / 1e6 / frames, pn > pn0 ? (pc - pc0) / (double)(pn - pn0) : 0,
+                    (pn - pn0) / (double)(now - t0), (pc - pc0) / 1e6 / frames, (unsigned long long)frames);
+                t0 = now, c0 = c, n0 = n, pc0 = pc, pn0 = pn, frames = 0;
+            }
+        }
+    }
     log_screens();
     player_dump(vfr);
     extern void input_cam_frame(float ratio);  // runtime/hle/input.c: the mouse's motion in the frame, for the cameras
@@ -274,10 +302,15 @@ void rt_vfr_update(uint64_t vfr) {
         // moves the camera and Link apart (Link seemed to step back in place, seen from the side). One period once
         // the presents have kept the pace for half a second, else the average of ~20 frames; plus a fiftieth of what
         // is owed; and at most 3% away from the last step.
-        double step = (g_grid_streak >= 30 ? period : smooth) + (real - given) * 0.02;
+        static int measured = -1;  // (probe) SAVAGEWIND_STEP_MEASURED=1: the measured step even on the pace's grid
+        if (measured < 0) measured = env_int("SAVAGEWIND_STEP_MEASURED", 0);
+        double step = (g_grid_streak >= 30 && !measured ? period : smooth) + (real - given) * 0.02;
         if (last_step > 0 && step > last_step * 1.03) step = last_step * 1.03;
         if (last_step > 0 && step < last_step * 0.97) step = last_step * 0.97;
-        if (step < 1.0 / FPS_CEILING) step = 1.0 / FPS_CEILING;
+        static int floor_fps = -1;  // (probe) SAVAGEWIND_STEP_FLOOR_FPS=<fps>: the shortest step the game is given
+        if (floor_fps < 0) floor_fps = env_int("SAVAGEWIND_STEP_FLOOR_FPS", 0);
+        double floor_step = 1.0 / (floor_fps > 0 ? floor_fps : FPS_CEILING);
+        if (step < floor_step) step = floor_step;
         if (step > 0.05) step = 0.05;
         last_step = step;
         ratio = (float)(step * 30);
@@ -353,7 +386,7 @@ static void clock_probe(uint64_t vfr) {
     if (every < 0) every = env_int("SAVAGEWIND_CLOCK_PROBE", 0);
     if (every <= 0) return;
     frames++;
-    game += VF(float, vfr, 0x98);  // (core 0's delta frame of the frame that just ended)
+    game += rt_vfr_core0_delta_frame();  // (core 0's delta frame of the frame that just ended)
     uint64_t now = plat_now_ns();
     if (!t0) t0 = now, next = now;
     if (now < next) return;
@@ -401,8 +434,8 @@ static void player_dump(uint64_t vfr) {
         }
 #endif
     }
-    {   // (research) SAVAGEWIND_LOG_VFR=<n>: every n updates, VFR's ratio, interval, core 0's delta frame (+0x98), the four
-        // per-core deltas (+0x108: pointers) and the cold timer's step since the last update (player actor +0x268c)
+    {   // (research) SAVAGEWIND_LOG_VFR=<n>: every n updates, VFR's ratio, interval, core 0's delta frame, the four
+        // per-core deltas (runtime/hle/vfr.c) and the cold timer's step since the last update (player actor +0x268c)
         static int every = -1;
         static uint64_t n;
         static float last_timer;
@@ -412,12 +445,9 @@ static void player_dump(uint64_t vfr) {
         float timer = actor >= 0x7000000000ull ? VF(float, actor, 0x268c) : 0;
         if (every > 0 && n++ % (uint64_t)every == 0) {
             float core[4];
-            for (int i = 0; i < 4; i++) {
-                uint64_t p = VF(uint64_t, vfr, 0x108 + 8 * i);
-                core[i] = p >= 0x7000000000ull ? *(float *)(uintptr_t)p : -1;
-            }
+            for (int i = 0; i < 4; i++) core[i] = rt_vfr_core_delta_frame(i);
             LOG("[vfr] ratio %.4f interval %u delta0 %.4f cores %.4f %.4f %.4f %.4f; cold timer %.4f step %.5f life %d y %.3f\n",
-                VF(float, vfr, VFR_RATIO), VF(uint32_t, vfr, VFR_INTERVAL), VF(float, vfr, 0x98), core[0], core[1],
+                VF(float, vfr, VFR_RATIO), VF(uint32_t, vfr, VFR_INTERVAL), rt_vfr_core0_delta_frame(), core[0], core[1],
                 core[2], core[3], timer, timer - last_timer, actor >= 0x7000000000ull ? VF(int32_t, actor, 0x848) : -1,
                 pinfo ? VF(float, pinfo, 0x8c) : 0);
         }

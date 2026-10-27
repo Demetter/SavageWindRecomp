@@ -70,6 +70,11 @@ uint64_t perf_process_cpu_ns(void) {  // user + kernel time of all the process's
     if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
     return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
 }
+uint64_t perf_thread_cpu_ns(void) {  // user + kernel time of this thread
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    return ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+}
 int perf_usable_processors(void) {  // the logical processors the game may run on (after one_per_core_init)
     DWORD_PTR all, sys;
     GetProcessAffinityMask(GetCurrentProcess(), &all, &sys);
@@ -83,6 +88,7 @@ int perf_usable_processors(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); retur
 uint64_t perf_process_cpu_ns(void) { return 0; }
 uint64_t perf_process_cycles(void) { return 0; }
 uint64_t perf_thread_cycles(void) { return 0; }
+uint64_t perf_thread_cpu_ns(void) { return 0; }
 void perf_thread_priority(int p) { (void)p; }
 #endif
 void perf_one_per_core(bool on) { one_per_core(on); }

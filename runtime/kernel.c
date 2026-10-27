@@ -469,6 +469,8 @@ void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t
 }
 
 uint32_t kernel_current_thread_handle(void) { return t_cur ? t_cur->handle : 0; }
+// (svcGetCurrentProcessorNumber, for native code that reads the game's core as its own code does: runtime/hle/vfr.c)
+uint32_t kernel_current_core(void) { return t_cur ? (uint32_t)t_cur->core : 0; }
 Cpu *kernel_current_cpu(void) { return t_cur ? &t_cur->cpu : NULL; }
 KThread *kernel_current_thread(void) { return t_cur; }
 

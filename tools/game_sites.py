@@ -163,6 +163,41 @@ SITES = [
          '94000000/fc000000 36000000/fff8001f', 0),
     Site('cam_reverse_y', 'code', '94000000/fc000000 36000000/fff8001f bd413660 1e214000 bd013660 a9424ff4 a9417bfd '
          '9100c3ff', 0),
+    # sead::CoreInfo::configure (runtime/hle/cores.c): the core count (a constant 3 on the console) and the core table,
+    # replaced by the host's game cores (BOTW-JOBS-NATIVE.md)
+    Site('core_info_configure', 'code', '90000008/9f00001f 52800069 b9000109/ffc003ff 9000000a/9f00001f '
+         '9100014a/ffc003ff d2c0002b 52800048 f900014b', 0),
+    # ksys::VFR per core with N slots (runtime/hle/vfr.c, tools/patches.py _vfr_*): its getters and per-core methods,
+    # and where its own code walks all three cores; sead's core-id TLS slot variable (the getters' core)
+    Site('vfr_get_delta_frame', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 91042268', 0),
+    Site('vfr_get_raw_delta_frame', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 9103c268', 0),
+    Site('vfr_get_delta_time', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 9104e268', 0),
+    Site('vfr_get_interval', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 91012268', 0),
+    Site('vfr_get_ratio', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 91018268 b9401fa9 f9400bf3', 0),
+    Site('vfr_get_ratio_time', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 91018268 b9401fa9 bd415a61', 0),
+    Site('vfr_use_buffer_b', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 9102f268', 0),
+    Site('vfr_use_buffer_a', 'code', 'a9be7bfd f9000bf3 910003fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 '
+         '94000000/fc000000 b4000000/ff00001f 51000400 b9001fa0 91023268', 0),
+    Site('vfr_set_min_delta', 'code', 'b9407808 7100051f 5400000b/ff00001f f940400b 1e2e1000 aa1f03e9 b940004a 9100116b', 0),
+    Site('vfr_get_and_set_min', 'code', 'fc1c0fe8 a9017bfd a90257f6 a9034ff4 910043fd 90000008/9f00001f aa0003f3 f9400108/ffc003ff '
+         '2a0303f4', 0),
+    Site('vfr_set_delta', 'code', 'd100c3ff fd000be8 f90017f3 a901fbfd 910063fd 90000008/9f00001f aa0003f3 1e204008 f9419108 '
+         'b9400100 94000000/fc000000 b4000000/ff00001f 51000400 90000009/9f00001f', 0),
+    Site('vfr_update_interval', 'code', 'a9be7bfd a9014ff4 910003fd 2d518400 aa0003f3 3940a408 bd00c001 7100011f', 0),
+    Site('vfr_update_spread', 'code', 'bd409a60 bd009e60 bd40a661 bd40b262 bd408e63 bd00aa61 bd00b662 bd009263 bd00a260 bd00ae61 '
+         'bd00ba62 bd009663 a9414ff4', 0),
+    Site('vfr_init_spread', 'code', 'bd409a60 bd009e60 bd40a661 bd40b262 bd408e63 bd403e64 b9403668 bd00aa61', 0),
+    Site('vfr_reset_spread', 'code', 'bd409a60 bd009e60 bd40a661 bd40b262 bd408e63 bd00aa61 bd00b662 bd009263 bd00a260 bd00ae61 '
+         'bd00ba62 bd009663 f9400bf3', 0),
+    Site('core_id_tls', 'got', '90000008/9f00001f aa0003f3 f9400108/ffc003ff b9400100 94000000/fc000000 b4000000/ff00001f '
+         '51000400 b9001fa0 91042268', 2),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -176,6 +211,14 @@ OPTIONAL_GROUPS = [
     ('yaz0_stream', 'yaz0_stream_ret'),
     ('cam_stick', 'cam_pitch_chase', 'cam_pitch_surf', 'cam_pitch_wakeboard', 'cam_pitch_aim', 'cam_pitch_item'),
     ('cam_reverse_x', 'cam_reverse_y'),
+    # the game on N cores (BOTW-JOBS-NATIVE.md): all of these or none, so a version never runs partly on N (only
+    # 1.9.0's checked so far; without them the game keeps sead's 3 cores and its own VFR)
+    ('core_info_configure', 'vfr_get_delta_frame', 'vfr_get_raw_delta_frame',
+     'vfr_get_delta_time', 'vfr_get_interval', 'vfr_get_ratio',
+     'vfr_get_ratio_time', 'vfr_use_buffer_b', 'vfr_use_buffer_a',
+     'vfr_set_min_delta', 'vfr_get_and_set_min', 'vfr_set_delta',
+     'vfr_update_interval', 'vfr_update_spread', 'vfr_init_spread',
+     'vfr_reset_spread', 'core_id_tls'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -287,6 +330,23 @@ KNOWN = {
         'cam_pitch_item': 0x7000bf2c0c,
         'cam_reverse_x': 0x7000d17024,
         'cam_reverse_y': 0x7000d1703c,
+        'core_info_configure': 0x7000eb92f0,
+        'vfr_get_delta_frame': 0x700056fcd0,
+        'vfr_get_raw_delta_frame': 0x70005b6fa8,
+        'vfr_get_delta_time': 0x70005abcfc,
+        'vfr_get_interval': 0x7000583118,
+        'vfr_get_ratio': 0x700059c788,
+        'vfr_get_ratio_time': 0x70007613c8,
+        'vfr_use_buffer_b': 0x700151d628,
+        'vfr_use_buffer_a': 0x700151d708,
+        'vfr_set_min_delta': 0x700151d7e8,
+        'vfr_get_and_set_min': 0x700151d8cc,
+        'vfr_set_delta': 0x700151dc00,
+        'vfr_update_interval': 0x700151d3d0,
+        'vfr_update_spread': 0x700151d4dc,
+        'vfr_init_spread': 0x700151d330,
+        'vfr_reset_spread': 0x700151d9d4,
+        'core_id_tls': 0x7001e348b0,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

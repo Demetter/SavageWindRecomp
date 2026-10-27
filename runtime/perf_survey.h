@@ -29,6 +29,7 @@ void perf_one_per_core(bool on);   // (in-launch trials) the process on one logi
 uint64_t perf_process_cpu_ns(void);  // user + kernel time of all the process's threads (0 where unknown)
 uint64_t perf_process_cycles(void);  // CPU cycles of all the process's threads so far / of this thread (0 where unknown)
 uint64_t perf_thread_cycles(void);
+uint64_t perf_thread_cpu_ns(void);  // user + kernel time of this thread (0 where unknown)
 void perf_thread_priority(int p);  // this thread's priority (Windows' steps; elsewhere nothing)
 static inline bool perfx(uint32_t bit) { return atomic_load_explicit(&g_perfx_list, memory_order_relaxed) & bit; }
 static inline bool perfx_trial(uint32_t bit) { return g_perfx_mask & bit; }
