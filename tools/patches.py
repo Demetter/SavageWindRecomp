@@ -372,6 +372,24 @@ def _yaz0_stream_ret(gen, a):
     return '{ extern void rt_yaz0_done(Cpu *); rt_yaz0_done(c); return; }' + f'  /* {a:#x}: ret (Yaz0 stream decoder) */'
 
 
+# BOTW's job scheduler run natively (runtime/hle/jobs.c; BOTW-JOBS-NATIVE.md step 2): the entries of a job pool's push,
+# kick and run-and-wait and of a worker's run go to the runtime, which takes them unless the pool is in the game's
+# serial mode (or SAVAGEWIND_JOBS_NATIVE=0); then the game's code runs from its first instruction. Each gets the game
+# functions the runtime calls: the group setup, the tick, the group event's clear and signal.
+_JOBS_FNS = ('jobs_group_setup', 'jobs_tick', 'jobs_event_clear', 'jobs_event_signal')
+
+
+def _jobs_entry(fn, word, frame, what):
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        fns = ', '.join(f'{gen.sites[s]:#x}ull' for s in _JOBS_FNS)
+        first = (f'c->sp -= {frame:#x};' if word >> 24 == 0xd1 else  # sub sp, sp, #frame
+                 f'uint64_t ea = c->sp - {frame:#x}; ST64(ea, c->x[29]); ST64(ea + 8, c->x[30]); c->sp = ea;')
+        return (f'{{ static const uint64_t fns[4] = {{{fns}}}; extern int {fn}(Cpu *, const uint64_t *); '
+                f'if ({fn}(c, fns)) return; {first} }}  /* {a:#x}: {what} */')
+    return patch
+
+
 # ksys::VFR per core with N slots (runtime/hle/vfr.c; BOTW-JOBS-NATIVE.md): its getters and per-core methods run in
 # the runtime, which keeps a slot for every core the game has (sead's object has three); where the game's own code walks
 # all three cores (copying buffer A to B, spreading core 0 to every core) a call does it for every core first. Each
@@ -1171,6 +1189,10 @@ PATCHES = {
     'frame_wait': _frame_wait,
     'yaz0_stream': _yaz0_stream,
     'yaz0_stream_ret': _yaz0_stream_ret,
+    'jobs_push': _jobs_entry('rt_jobs_push', 0xa9bc7bfd, 0x40, 'stp x29, x30, [sp, #-0x40]! (job pool push)'),
+    'jobs_kick': _jobs_entry('rt_jobs_kick', 0xd10103ff, 0x40, 'sub sp, sp, #0x40 (job pool kick)'),
+    'jobs_run': _jobs_entry('rt_jobs_run', 0xa9ba7bfd, 0x60, 'stp x29, x30, [sp, #-0x60]! (job worker run)'),
+    'jobs_run_wait': _jobs_entry('rt_jobs_run_wait', 0xa9bc7bfd, 0x40, 'stp x29, x30, [sp, #-0x40]! (job pool run-and-wait)'),
     'vfr_ratio': _vfr_ratio,
     'gui_speed': _gui_speed,
     'persp_matrix': _persp_matrix,

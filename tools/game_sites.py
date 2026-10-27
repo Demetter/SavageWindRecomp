@@ -703,6 +703,17 @@ SITES = [
          '94000000/fc000000 9107e260', 0),
     Site('obj28_pick', 'code', '7100151f 54000008/ff00001f 90000009/9f00001f 91000129/ffc003ff 1000000a/9f00001f 3868692b '
          '8b0b094a d61f0140 91068260', 0),
+    # BOTW's job scheduler run natively (BOTW-JOBS-NATIVE.md step 2; runtime/hle/jobs.c; tools/patches.py _jobs_*): the
+    # entries of push, kick, a worker's run and run-and-wait, and the group setup, tick and group-event calls they make
+    Site('jobs_push', 'code', 'a9bc7bfd f9000bf7 a90257f6 a9034ff4 910003fd aa0203f4 aa0103f5 b9001ba3', 0),
+    Site('jobs_kick', 'code', 'd10103ff a9017bfd a90257f6 a9034ff4 910043fd 39427008 aa0003f3 34000008/ff00001f', 0),
+    Site('jobs_run', 'code', 'a9ba7bfd f9000bfb a90267fa a9035ff8 a90457f6 a9054ff4 910003fd b9414008', 0),
+    Site('jobs_run_wait', 'code', 'a9bc7bfd f9000bf7 a90257f6 a9034ff4 910003fd 39427008 aa0003f3 35000008/ff00001f', 0),
+    Site('jobs_group_setup', 'call', '94000000/fc000000 f9400288 aa1403e0 f9400508 d63f0100 b9407a68 7100051f 5400000b/ff00001f', 0),
+    Site('jobs_tick', 'call', '94000000/fc000000 f900a660 52800057 aa1303e0 b9010277 94000000/fc000000 b940fe78 '
+         'b4000000/ff00001f', 0),
+    Site('jobs_event_clear', 'call', '94000000/fc000000 390073bf 2a1f03fb 394073a8 35000008/ff00001f 2a1f03fb f9400288 910063a2', 0),
+    Site('jobs_event_signal', 'call', '94000000/fc000000 b9010279 aa1403e0 b940fe61 94000000/fc000000 aa1303e0 b901027a b9010277', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -849,7 +860,10 @@ OPTIONAL_GROUPS = [
      'ring19_wc_c0', 'ring19_wc_c1', 'ring19_wc_ck',
      'ring19_wc_mov', 'ring19_wc_ccmp', 'ring19_wc_end',
      'obj28_ifaces', 'obj28_make', 'obj28_make_fn',
-     'obj28_destroy', 'obj28_destroy_fn', 'obj28_pick'),
+     'obj28_destroy', 'obj28_destroy_fn', 'obj28_pick',
+     'jobs_push', 'jobs_kick', 'jobs_run',
+     'jobs_run_wait', 'jobs_group_setup', 'jobs_tick',
+     'jobs_event_clear', 'jobs_event_signal'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1341,6 +1355,14 @@ KNOWN = {
         'obj28_destroy': 0x70010b6d98,
         'obj28_destroy_fn': 0x700140402c,
         'obj28_pick': 0x70010b71b4,
+        'jobs_push': 0x7000f93ea0,
+        'jobs_kick': 0x7000f93f78,
+        'jobs_run': 0x7000f94580,
+        'jobs_run_wait': 0x7000f94100,
+        'jobs_group_setup': 0x7000ef6118,
+        'jobs_tick': 0x700159ff00,
+        'jobs_event_clear': 0x7000ef6648,
+        'jobs_event_signal': 0x7000ef6640,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

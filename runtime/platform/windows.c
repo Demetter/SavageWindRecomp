@@ -227,6 +227,13 @@ void plat_thread_realtime(uint64_t period_ns) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
 
+// ---- address waits
+bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns) {
+    DWORD ms = (DWORD)((timeout_ns + 999999) / 1000000);
+    return WaitOnAddress((volatile VOID *)addr, &expected, sizeof expected, ms) || GetLastError() != ERROR_TIMEOUT;
+}
+void plat_wake_u32_all(const uint32_t *addr) { WakeByAddressAll((PVOID)addr); }
+
 // ---- process
 // Release builds are GUI-subsystem executables (no console window): stdout / stderr go to savagewind.log next to the
 // exe, and a fatal error shows a message box (plat_fatal_notice) instead of vanishing. Processes started by this one

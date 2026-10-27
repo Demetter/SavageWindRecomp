@@ -114,7 +114,7 @@ GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 # --stack: every thread's default stack, reserved (committed as it grows): 256 MB, the guest threads' recursion runs on
 # it (runtime/kernel.c thread_start)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,268435456 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -l:libz.a \
+            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -lsynchronization -l:libz.a \
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> savagewind.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))

@@ -1,6 +1,7 @@
 // macOS host layer (runtime/platform.h).
 #include <crt_externs.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <execinfo.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
@@ -55,6 +56,19 @@ void plat_sleep_until_ns(uint64_t t) {
     if (!tb.denom) mach_timebase_info(&tb);
     mach_wait_until(t * tb.denom / tb.numer);
 }
+
+// ---- address waits: the kernel's ulock, what libc++'s std::atomic::wait uses on Apple platforms
+extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#define UL_COMPARE_AND_WAIT 1
+#define ULF_WAKE_ALL 0x100
+#define ULF_NO_ERRNO 0x1000000
+bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns) {
+    uint64_t us = (timeout_ns + 999) / 1000;
+    int r = __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, (void *)addr, expected, us > UINT32_MAX ? 0 : (uint32_t)us);
+    return r != -ETIMEDOUT;
+}
+void plat_wake_u32_all(const uint32_t *addr) { __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL | ULF_NO_ERRNO, (void *)addr, 0); }
 
 // Real-time (time-constraint) thread: exempt from the timer coalescing macOS applies to
 // ordinary threads when the app isn't frontmost, which otherwise stretches 16ms waits to ~100ms.

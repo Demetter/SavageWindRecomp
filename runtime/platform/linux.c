@@ -11,8 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/ucontext.h>
 #include <time.h>
@@ -65,6 +68,13 @@ void plat_sleep_until_ns(uint64_t t) {
     struct timespec ts = {.tv_sec = (time_t)(t / 1000000000u), .tv_nsec = (long)(t % 1000000000u)};
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 }
+
+// ---- address waits
+bool plat_wait_u32(const uint32_t *addr, uint32_t expected, uint64_t timeout_ns) {
+    struct timespec ts = {.tv_sec = (time_t)(timeout_ns / 1000000000u), .tv_nsec = (long)(timeout_ns % 1000000000u)};
+    return syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, &ts, NULL, 0) == 0 || errno != ETIMEDOUT;
+}
+void plat_wake_u32_all(const uint32_t *addr) { syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0); }
 
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the
 // vsync thread on time while the guest threads load every core.
