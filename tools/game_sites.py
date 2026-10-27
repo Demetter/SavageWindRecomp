@@ -690,6 +690,19 @@ SITES = [
     Site('ring19_wc_mov', 'code', '52800048 b90007e8 52800035 29412688 6b1c013f b94007e9 f9400a96 7a428900', 0),
     Site('ring19_wc_ccmp', 'code', '7a428900 1b1c2508 93407d08 9a9f8118 52800f88 9b085b08 3941e109 34000009/ff00001f', 0),
     Site('ring19_wc_end', 'code', '6b1b039f 54000001/ff00001f a9464ff4 a94557f6 a9445ff8 a94367fa a9426ffc a9417bfd', 1),
+    # #28's second table (BOTW-JOBS-NATIVE.md #28; tools/patches.py _obj28_*, runtime/hle/percore.c): the constructor's
+    # interfaces and records, the destructor's records, the pick of the current core's
+    Site('obj28_ifaces', 'code', 'a9142668 a9152668 a9162668 a9172668 a9182668 a9192668 94000000/fc000000 9107e260', 0),
+    Site('obj28_make', 'code', '94000000/fc000000 9107e260 aa1403e1 94000000/fc000000 91094260 aa1503e1 94000000/fc000000 '
+         '910aa260', 0),
+    Site('obj28_make_fn', 'call', '94000000/fc000000 9107e260 aa1403e1 94000000/fc000000 91094260 aa1503e1 94000000/fc000000 '
+         '910aa260', 0),
+    Site('obj28_destroy', 'code', '94000000/fc000000 910c0260 94000000/fc000000 910aa260 94000000/fc000000 91094260 '
+         '94000000/fc000000 9107e260', 0),
+    Site('obj28_destroy_fn', 'call', '94000000/fc000000 910c0260 94000000/fc000000 910aa260 94000000/fc000000 91094260 '
+         '94000000/fc000000 9107e260', 0),
+    Site('obj28_pick', 'code', '7100151f 54000008/ff00001f 90000009/9f00001f 91000129/ffc003ff 1000000a/9f00001f 3868692b '
+         '8b0b094a d61f0140 91068260', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -834,7 +847,9 @@ OPTIONAL_GROUPS = [
      'ring19_wb_c0', 'ring19_wb_c1', 'ring19_wb_ck',
      'ring19_wb_mov', 'ring19_wb_ccmp', 'ring19_wb_end',
      'ring19_wc_c0', 'ring19_wc_c1', 'ring19_wc_ck',
-     'ring19_wc_mov', 'ring19_wc_ccmp', 'ring19_wc_end'),
+     'ring19_wc_mov', 'ring19_wc_ccmp', 'ring19_wc_end',
+     'obj28_ifaces', 'obj28_make', 'obj28_make_fn',
+     'obj28_destroy', 'obj28_destroy_fn', 'obj28_pick'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1320,6 +1335,12 @@ KNOWN = {
         'ring19_wc_mov': 0x700105aa6c,
         'ring19_wc_ccmp': 0x700105aa88,
         'ring19_wc_end': 0x700105abe0,
+        'obj28_ifaces': 0x70010b6c98,
+        'obj28_make': 0x70010b6cb0,
+        'obj28_make_fn': 0x7001403f38,
+        'obj28_destroy': 0x70010b6d98,
+        'obj28_destroy_fn': 0x700140402c,
+        'obj28_pick': 0x70010b71b4,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

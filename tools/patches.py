@@ -1021,6 +1021,37 @@ def _ring19_end(head_back, loop_back):  # b.ne <loop>: the core's last entry don
                 f'  /* {a:#x}: b.ne: the core\'s last entry, then the next core (per-core rings) */')
     return patch
 
+# #28's second table (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): the object f_70010b6b94 makes keeps six 16-byte
+# interfaces (+0x140) and six 0x58-byte polymorphic records (+0x1a0), one per core; f_70010b7184 picks the current
+# core's. Blocks with a slot for every core and the system core's threads': the constructor makes every slot's, the
+# destructor destroys every slot's, the pick takes the block.
+def _obj28_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core records (#28)')
+
+
+def _obj28_rest(word, what):
+    return _obj28_patch(word, lambda gen, a: '(void)0;', what + ' (every slot\'s at the first)')
+
+
+def _obj28_call(fn, site):  # bl <site's function> (the first): every slot's
+    def patch(gen, a):
+        f = gen.sites[site]
+        return _obj28_patch(None, lambda gen, a: (
+            f'extern void {fn}(Cpu *, uint64_t, uint64_t); {fn}(c, c->x[19], {f:#x}ull);'), 'bl: every slot\'s')(gen, a)
+    return patch
+
+
+def _obj28_bl_rest(gen, a):  # bl: (every slot's at the first)
+    return _obj28_patch(None, lambda gen, a: '(void)0;', 'bl: (every slot\'s at the first)')(gen, a)
+
+
+def _obj28_pick(gen, a):  # cmp w8, #5 (then the switch): the current core's record in the block, to the end
+    assert _word(gen, a + 0x24) == 0xf9400bf3  # (ldr x19, [sp, #0x10]: the switch's end)
+    return _obj28_patch(0x7100151f, lambda gen, a: (
+        '{ uint64_t b = rt_percore_block(c->x[19], 0x1a0, 0x58, 6, 1); uint32_t k = (uint32_t)c->x[8]; '
+        f'c->x[0] = b + 0x58ull * (k <= (uint32_t)rt_game_cores() ? k : 0); goto L_{a + 0x24:x}; }}'),
+        'cmp w8, #5: the current core\'s record')(gen, a)
+
 # #26 (BOTW-JOBS-NATIVE.md): a 0x58-byte string per core (sead FixedSafeString<64>: vtable, pointer to the inline
 # buffer at +0x14, capacity 0x40 at +0x10) in a function-local static at 0x7001e96c20 of f_7001594a84, indexed by the
 # core (unbounded) and made by its guarded init, unrolled for three. A block keyed by the static's address: the init
@@ -1510,6 +1541,14 @@ PATCHES = {
     'ring19_wc_c0': _ring19_c0(0xb940181b, 27, 0), 'ring19_wc_c1': _ring19_c1(0xb9401e9b, 27, 20, 4),
     'ring19_wc_ck': _ring19_next(0xb940229b, 27, 20, 4, 0x188, 8),
     'ring19_wc_mov': _ring19_mov(4), 'ring19_wc_ccmp': _ring19_ccmp(4), 'ring19_wc_end': _ring19_end(0x184, 0x168),
+    'obj28_ifaces': {0: _obj28_patch(0xa9142668, lambda gen, a: (
+                         'extern void rt_obj28_ifaces(uint64_t, uint64_t, uint64_t); '
+                         'rt_obj28_ifaces(c->x[19], c->x[8], c->x[9]);'), 'stp x8, x9, [x19, #0x140]: every slot\'s interface'),
+                     **{4 * i: _obj28_rest(0xa9142668 + (i << 16), f'stp x8, x9, [x19, #{0x140 + 0x10 * i:#x}]')
+                        for i in range(1, 6)}},
+    'obj28_make': {0: _obj28_call('rt_obj28_make', 'obj28_make_fn'), **{0xc * i: _obj28_bl_rest for i in range(1, 6)}},
+    'obj28_destroy': {0: _obj28_call('rt_obj28_destroy', 'obj28_destroy_fn'), **{8 * i: _obj28_bl_rest for i in range(1, 6)}},
+    'obj28_pick': _obj28_pick,
     'str26_init_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
                                     'add x22, x22, #0xc20: every core\'s string'),
     'str26_init_rest': _str26_rest,

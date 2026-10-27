@@ -936,6 +936,36 @@ void rt_ring19_c_rest(Cpu *c, uint64_t entries, uint64_t make) {
     }
 }
 
+// ---- #28's second table: per-core records of the object f_70010b6b94 (1.9.0) makes - a 16-byte interface per core at
+// +0x140 and a 0x58-byte polymorphic record per core at +0x1a0 (made with its interface), six of each; f_70010b7184 picks
+// the current core's (past the sixth: the first). Blocks with a slot for every core and the system core's threads'.
+#define IFACE28(obj) rt_percore_block(obj, 0x140, 0x10, 6, 1)
+#define REC28(obj) rt_percore_block(obj, 0x1a0, 0x58, 6, 1)
+
+// The constructor's interfaces (each two vtable pointers): every slot's.
+void rt_obj28_ifaces(uint64_t obj, uint64_t a, uint64_t b) {
+    uint64_t f = IFACE28(obj);
+    for (uint64_t i = 0, n = (uint64_t)rt_game_cores() + 1; i < n; i++) ST64(f + 0x10 * i, a), ST64(f + 0x10 * i + 8, b);
+}
+
+// The constructor's first record (make(record, its interface)): every slot's.
+void rt_obj28_make(Cpu *c, uint64_t obj, uint64_t make) {
+    uint64_t f = IFACE28(obj), r = REC28(obj);
+    for (uint64_t i = 0, n = (uint64_t)rt_game_cores() + 1; i < n; i++) {
+        c->x[0] = r + 0x58 * i, c->x[1] = f + 0x10 * i;
+        guest_call(c, make);
+    }
+}
+
+// The destructor's first record (the game's last): every slot's, the last first.
+void rt_obj28_destroy(Cpu *c, uint64_t obj, uint64_t destroy) {
+    uint64_t r = REC28(obj);
+    for (uint64_t i = (uint64_t)rt_game_cores() + 1; i-- > 0;) {
+        c->x[0] = r + 0x58 * i;
+        guest_call(c, destroy);
+    }
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);
