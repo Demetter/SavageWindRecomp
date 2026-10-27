@@ -549,6 +549,316 @@ void rt_rec23_ctor_end(uint64_t obj) {
     }
 }
 
+// ---- #4a: per-slot 0x70-byte candidates (slot = sead's core table entry of the core) at +0xe00 of the #5 object -
+// +0x5a0 of its part at +0x860, which makes them (f_7000c31f04 1.9.0) and releases them (f_7000c2ae3c): a string, a
+// priority (+0x58) and a handle (+0x60). Jobs offer a candidate to their slot (kept when its priority is higher), once
+// a frame the best is copied to +0xd90 and every slot reset. The game's code does this for three; these for every slot.
+#define REC4A(obj) rt_percore_block(obj, 0xe00, 0x70, 3, 0)
+
+// At the call for slot 2 (the record's constructor, its reset, its handle's release at +0x60): that call for slot 2 and
+// every further slot (down: from the last).
+void rt_rec4a_rest(Cpu *c, uint64_t obj, uint64_t fn, uint32_t at, int down) {
+    uint64_t b = REC4A(obj), n = (uint64_t)rt_game_cores();
+    for (uint64_t j = 2; j < n; j++) {
+        c->x[0] = b + 0x70 * (down ? n + 1 - j : j) + at;
+        guest_call(c, fn);
+    }
+}
+
+// f_7000c2d894 (1.9.0): the slot with the highest priority (the first of equals) copied to +0xd90, every slot reset.
+void rt_rec4a_pick(Cpu *c, uint64_t copy, uint64_t reset) {
+    uint64_t obj = c->x[0], b = REC4A(obj);
+    uint64_t n = (uint64_t)rt_game_cores(), best = 0;
+    int32_t top = (int32_t)LD32(b + 0x58);
+    for (uint64_t i = 1; i < n; i++) {
+        int32_t p = (int32_t)LD32(b + 0x70 * i + 0x58);
+        if (top < p) top = p, best = i;
+    }
+    c->x[0] = obj + 0xd90, c->x[1] = b + 0x70 * best;
+    guest_call(c, copy);
+    for (uint64_t i = 0; i < n; i++) {
+        c->x[0] = b + 0x70 * i;
+        guest_call(c, reset);
+    }
+}
+
+// ---- #4b: per-slot candidate lists (slot = sead's core table entry of the core) of the object f_70010d4924 (1.9.0)
+// makes: eight 0x50-byte lists per slot at +0x28 (one per kind; count, capacity 8, pointer to its own buffer at +0x10),
+// one list per slot at +0xa28 (A) and at +0xb18 (B). Jobs add their candidates to their slot's lists (f_70010d5534);
+// once a frame (f_70010d61d4) the eight merged lists at +0x7a8 are picked from every slot's (best priority, +0x14 of an
+// item), dead candidates dropped, the lists cleared. The game's code for this is unrolled for three slots; these are
+// the same over every slot.
+#define L4B_R(obj) rt_percore_block(obj, 0x28, 0x280, 3, 0)
+#define L4B_A(obj) rt_percore_block(obj, 0xa28, 0x50, 3, 0)
+#define L4B_B(obj) rt_percore_block(obj, 0xb18, 0x50, 3, 0)
+
+static uint64_t l4b_at(uint64_t l, uint32_t i) { return LD64(LD64(l + 8) + 8ull * i); }
+
+// The index of item in the list, or -1.
+static int64_t l4b_find(uint64_t l, uint64_t item) {
+    for (int32_t i = 0, n = (int32_t)LD32(l); i < n; i++)
+        if (l4b_at(l, (uint32_t)i) == item) return i;
+    return -1;
+}
+
+// f_7000e8cc5c (1.9.0) for one entry: the entry at i out, the rest moved down.
+static void l4b_erase(uint64_t l, uint32_t i) {
+    int32_t n = (int32_t)LD32(l), end = (int32_t)i + 1;
+    if (n < end) return;
+    if (n > end) {
+        uint64_t p = LD64(l + 8);
+        memmove((void *)(uintptr_t)(p + 8ull * i), (const void *)(uintptr_t)(p + 8ull * (uint32_t)end), 8ull * (uint32_t)(n - end));
+    }
+    ST32(l, (uint32_t)(n - 1));
+}
+
+// An item's kind (0..7: its list) and type, through its descriptor (f_70010d389c / f_70010d38ac).
+static uint32_t l4b_kind(uint64_t item) { return LD32(LD64(LD64(item + 8) + 0xa0) + 0x2b0); }
+static uint32_t l4b_type(uint64_t item) { return LD32(LD64(LD64(item + 8) + 0xa0) + 0x2b4); }
+
+static float l4b_prio(uint64_t item) {
+    union { float f; uint32_t u; } v;
+    v.u = LD32(item + 0x14);
+    return v.f;
+}
+
+static void l4b_init(uint64_t l) {  // (memset, then f_7000e8cb64(l, 8, l + 0x10))
+    for (uint32_t o = 0; o < 0x50; o += 8) ST64(l + o, 0);
+    ST64(l + 8, l + 0x10), ST32(l, 0), ST32(l + 4, 8);
+}
+
+// The constructor's end (its last store): every slot's lists made in the blocks.
+void rt_rec4b_ctor(uint64_t obj) {
+    uint64_t r = L4B_R(obj), a = L4B_A(obj), b = L4B_B(obj);
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        for (uint64_t k = 0; k < 8; k++) l4b_init(r + 0x280 * s + 0x50 * k);
+        l4b_init(a + 0x50 * s), l4b_init(b + 0x50 * s);
+    }
+}
+
+// f_70010d5fe8 (1.9.0): every list emptied (every slot's, the merged ones), the current pick and the state cleared.
+void rt_rec4b_reset(Cpu *c) {
+    uint64_t obj = c->x[0], r = L4B_R(obj), a = L4B_A(obj), b = L4B_B(obj);
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        for (uint64_t k = 0; k < 8; k++) ST32(r + 0x280 * s + 0x50 * k, 0);
+        ST32(a + 0x50 * s, 0), ST32(b + 0x50 * s, 0);
+    }
+    for (uint64_t k = 0; k < 8; k++) ST32(obj + 0x7a8 + 0x50 * k, 0);
+    ST64(obj + 0xc08, 0), ST64(obj + 0xc40, 0), ST16(obj + 0xe20, 0);
+}
+
+// The per-frame update's clearing of every slot's lists (the kinds' and A's; f_70010d61d4 1.9.0, two places).
+void rt_rec4b_clear(uint64_t obj) {
+    uint64_t r = L4B_R(obj), a = L4B_A(obj);
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        for (uint64_t k = 0; k < 8; k++) ST32(r + 0x280 * s + 0x50 * k, 0);
+        ST32(a + 0x50 * s, 0);
+    }
+}
+
+// Does any slot have a candidate of kind 1? (f_70010d61d4: its three counts read one after another)
+int rt_rec4b_any1(uint64_t obj) {
+    uint64_t r = L4B_R(obj);
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++)
+        if (LD32(r + 0x280 * s + 0x50)) return 1;
+    return 0;
+}
+
+// Does any slot's kind-1 list hold a candidate other than `cur`? (f_70010d61d4: three unrolled scans)
+int rt_rec4b_other1(uint64_t obj, uint64_t cur) {
+    uint64_t r = L4B_R(obj);
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        uint64_t l = r + 0x280 * s + 0x50;
+        for (int32_t i = 0, m = (int32_t)LD32(l); i < m; i++)
+            if (l4b_at(l, (uint32_t)i) != cur) return 1;
+    }
+    return 0;
+}
+
+// f_70010d61d4's loop over the merged kind-1 list (+0x7f8), from its end: a candidate no slot's A list holds is dropped.
+void rt_rec4b_keep_a(uint64_t obj, uint64_t count) {
+    uint64_t a = L4B_A(obj), m = obj + 0x7f8;
+    int n = rt_game_cores();
+    for (uint64_t i = count; i-- > 0;) {
+        uint64_t item = i < LD32(m) ? l4b_at(m, (uint32_t)i) : 0;
+        int held = 0;
+        for (int s = 0; s < n && !held; s++) held = l4b_find(a + 0x50ull * (uint64_t)s, item) >= 0;
+        if (!held) l4b_erase(m, (uint32_t)i);
+    }
+}
+
+// f_70010d58c4 (1.9.0): the candidate out of every slot's list of its kind (every time it is there).
+void rt_rec4b_remove(Cpu *c) {
+    uint64_t obj = c->x[0], item = c->x[1], r = L4B_R(obj);
+    uint32_t k = l4b_kind(item);
+    k = k < 8 ? k : 0;
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        uint64_t l = r + 0x280 * s + 0x50ull * k;
+        for (int64_t i; (i = l4b_find(l, item)) >= 0;) l4b_erase(l, (uint32_t)i);
+    }
+}
+
+// f_70010d5b68 / f_70010d5c40 (1.9.0): the candidate out of every slot's A (B) list (its first place in each).
+static void remove_first(uint64_t base, uint64_t item) {
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        int64_t i = l4b_find(base + 0x50 * s, item);
+        if (i >= 0) l4b_erase(base + 0x50 * s, (uint32_t)i);
+    }
+}
+void rt_rec4b_remove_a(Cpu *c) { remove_first(L4B_A(c->x[0]), c->x[1]); }
+void rt_rec4b_remove_b(Cpu *c) { remove_first(L4B_B(c->x[0]), c->x[1]); }
+
+// A candidate whose owner (its first field) is gone, dying (+0x64 == 3) or flagged (+0x78 bit 0), or which is itself
+// flagged (+0x61).
+static int l4b_dead(uint64_t item) {
+    uint64_t o = LD64(item);
+    return !o || LD8(o + 0x64) == 3 || (LD32(o + 0x78) & 1) || LD8(item + 0x61);
+}
+
+static void l4b_sweep(uint64_t l) {
+    int32_t n = (int32_t)LD32(l);
+    for (int32_t i = n - 1; i >= 0; i--)
+        if (l4b_dead(l4b_at(l, (uint32_t)i))) l4b_erase(l, (uint32_t)i);
+}
+
+// f_70010d6a24 (1.9.0): dead candidates out of every slot's lists; a dead one in a merged list out of everything
+// (f_70010d5d18).
+void rt_rec4b_sweep(Cpu *c, uint64_t drop) {
+    uint64_t obj = c->x[0], r = L4B_R(obj), a = L4B_A(obj), b = L4B_B(obj);
+    uint64_t n = (uint64_t)rt_game_cores();
+    for (uint64_t s = 0; s < n; s++)
+        for (uint64_t k = 0; k < 8; k++) l4b_sweep(r + 0x280 * s + 0x50 * k);
+    for (uint64_t s = 0; s < n; s++) l4b_sweep(a + 0x50 * s);
+    for (uint64_t s = 0; s < n; s++) l4b_sweep(b + 0x50 * s);
+    for (uint64_t k = 0; k < 8; k++) {
+        uint64_t m = obj + 0x7a8 + 0x50 * k;
+        for (int32_t i = (int32_t)LD32(m) - 1; i >= 0; i--) {
+            if (!l4b_dead(l4b_at(m, (uint32_t)i))) continue;
+            c->x[0] = obj, c->x[1] = (uint32_t)i < LD32(m) ? l4b_at(m, (uint32_t)i) : 0;
+            guest_call(c, drop);
+        }
+    }
+}
+
+// The first candidate of a list not already in the merged list m: the ones before it dropped (f_70010d6f60 /
+// f_70010d7930 1.9.0). 0: none left.
+static uint64_t l4b_front(uint64_t l, uint64_t m) {
+    while (LD32(l)) {
+        uint64_t item = l4b_at(l, 0);
+        if (l4b_find(m, item) < 0) return item;
+        l4b_erase(l, 0);
+    }
+    return 0;
+}
+
+// f_70010d6f60 (1.9.0): the next candidate of a kind - of the slots' first ones not merged yet, the best priority (ties:
+// the first slot's, unless a later one is `cur`) - taken out of its slot's list. 0: none.
+void rt_rec4b_pick(Cpu *c) {
+    uint64_t obj = c->x[0], cur = c->x[2], r = L4B_R(obj);
+    uint32_t k = (uint32_t)c->x[1];
+    uint64_t m = obj + 0x7a8 + 0x50ull * k;
+    float best = -1.0f;
+    int64_t slot = -1;
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        uint64_t item = l4b_front(r + 0x280 * s + 0x50ull * k, m);
+        if (!item) continue;
+        float p = l4b_prio(item);
+        if (!(p < best) && (p != best || item == cur)) best = p, slot = (int64_t)s;
+    }
+    uint64_t l = r + 0x280 * (uint64_t)slot + 0x50ull * k, item = 0;
+    if (slot >= 0 && (int32_t)LD32(l) >= 1) item = l4b_at(l, 0), l4b_erase(l, 0);
+    c->x[0] = item;
+}
+
+// f_70010d7930 (1.9.0): the same over every slot's B list (against the merged kind-1 list; ties: the first slot's).
+void rt_rec4b_pick_b(Cpu *c) {
+    uint64_t obj = c->x[0], b = L4B_B(obj), m = obj + 0x7f8;
+    float best = -1.0f;
+    int64_t slot = -1;
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        uint64_t item = l4b_front(b + 0x50 * s, m);
+        if (item && l4b_prio(item) > best) best = l4b_prio(item), slot = (int64_t)s;
+    }
+    uint64_t l = b + 0x50 * (uint64_t)slot, item = 0;
+    if (slot >= 0 && (int32_t)LD32(l) >= 1) item = l4b_at(l, 0), l4b_erase(l, 0);
+    c->x[0] = item;
+}
+
+// f_70010d71ec (1.9.0): each slot's B list made from its kind-1 list (its first eight, as far as B has room).
+void rt_rec4b_fill_b(Cpu *c) {
+    uint64_t obj = c->x[0], r = L4B_R(obj), b = L4B_B(obj);
+    uint64_t n = (uint64_t)rt_game_cores();
+    for (uint64_t s = 0; s < n; s++) ST32(b + 0x50 * s, 0);
+    for (uint64_t s = 0; s < n; s++) {
+        uint64_t src = r + 0x280 * s + 0x50, dst = b + 0x50 * s;
+        int32_t m = (int32_t)LD32(src) < 8 ? (int32_t)LD32(src) : 8;
+        for (int32_t i = 0; i < m; i++) {
+            int32_t cnt = (int32_t)LD32(dst);
+            if (cnt >= (int32_t)LD32(dst + 4)) continue;
+            ST64(LD64(dst + 8) + 8ull * (uint32_t)cnt, l4b_at(src, (uint32_t)i));
+            ST32(dst, (uint32_t)(cnt + 1));
+        }
+    }
+}
+
+// f_70010d7374 (1.9.0): when a kind-0 candidate of the types 0x1800006..8 or 0x180000a has an owner the object's
+// filter (+0xc28) takes, every such candidate the filter doesn't take is dropped from every slot's kind-0 list.
+static int l4b_filtered(uint32_t type) {
+    uint32_t t = type - 0x1800006u;
+    return t <= 4 && t != 3;
+}
+static int l4b_takes(Cpu *c, uint64_t obj, uint64_t item) {
+    uint64_t f = LD64(obj + 0xc28);
+    if (!f) return 0;
+    c->x[0] = LD64(item);
+    guest_call(c, f);
+    return c->x[0] & 1;
+}
+void rt_rec4b_filter(Cpu *c) {
+    uint64_t obj = c->x[0], r = L4B_R(obj);
+    uint64_t n = (uint64_t)rt_game_cores();
+    int any = 0;
+    for (uint64_t s = 0; s < n && !any; s++) {
+        uint64_t l = r + 0x280 * s, p = LD64(l + 8);
+        for (int32_t i = 0, m = (int32_t)LD32(l); i < m && !any; i++) {
+            uint64_t item = LD64(p + 8ull * (uint32_t)i);
+            any = l4b_filtered(l4b_type(item)) && l4b_takes(c, obj, item);
+        }
+    }
+    if (!any) return;
+    for (uint64_t s = 0; s < n; s++) {
+        uint64_t l = r + 0x280 * s;
+        for (int32_t i = (int32_t)LD32(l) - 1; i >= 0; i--) {
+            uint64_t item = (uint32_t)i < LD32(l) ? l4b_at(l, (uint32_t)i) : 0;
+            if (l4b_filtered(l4b_type(item)) && !l4b_takes(c, obj, item)) l4b_erase(l, (uint32_t)i);
+        }
+    }
+}
+
+// f_70010d7610 (1.9.0): by the states (+0x10) of the kind-0 candidates: when one is 6, the 5s and 4s are dropped from
+// every slot's kind-0 list; else when one is 5, the 4s.
+static int l4b_has_state(uint64_t r, uint64_t n, uint32_t v) {
+    for (uint64_t s = 0; s < n; s++) {
+        uint64_t l = r + 0x280 * s;
+        for (int32_t i = 0, m = (int32_t)LD32(l); i < m; i++)
+            if (LD32(l4b_at(l, (uint32_t)i) + 0x10) == v) return 1;
+    }
+    return 0;
+}
+void rt_rec4b_states(Cpu *c) {
+    uint64_t obj = c->x[0], r = L4B_R(obj);
+    uint64_t n = (uint64_t)rt_game_cores();
+    int drop5 = l4b_has_state(r, n, 6);
+    if (!drop5 && !l4b_has_state(r, n, 5)) return;
+    for (uint64_t s = 0; s < n; s++) {
+        uint64_t l = r + 0x280 * s;
+        for (int32_t i = (int32_t)LD32(l) - 1; i >= 0; i--) {
+            uint32_t v = LD32(l4b_at(l, (uint32_t)i) + 0x10);
+            if (v == 4 || (drop5 && v == 5)) l4b_erase(l, (uint32_t)i);
+        }
+    }
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);

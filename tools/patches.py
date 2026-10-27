@@ -811,6 +811,101 @@ def _rec23_none(word, what):
     return _rec23_patch(word, lambda gen, a: '(void)0;', what + ': (every sub-entry at the first)')
 
 
+# #4 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): arrays indexed by the slot of sead's core table (< 3), in blocks with
+# a slot for every core. #4a: the 0x70-byte candidate records at +0xe00 of the #5 object - the constructor resets every
+# slot's, the offer takes the block and bounds the slot, the per-frame pick (the best of every slot's) is the
+# runtime's. #4b: the candidate lists of the object f_70010d4924 (1.9.0) makes - eight per slot at +0x28, one per slot
+# at +0xa28 and at +0xb18: the constructor's end makes every slot's, the add takes the blocks and bounds the slot, the
+# functions over the slots (unrolled for three) are the runtime's, and the per-frame update's clearings, checks and
+# scans go over every slot.
+def _rec4_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-slot candidates')
+
+
+def _rec4a_ctor(word, slot):  # add x0, x19, #(0xe00 + 0x70 * slot): the slot's record in the block
+    return _rec4_patch(word, lambda gen, a: f'c->x[0] = rt_percore_block(c->x[19], 0xe00, 0x70, 3, 0) + {0x70 * slot:#x};',
+                       f'add x0, x19, #{0xe00 + 0x70 * slot:#x}: slot {slot}\'s record')
+
+
+def _rec4a_rest(fn_site, obj, at, down, what):  # bl <fn> (slot 2's): slot 2's and every further slot's
+    def patch(gen, a):
+        fn = gen.sites[fn_site]
+        return _rec4_patch(None, lambda gen, a: (
+            'extern void rt_rec4a_rest(Cpu *, uint64_t, uint64_t, uint32_t, int); '
+            f'rt_rec4a_rest(c, {obj}, {fn:#x}ull, {at:#x}, {down});'), f'bl: {what}, slot 2\'s and every further slot\'s')(gen, a)
+    return patch
+
+
+_REC4A_PART = 'rt_percore_block(c->x[19] - 0x860, 0xe00, 0x70, 3, 0)'  # (from the part at +0x860: x19)
+
+
+def _rec4a_part(word, dst, add, what):  # add x<dst>, x19, #(0x5a0 + ...): a slot's record from the part
+    return _rec4_patch(word, lambda gen, a: f'c->x[{dst}] = {_REC4A_PART} + {add:#x};', what)
+
+
+def _rec4a_pick(gen, a):  # f_7000c2d894 (1.9.0): the best of every slot's records copied, every slot's reset
+    copy, reset = gen.sites['rec4a_copy_fn'], gen.sites['rec4a_reset_fn']
+    return _rec4_patch(0xa9bd7bfd, lambda gen, a: (
+        f'extern void rt_rec4a_pick(Cpu *, uint64_t, uint64_t); rt_rec4a_pick(c, {copy:#x}ull, {reset:#x}ull); return;'),
+        'stp x29, x30, [sp, #-0x30]!: the pick over every slot')(gen, a)
+
+
+def _l4b(obj, field, stride):
+    return f'rt_percore_block({obj}, {field:#x}, {stride:#x}, 3, 0)'
+
+
+def _rec4b_whole(word, fn, what, *fns):  # a function over the slots' lists: the runtime's (fns: sites it calls)
+    def patch(gen, a):
+        types, args = ''.join(', uint64_t' for _ in fns), ''.join(f', {gen.sites[s]:#x}ull' for s in fns)
+        return _rec4_patch(word, lambda gen, a: f'extern void {fn}(Cpu *{types}); {fn}(c{args}); return;', what)(gen, a)
+    return patch
+
+
+_REC4B_BOUND = _rec4_patch(0x71000f1f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[24], (uint32_t)rt_game_cores()));',
+                           'cmp w24, #3: a slot with a block entry')
+
+
+def _rec4b_none(off):  # str wzr, [x19, #off]: a slot's list count (all cleared at the first store)
+    return _rec4_patch(0xb900027f | (off >> 2) << 10, lambda gen, a: '(void)0;',
+                       f'str wzr, [x19, #{off:#x}]: (every slot\'s cleared at the first)')
+
+
+def _rec4b_clear(rest):  # the per-frame update's clearing of the slots' lists: {offset from the first store: field}
+    first = _rec4_patch(0xb9002a7f, lambda gen, a: 'extern void rt_rec4b_clear(uint64_t); rt_rec4b_clear(c->x[19]);',
+                        'str wzr, [x19, #0x28]: every slot\'s lists cleared')
+    return {0: first, **{o: _rec4b_none(off) for o, off in rest.items()}}
+
+
+_REC4B_COUNTS = [0x28 + 0x50 * j for j in range(24)] + [0xa28, 0xa78, 0xac8]  # (the kinds' lists, then A's, by slot)
+
+
+def _rec4b_any(step, loads):  # three loads of the slots' kind-1 counts, `step` apart: any slot's at the first, 0 after
+    (w0, d0), (w1, d1), (w2, d2) = loads
+    return {0: _rec4_patch(w0, lambda gen, a: (
+                'extern int rt_rec4b_any1(uint64_t); 'f'c->x[{d0}] = (uint32_t)rt_rec4b_any1(c->x[19]);'),
+                'ldr: any slot\'s kind-1 candidates'),
+            step: _rec4_patch(w1, lambda gen, a: f'c->x[{d1}] = 0;', 'ldr: (every slot\'s at the first)'),
+            2 * step: _rec4_patch(w2, lambda gen, a: f'c->x[{d2}] = 0;', 'ldr: (every slot\'s at the first)')}
+
+
+_REC4B_ANY8 = ((0xb9407a68, 8), (0xb942fa68, 8), (0xb9457a68, 8))  # (ldr w8, [x19, #0x78 / #0x2f8 / #0x578])
+
+
+def _rec4b_keep_a(gen, a):  # the loop over the merged kind-1 list: a candidate no slot's A list holds out (643c next)
+    assert _word(gen, a + 0xdc) == 0xf9460668, hex(_word(gen, a + 0xdc))  # (ldr x8, [x19, #0xc08])
+    return _rec4_patch(0xb947fa69, lambda gen, a: (
+        'extern void rt_rec4b_keep_a(uint64_t, uint64_t); rt_rec4b_keep_a(c->x[19], c->x[21]); '
+        f'c->x[21] = 0; c->x[22] = 1; c->x[8] = LD64(c->x[19] + 0xc08); goto L_{a + 0xe0:x};'),
+        'ldr w9, [x19, #0x7f8]: the loop, against every slot\'s A list')(gen, a)
+
+
+def _rec4b_other1(gen, a):  # the scans of the slots' kind-1 lists for a candidate other than x8
+    assert _word(gen, a + 0x3c) == 0xb9400288 and _word(gen, a + 0x100) == 0xaa1f03e2  # (their two ends)
+    return _rec4_patch(0x93407d6b, lambda gen, a: (
+        f'extern int rt_rec4b_other1(uint64_t, uint64_t); if (rt_rec4b_other1(c->x[19], c->x[8])) goto L_{a + 0x3c:x}; '
+        f'goto L_{a + 0x100:x};'), 'sxtw x11, w11: every slot\'s kind-1 list scanned')(gen, a)
+
+
 # #26 (BOTW-JOBS-NATIVE.md): a 0x58-byte string per core (sead FixedSafeString<64>: vtable, pointer to the inline
 # buffer at +0x14, capacity 0x40 at +0x10) in a function-local static at 0x7001e96c20 of f_7001594a84, indexed by the
 # core (unbounded) and made by its guarded init, unrolled for three. A block keyed by the static's address: the init
@@ -1176,6 +1271,15 @@ PATCHES = {
     'q27_init_2': _q27_patch(None, lambda gen, a: 'c->x[0] = 0;', 'bl: (every slot\'s made at the first)'),
     'q27_init_3': _q27_patch(None, lambda gen, a: 'c->x[0] = 0;', 'bl: (every slot\'s made at the first)'),
     'q27_ctor_tail': _q27_ctor_tail,
+    # the second append (f_700112e6d4 1.9.0, two places, without the lock): the buffers' base, the bound, the cursor
+    'q27_add2_bufs': _q27_base(0x9104a269, 9, 19, 0x128, 0x10, 'add x9, x19, #0x128: every slot\'s buffer'),
+    'q27_add2_bound': _q27_patch(0x71000ebf, lambda gen, a: (
+        '(void)(subs32(c, (uint32_t)c->x[21], (uint32_t)rt_game_cores()));'), 'cmp w21, #3: a slot with a block entry'),
+    'q27_add2_cur': _q27_cur(0x8b150a6a, 10, 19, 21),
+    'q27_add3_bufs': _q27_base(0x9104a269, 9, 19, 0x128, 0x10, 'add x9, x19, #0x128: every slot\'s buffer'),
+    'q27_add3_bound': _q27_patch(0x71000d5f, lambda gen, a: (
+        '(void)(subs32(c, (uint32_t)c->x[10], (uint32_t)rt_game_cores()));'), 'cmp w10, #3: a slot with a block entry'),
+    'q27_add3_cur': _q27_cur(0x8b0a0a6a, 10, 19, 10),
     'rec23_ctor_end': _rec23_patch(0xb908627f, lambda gen, a: (
         'extern void rt_rec23_ctor_end(uint64_t); ST32(c->x[19] + 0x860, 0); rt_rec23_ctor_end(c->x[19] - 0x28);'),
         'str wzr, [x19, #0x860]: then every core\'s records into the block (x19: this + 0x28, from the constructor\'s '
@@ -1205,6 +1309,52 @@ PATCHES = {
     'rec23_a_b3': _rec23_bound(0x71000d3f, 9), 'rec23_b_b3': _rec23_bound(0x71000d3f, 9),
     'rec23_a_b4': _rec23_bound(0x71000d3f, 9), 'rec23_b_b4': _rec23_bound(0x71000d3f, 9),
     'rec23_a_b5': _rec23_bound(0x71000d5f, 10), 'rec23_b_b5': _rec23_bound(0x71000d5f, 10),
+    'rec4a_ctor_0': _rec4a_ctor(0x91380260, 0), 'rec4a_ctor_1': _rec4a_ctor(0x9139c260, 1),
+    'rec4a_ctor_2': _rec4a_ctor(0x913b8260, 2),
+    'rec4a_ctor_rest': _rec4a_rest('rec4a_reset_fn', 'c->x[19]', 0, 0, 'the reset'),
+    'rec4a_part_base': _rec4a_part(0x91168275, 21, 0, 'add x21, x19, #0x5a0: every slot\'s record'),
+    'rec4a_part_size': _rec4_patch(0x52802a02, lambda gen, a: 'c->x[2] = 0x70ull * (uint64_t)rt_game_cores();',
+                                   'mov w2, #0x150: every slot\'s record cleared'),
+    'rec4a_part_1': _rec4a_part(0x91184260, 0, 0x70, 'add x0, x19, #0x610: slot 1\'s record'),
+    'rec4a_part_2': _rec4a_part(0x911a0260, 0, 0xe0, 'add x0, x19, #0x680: slot 2\'s record'),
+    'rec4a_part_rest': _rec4a_rest('rec4a_make_fn', 'c->x[19] - 0x860', 0, 0, 'the record\'s constructor'),
+    'rec4a_drop_rest': _rec4a_rest('rec4a_release_fn', 'c->x[19] - 0x860', 0x60, 1, 'the handle\'s release'),
+    'rec4a_drop_1': _rec4a_part(0x9119c260, 0, 0x70 + 0x60, 'add x0, x19, #0x670: slot 1\'s handle'),
+    'rec4a_drop_0': _rec4a_part(0x91180260, 0, 0x60, 'add x0, x19, #0x600: slot 0\'s handle'),
+    'rec4a_acc_base': _rec4_patch(0x91380289, lambda gen, a: 'c->x[9] = rt_percore_block(c->x[20], 0xe00, 0x70, 3, 0);',
+                                  'add x9, x20, #0xe00: every slot\'s record'),
+    'rec4a_acc_bound': _rec4_patch(0x71000d1f, lambda gen, a: (
+        '(void)(subs32(c, (uint32_t)c->x[8], (uint32_t)rt_game_cores()));'), 'cmp w8, #3: a slot with a block entry'),
+    'rec4a_pick': _rec4a_pick,
+    'rec4b_ctor_end': _rec4_patch(0xb90a027f, lambda gen, a: (
+        'extern void rt_rec4b_ctor(uint64_t); ST32(c->x[19] + 0xa00, 0); rt_rec4b_ctor(c->x[20]);'),
+        'str wzr, [x19, #0xa00]: then every slot\'s lists (x19: this + 0xc8, x20: this)'),
+    'rec4b_acc_base': _rec4_patch(0x9100a288, lambda gen, a: f'c->x[8] = {_l4b("c->x[20]", 0x28, 0x280)};',
+                                  'add x8, x20, #0x28: every slot\'s lists'),
+    'rec4b_acc_bound': _REC4B_BOUND,
+    'rec4b_acc_a_base': _rec4_patch(0x9128a288, lambda gen, a: f'c->x[8] = {_l4b("c->x[20]", 0xa28, 0x50)};',
+                                    'add x8, x20, #0xa28: every slot\'s A list'),
+    'rec4b_acc_a_bound': _REC4B_BOUND,
+    'rec4b_reset': _rec4b_whole(0xb900281f, 'rt_rec4b_reset', 'str wzr, [x0, #0x28]: every list emptied'),
+    'rec4b_remove': _rec4b_whole(0xd103c3ff, 'rt_rec4b_remove', 'sub sp, sp, #0xf0: out of every slot\'s lists'),
+    'rec4b_remove_a': _rec4b_whole(0xa9be7bfd, 'rt_rec4b_remove_a', 'stp x29, x30, [sp, #-0x20]!: out of every A list'),
+    'rec4b_remove_b': _rec4b_whole(0xa9be7bfd, 'rt_rec4b_remove_b', 'stp x29, x30, [sp, #-0x20]!: out of every B list'),
+    'rec4b_sweep': _rec4b_whole(0xa9bb7bfd, 'rt_rec4b_sweep', 'stp x29, x30, [sp, #-0x50]!: every slot\'s lists swept',
+                                'rec4b_drop_fn'),
+    'rec4b_pick': _rec4b_whole(0xfc1b0fe8, 'rt_rec4b_pick', 'str d8, [sp, #-0x50]!: the pick over every slot'),
+    'rec4b_fill_b': _rec4b_whole(0xd101c3ff, 'rt_rec4b_fill_b', 'sub sp, sp, #0x70: every slot\'s B list'),
+    'rec4b_filter': _rec4b_whole(0xa9bc7bfd, 'rt_rec4b_filter', 'stp x29, x30, [sp, #-0x40]!: every slot\'s kind 0'),
+    'rec4b_states': _rec4b_whole(0xd10103ff, 'rt_rec4b_states', 'sub sp, sp, #0x40: every slot\'s kind 0'),
+    'rec4b_pick_b': _rec4b_whole(0xfc1c0fe8, 'rt_rec4b_pick_b', 'str d8, [sp, #-0x40]!: the pick over every B list'),
+    'rec4b_upd_clear1': _rec4b_clear({4 * j: off for j, off in enumerate(_REC4B_COUNTS) if j}),
+    'rec4b_upd_clear2': _rec4b_clear(dict(zip([4, 8, 0x14, 0x18, 0x20, 0x28, 0x2c] + list(range(0x30, 0x70, 4)) +
+                                              [0x70, 0x74, 0x7c], _REC4B_COUNTS[1:]))),
+    'rec4b_upd_any_a': _rec4b_any(8, _REC4B_ANY8),
+    'rec4b_upd_any_b': _rec4b_any(4, ((0xb9807a6a, 10), (0xb942fa6b, 11), (0xb9457a6c, 12))),
+    'rec4b_upd_any_c': _rec4b_any(8, _REC4B_ANY8),
+    'rec4b_upd_any_d': _rec4b_any(8, _REC4B_ANY8),
+    'rec4b_upd_keep_a': _rec4b_keep_a,
+    'rec4b_upd_other1': _rec4b_other1,
     'str26_init_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
                                     'add x22, x22, #0xc20: every core\'s string'),
     'str26_init_rest': _str26_rest,
@@ -1241,5 +1391,9 @@ PATCHES = {
 
 def table(sites):
     """address -> patch, for the main module whose sites these are (tools/game_sites.py; an optional site it lacks
-    has no patch)"""
-    return {sites[name]: fn for name, fn in PATCHES.items() if name in sites}
+    has no patch). A patch given as a dict is several instructions of one site: {offset from it: patch}."""
+    out = {}
+    for name, fn in PATCHES.items():
+        if name in sites:
+            out.update({sites[name] + o: f for o, f in fn.items()} if isinstance(fn, dict) else {sites[name]: fn})
+    return out
