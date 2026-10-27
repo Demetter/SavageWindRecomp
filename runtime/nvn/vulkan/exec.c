@@ -687,11 +687,22 @@ void renderer_wait_seq(uint64_t seq) {
     bool overlap = gpu_overlap();
     if (!overlap) deferred_seq = 0;  // (switched off mid-run: this wait covers the deferred one)
     if (overlap && oneshot_seq && oneshot_seq <= seq && oneshot_seq > vk_completed_seq()) {
-        deferred_seq = 0;  // (a one-off readback in what this waits for: everything up to it, now)
+        // A one-off readback in what this waits for: its own submission now (the CPU reads this frame's pixels), and
+        // the deferred fence; this one stays deferred, so the rest of the frame stays queued. Waiting for everything
+        // up to this fence drained the GPU: ~5 ms hitches, 1 frame in 20 at Hyrule Castle (27 Oct), where BOTW reads
+        // ~20 small targets back every 20-200 frames, each a "one-off" here. SAVAGEWIND_ONESHOT_FULL=1: that full wait.
+        static int full = -1;
+        if (full < 0) full = getenv("SAVAGEWIND_ONESHOT_FULL") != NULL;
+        uint64_t prev = deferred_seq, need = full ? seq : oneshot_seq > prev ? oneshot_seq : prev;
+        deferred_seq = need >= seq ? 0 : seq;
         pthread_mutex_unlock(&seq_lock);
         static int nlog;
-        if (nlog < 20) { nlog++; LOG("[vk] GPU overlap: a one-off readback, wait on submission %llu not deferred\n", (unsigned long long)seq); }
-        vk_wait_seq(seq);
+        if (nlog < 20) {
+            nlog++;
+            LOG("[vk] GPU overlap: a one-off readback in submission %llu, waited for %llu of %llu\n",
+                (unsigned long long)oneshot_seq, (unsigned long long)need, (unsigned long long)seq);
+        }
+        vk_wait_seq(need);
         return;
     }
     if (overlap) {
@@ -1739,6 +1750,12 @@ static void readback_schedule(VkCommandBuffer cb, NvnTexture *t, const NvnTextur
         int k = 0;
         while (k < 63 && last[k].addr && last[k].addr != r->addr) k++;
         bool streaming = last[k].addr == r->addr && last[k].frame + 16 >= fr;
+        static int log_oneshot = -1;
+        if (log_oneshot < 0) log_oneshot = getenv("SAVAGEWIND_LOG_ONESHOT") != NULL;
+        if (log_oneshot && !streaming)
+            LOG("[oneshot] frame %llu: %ux%u format %#x at %llx, %s %llu frames\n", (unsigned long long)fr, w, h, t->format,
+                (unsigned long long)r->addr, last[k].addr == r->addr ? "last read" : "first, slot",
+                last[k].addr == r->addr ? (unsigned long long)(fr - last[k].frame) : (unsigned long long)k);
         last[k].addr = r->addr;
         last[k].frame = fr;
         if (!streaming) {

@@ -441,6 +441,9 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (c->x[30] == 0x7000e94a98ull) gcp_fence(false, 0);
     uint64_t probe_start = timing ? plat_now_ns() : 0;
     uint64_t probe_frame = vk_frame_trace_on ? renderer_present_count() : 0;
+    // (SAVAGEWIND_SYNC_PROBE: where the queue and the GPU were when the wait began)
+    uint64_t probe_qdone = probe ? g_q_done : 0, probe_qput = probe ? g_q_put : 0;
+    uint64_t probe_submitted = probe ? renderer_fence_seq() : 0, probe_completed = probe ? vk_completed_seq() : 0;
     static int flush = -1;
     static uint64_t n;
     if (flush < 0) flush = getenv("SAVAGEWIND_SYNC_FLUSH") ? 1 : 0;
@@ -496,11 +499,15 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             vk_frame_trace_event("Fence: reacquire guest core", 8, probe_frame, s->seq, probe_gpu_end, end, 0, c->x[30]);
         }
         static __thread unsigned sampled;
-        if (probe && end - probe_start >= 250000 && (++sampled % 60 == 1))
-            TRACE_LOG("[sync-probe] lr %llx sync %llx seq %llu in_list %d queue %.3f release %.3f gpu %.3f core %.3f ms\n",
-                (unsigned long long)c->x[30], (unsigned long long)A(0), (unsigned long long)s->seq, s->in_list,
+        if (probe && end - probe_start >= 250000 && (end - probe_start >= 2000000 || ++sampled % 60 == 1))
+            TRACE_LOG("[sync-probe] %.3f lr %llx sync %llx seq %llu ticket %llu in_list %d queue %.3f release %.3f gpu %.3f "
+                "core %.3f ms; at start queue %llu/%llu ops, seq submitted %llu done %llu, frame %llu\n", end / 1e6,
+                (unsigned long long)c->x[30], (unsigned long long)A(0), (unsigned long long)s->seq,
+                (unsigned long long)s->ticket, s->in_list,
                 (probe_queued - probe_start) / 1e6, (probe_gpu_start - probe_queued) / 1e6,
-                (probe_gpu_end - probe_gpu_start) / 1e6, (end - probe_gpu_end) / 1e6);
+                (probe_gpu_end - probe_gpu_start) / 1e6, (end - probe_gpu_end) / 1e6, (unsigned long long)probe_qdone,
+                (unsigned long long)probe_qput, (unsigned long long)probe_submitted, (unsigned long long)probe_completed,
+                (unsigned long long)renderer_present_count());
     }
     if (frame_split() && s->ticket) g_fs_sync1 = plat_now_ns();
     TL("syncwait done");
