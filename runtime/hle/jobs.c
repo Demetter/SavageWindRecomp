@@ -49,6 +49,7 @@ typedef struct {
     uint32_t open;  // kicked and not yet closed by run-and-wait
     uint32_t gen;   // rounds closed
     uint32_t busy;  // workers walking the round list
+    uint32_t fan;   // the seq a woken worker last passed the wake-up on for (wake_workers)
     uint8_t started[32];  // worker i's thread is in the native loop
 } Pool;
 static Pool g_pools[8];
@@ -269,6 +270,29 @@ static void bump(uint32_t *w) {
     plat_wake_u32_all(w);
 }
 
+// The workers' wake-up for new work (a round opens, a group joins one): the thread that has it - the main thread, on
+// the frame's critical path - wakes one sleeping worker, and the first worker up wakes the rest (fan_out), so the
+// operating system's wake calls (one per sleeping thread on Windows: NtAlertThreadByThreadId) run on a worker in
+// parallel with the work instead of one after another on the main thread (~3% of its time at N = 6, 720p).
+// SAVAGEWIND_JOBS_WAKE_ALL=1: every worker from the waking thread, as before; PERFX bit 32768 A/Bs it.
+static int g_wake_all = -1;
+static bool wake_fan(void) {
+    if (g_wake_all < 0) g_wake_all = getenv("SAVAGEWIND_JOBS_WAKE_ALL") && atoi(getenv("SAVAGEWIND_JOBS_WAKE_ALL"));
+    if (g_wake_all) return false;
+    extern uint32_t g_perfx_mask;
+    extern uint32_t perfx_now(void);
+    return !(g_perfx_mask & 32768) || (perfx_now() & 32768);
+}
+static void wake_workers(Pool *p) {
+    __atomic_add_fetch(&p->seq, 1, __ATOMIC_RELEASE);
+    if (wake_fan()) plat_wake_u32_one(&p->seq); else plat_wake_u32_all(&p->seq);
+}
+static void fan_out(Pool *p, uint32_t s) {  // (a worker woken for seq s) the other sleepers, once for s
+    uint32_t f = __atomic_load_n(&p->fan, __ATOMIC_ACQUIRE);
+    if (f != s && __atomic_compare_exchange_n(&p->fan, &f, s, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        plat_wake_u32_all(&p->seq);
+}
+
 // Waits until *w != v: spins first, then the OS's address wait, in slices so a reboot doesn't wait it out. A thread
 // that holds an emulated core (the main thread) lets it go while it blocks.
 static void wait_change(const uint32_t *w, uint32_t v, bool core_held) {
@@ -470,9 +494,10 @@ static void run_end(uint64_t w) {
 // it opens and taking groups that join it; between rounds it waits on the pool's word.
 static void worker_loop(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t i) {
     kernel_thread_off_cores();
-    uint32_t gen = UINT32_MAX, k = 0;
+    uint32_t gen = UINT32_MAX, k = 0, gen_seen = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
     while (!g_rt_unwind) {
         uint32_t s = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
+        if (s != gen_seen) gen_seen = s, fan_out(p, s);  // (new work: the workers still asleep up too)
         help(c);  // (tasks a job forked: rt_jobs_fork_join)
         if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) {
             __atomic_add_fetch(&p->busy, 1, __ATOMIC_SEQ_CST);
@@ -511,7 +536,7 @@ int rt_jobs_push(Cpu *c, const uint64_t *fns) {
     uint32_t n = LD32(pool + POOL_LIST_N), cap = LD32(pool + POOL_LIST_CAP);
     ST64(LD64(pool + POOL_LIST) + 8ull * (n < cap ? n : 0), g);
     __atomic_store_n(P32(pool + POOL_LIST_N), n + 1, __ATOMIC_RELEASE);
-    if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) bump(&p->seq), bump(&p->evt);
+    if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) wake_workers(p), bump(&p->evt);
     return 1;
 }
 
@@ -532,7 +557,7 @@ static void open_round(Cpu *c, Pool *p) {
     }
     if (g_stats || g_tr_mask || g_rev) g_st_kick = plat_now_ns();
     __atomic_store_n(&p->open, 1, __ATOMIC_SEQ_CST);
-    bump(&p->seq);
+    wake_workers(p);
 }
 
 // f_7000f93f78 kick(pool)
