@@ -227,6 +227,7 @@ float rt_gui_speed(float game) {
 
 static void clock_probe(uint64_t vfr);
 static void log_screens(void);
+static void player_dump(uint64_t vfr);
 
 void rt_vfr_update(uint64_t vfr) {
     extern bool nvn_timeline(void);
@@ -235,6 +236,7 @@ void rt_vfr_update(uint64_t vfr) {
     g_fs_vfr = plat_now_ns();
     clock_probe(vfr);
     log_screens();
+    player_dump(vfr);
     extern void input_cam_frame(float ratio);  // runtime/hle/input.c: the mouse's motion in the frame, for the cameras
     if (!framepace_on()) {
         input_cam_frame(VF(float, vfr, VFR_RATIO));
@@ -371,6 +373,65 @@ static void clock_probe(uint64_t vfr) {
     LOG("[clock] t %.3f frames %llu game %.2f tod %.4f pos %.3f %.3f %.3f stamina %.1f fps %d at %.3f\n",
         (now - t0) / 1e9, (unsigned long long)frames, game, tod, pos[0], pos[1], pos[2], stamina, framepace_target(),
         now / 1e9);
+}
+
+// (research) SAVAGEWIND_DUMP_PLAYER=<bytes>: each game update, the player actor's first <bytes> (PlayerInfo +0x60,
+// zeldaret's mPlayerActor) -> build/player.bin: records of u64 ns, f32 ratio, u32 interval, u64 actor, then the bytes
+static void player_dump(uint64_t vfr) {
+    static int bytes = -1;
+    static FILE *f;
+    if (bytes < 0) {
+        bytes = env_int("SAVAGEWIND_DUMP_PLAYER", 0);
+        if (bytes > 0) f = fopen("build/player.bin", "wb");
+    }
+    {   // (research) SAVAGEWIND_WATCH_PLAYER=<offset hex>: from 30 s on, the instructions that write the player actor's 4
+        // bytes at that offset (runtime/sampler.c), reported every 10 s
+        static long off = -2;
+        static uint64_t t0, last;
+        if (off == -2) { const char *e = getenv("SAVAGEWIND_WATCH_PLAYER"); off = e ? strtol(e, NULL, 16) : -1; }
+        uint64_t pinfo = *(uint64_t *)(uintptr_t)g_site.player_info, now = plat_now_ns();
+        uint64_t actor = pinfo ? VF(uint64_t, pinfo, 0x60) : 0;
+#ifdef _WIN32
+        if (off >= 0 && actor >= 0x7000000000ull) {
+            extern void sampler_watch_write(uint64_t addr), sampler_watch_report(void);
+            if (!t0) t0 = now;
+            if (now - t0 > (uint64_t)env_int("SAVAGEWIND_WATCH_AFTER_MS", 30000) * 1000000ull)
+                sampler_watch_write(actor + (uint64_t)off);
+            if (now - last > 10000000000ull) last = now, sampler_watch_report();
+        }
+#endif
+    }
+    {   // (research) SAVAGEWIND_LOG_VFR=<n>: every n updates, VFR's ratio, interval, core 0's delta frame (+0x98), the four
+        // per-core deltas (+0x108: pointers) and the cold timer's step since the last update (player actor +0x268c)
+        static int every = -1;
+        static uint64_t n;
+        static float last_timer;
+        if (every < 0) every = env_int("SAVAGEWIND_LOG_VFR", 0);
+        uint64_t pinfo = *(uint64_t *)(uintptr_t)g_site.player_info;
+        uint64_t actor = pinfo ? VF(uint64_t, pinfo, 0x60) : 0;
+        float timer = actor >= 0x7000000000ull ? VF(float, actor, 0x268c) : 0;
+        if (every > 0 && n++ % (uint64_t)every == 0) {
+            float core[4];
+            for (int i = 0; i < 4; i++) {
+                uint64_t p = VF(uint64_t, vfr, 0x108 + 8 * i);
+                core[i] = p >= 0x7000000000ull ? *(float *)(uintptr_t)p : -1;
+            }
+            LOG("[vfr] ratio %.4f interval %u delta0 %.4f cores %.4f %.4f %.4f %.4f; cold timer %.4f step %.5f life %d y %.3f\n",
+                VF(float, vfr, VFR_RATIO), VF(uint32_t, vfr, VFR_INTERVAL), VF(float, vfr, 0x98), core[0], core[1],
+                core[2], core[3], timer, timer - last_timer, actor >= 0x7000000000ull ? VF(int32_t, actor, 0x848) : -1,
+                pinfo ? VF(float, pinfo, 0x8c) : 0);
+        }
+        last_timer = timer;
+    }
+    if (bytes <= 0 || !f) return;
+    uint64_t pinfo = *(uint64_t *)(uintptr_t)g_site.player_info;
+    uint64_t actor = pinfo ? VF(uint64_t, pinfo, 0x60) : 0;
+    if (actor < 0x7000000000ull || actor + (uint64_t)bytes > 0x7320000000ull) return;
+    uint64_t t = plat_now_ns();
+    float ratio = VF(float, vfr, VFR_RATIO);
+    uint32_t iv = VF(uint32_t, vfr, VFR_INTERVAL);
+    fwrite(&t, 8, 1, f), fwrite(&ratio, 4, 1, f), fwrite(&iv, 4, 1, f), fwrite(&actor, 8, 1, f);
+    fwrite((const void *)(uintptr_t)actor, 1, (size_t)bytes, f);
 }
 
 // SAVAGEWIND_LOG_SCREENS=1: the pause state and the game's UI screens that exist (their ids), each time they change

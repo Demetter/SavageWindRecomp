@@ -202,6 +202,64 @@ static void *hang_main(void *arg) {
     }
 }
 
+// (research) A write watchpoint: debug register 0 on every guest thread, the 4 bytes at addr; each instruction that
+// writes them is counted by its host address (the instruction after the store), reported by sampler_watch_report.
+#define WATCH_SITES 32
+static volatile uint64_t watch_rip[WATCH_SITES], watch_hits[WATCH_SITES];
+static LONG CALLBACK watch_handler(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t rip = (uint64_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress;
+    for (int i = 0; i < WATCH_SITES; i++) {
+        if (watch_rip[i] == rip) { watch_hits[i]++; break; }
+        if (!watch_rip[i] && __sync_bool_compare_and_swap(&watch_rip[i], 0, rip)) { watch_hits[i]++; break; }
+    }
+    e->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void *watch_main(void *arg) {
+    uint64_t addr = (uint64_t)(uintptr_t)arg;
+    pthread_t host[MAX_THREADS];
+    uint32_t handle[MAX_THREADS];
+    uint64_t entry[MAX_THREADS];
+    int n = kernel_running_threads(host, handle, entry, MAX_THREADS), set = 0;
+    for (int i = 0; i < n; i++) {
+        if (handle[i] >= 0xf000) continue;
+        HANDLE h = (HANDLE)pthread_gethandle(host[i]);
+        if (!h || SuspendThread(h) == (DWORD)-1) continue;
+        CONTEXT ctx;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(h, &ctx)) {
+            ctx.Dr0 = addr;
+            ctx.Dr7 = (ctx.Dr7 & ~0xF0003ull) | 1 | (1ull << 16) | (3ull << 18);  // (local enable, on writes, 4 bytes)
+            if (SetThreadContext(h, &ctx)) set++;
+        }
+        ResumeThread(h);
+    }
+    LOG("[watch] writes to %llx watched on %d of %d threads\n", (unsigned long long)addr, set, n);
+    return NULL;
+}
+void sampler_watch_write(uint64_t addr) {
+    static bool once;
+    if (once) return;
+    once = true;
+    AddVectoredExceptionHandler(1, watch_handler);
+    pthread_t th;
+    pthread_create(&th, NULL, watch_main, (void *)(uintptr_t)addr);
+    pthread_detach(th);
+}
+void sampler_watch_report(void) {
+    for (int i = 0; i < WATCH_SITES && watch_rip[i]; i++) {
+        HMODULE m = NULL;
+        char name[MAX_PATH] = "?";
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(uintptr_t)watch_rip[i], &m);
+        if (m) GetModuleFileNameA(m, name, sizeof name);
+        LOG("[watch] written by host %llx (%s +%llx): %llu times\n", (unsigned long long)watch_rip[i], name,
+            (unsigned long long)(watch_rip[i] - (uint64_t)(uintptr_t)m), (unsigned long long)watch_hits[i]);
+    }
+}
+
 __attribute__((constructor)) static void sampler_start(void) {
     const char *e = getenv("SAVAGEWIND_SAMPLE"), *h = getenv("SAVAGEWIND_SAMPLE_ON_HANG");
     pthread_t th;
