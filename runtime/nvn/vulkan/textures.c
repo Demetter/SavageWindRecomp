@@ -1054,7 +1054,10 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             bool expand = mf.expand_rgb && fi->bpb == 3;
             uint32_t out_row = expand ? l.wb * 4 : row;
             VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
-            uint8_t *lin = expand ? malloc(sz) : s.ptr;
+            // (a font sheet is read back on the CPU to be made larger: in ordinary memory, not the upload ring, which is
+            // often write-combined over the PCIe bus - hashing a sheet there took 30-200 ms)
+            uint8_t *lin = expand || b->font_scale > 1 ? malloc(sz) : s.ptr;
+            if (!lin && !expand) lin = s.ptr;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * (t->stride ? t->stride : row), row);
@@ -1085,6 +1088,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
                 uint32_t n = b->font_scale;
                 VkSpan big = vk_transient(sz * n * n, 16);
                 font_sheet_upscale(t->format, lin, l.wb * fi->bw, l.hb * fi->bh, (int)n, big.ptr);
+                if (lin != s.ptr) free(lin);
                 VkBufferImageCopy rg = {.bufferOffset = big.off, .bufferRowLength = l.wb * fi->bw * n,
                                         .bufferImageHeight = l.hb * fi->bh * n, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {level_w(b, lv), level_h(b, lv), 1}};

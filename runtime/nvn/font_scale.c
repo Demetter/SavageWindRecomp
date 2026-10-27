@@ -387,10 +387,67 @@ static void axis(uint32_t size, uint32_t n, int *i0, int *i1, float *f) {  // wh
     }
 }
 
-void font_sheet_upscale(uint32_t format, const uint8_t *lin, uint32_t w, uint32_t h, int n, uint8_t *out) {
+// Made sheets are kept in the cache folder (fonts/<key>.bin) and read back in later sessions: making them took 70-340
+// ms each at 3x while the game loads (27 Oct, 5120x2160: ~0.6 s of a stopped title screen); a read is a few ms. The key
+// covers the sheet's texels, its shape, the scale and the edge settings (FONT_SHEET_VERSION: the making itself).
+#define FONT_SHEET_VERSION 1
+const char *vk_cache_dir(void);
+static bool sheet_cache_path(char *path, size_t size, uint32_t format, const uint8_t *lin, uint64_t in_bytes, uint32_t w,
+                             uint32_t h, int n) {
+    uint64_t k = sheet_hash(lin, in_bytes);
+    float e = font_edge(), b = font_bold();
+    uint32_t eb[2];
+    memcpy(&eb[0], &e, 4), memcpy(&eb[1], &b, 4);
+    k = (k ^ ((uint64_t)format << 48 | (uint64_t)w << 24 | h)) * 0x100000001b3ull;
+    k = (k ^ ((uint64_t)eb[0] << 32 | eb[1])) * 0x100000001b3ull;
+    k = (k ^ ((uint64_t)n << 8 | FONT_SHEET_VERSION)) * 0x100000001b3ull;
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/fonts", vk_cache_dir());
+    mkdir(dir, 0755);
+    return snprintf(path, size, "%s/%016llx.bin", dir, (unsigned long long)k) < (int)size;
+}
+
+static bool sheet_make(uint32_t format, const uint8_t *lin, uint32_t w, uint32_t h, int n, uint8_t *out);
+void font_sheet_upscale(uint32_t format, const uint8_t *lin, uint32_t w, uint32_t h, int n, uint8_t *dst) {
+    uint64_t t0 = SDL_GetTicksNS(), ow = (uint64_t)w * (uint32_t)n, oh = (uint64_t)h * (uint32_t)n;
+    uint64_t in_bytes = format == FMT_R8 ? (uint64_t)w * h : (uint64_t)w * h / 2, out_bytes = format == FMT_R8 ? ow * oh : ow * oh / 2;
+    // (dst is upload memory, often write-combined over the PCIe bus: reading it back to write the file crawled - a
+    // second a sheet - so the sheet is made or read in ordinary memory and copied there once)
+    uint8_t *out = malloc(out_bytes);
+    if (!out) { sheet_make(format, lin, w, h, n, dst); return; }
+    char path[600];
+    bool cached = false;
+    if (sheet_cache_path(path, sizeof path, format, lin, in_bytes, w, h, n)) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            cached = fread(out, 1, out_bytes, f) == out_bytes && fgetc(f) == EOF;
+            fclose(f);
+        }
+        if (!cached && sheet_make(format, lin, w, h, n, out)) {  // (an empty one, out of memory: not kept)
+            char tmp[640];  // (this thread's: two may make the same sheet at once; the second rename fails, harmlessly)
+            snprintf(tmp, sizeof tmp, "%s.%llu.tmp", path, (unsigned long long)SDL_GetCurrentThreadID());
+            f = fopen(tmp, "wb");
+            if (f) {
+                bool written = fwrite(out, 1, out_bytes, f) == out_bytes;
+                written = fclose(f) == 0 && written;
+                if (!written || rename(tmp, path) != 0) remove(tmp);
+            }
+        }
+    } else {
+        sheet_make(format, lin, w, h, n, out);
+    }
+    uint64_t t1 = SDL_GetTicksNS();
+    memcpy(dst, out, out_bytes);
+    free(out);
+    static int nlog;
+    if (nlog++ < 48) LOG("[fonts] %ux%u sheet %s %dx in %.1f ms (+%.1f ms into upload memory)\n", w, h, cached ? "read" : "made", n,
+                         (t1 - t0) / 1e6, (SDL_GetTicksNS() - t1) / 1e6);
+}
+
+static bool sheet_make(uint32_t format, const uint8_t *lin, uint32_t w, uint32_t h, int n, uint8_t *out) {
     Up u = {.format = format, .w = w, .h = h, .n = (uint32_t)n, .ow = w * (uint32_t)n, .oh = h * (uint32_t)n,
             .layers = format == FMT_R8 ? 2 : 1, .lin = lin, .out = out};
-    uint64_t px = (uint64_t)w * h, t0 = SDL_GetTicksNS();
+    uint64_t px = (uint64_t)w * h;
     bool ok = true;
     for (uint32_t l = 0; l < u.layers; l++) {
         u.a[l] = malloc(px * sizeof(float)), u.across[l] = malloc(px * sizeof(float)), u.t[l] = malloc(px * sizeof(Tx));
@@ -412,6 +469,6 @@ void font_sheet_upscale(uint32_t format, const uint8_t *lin, uint32_t w, uint32_
     }
     for (uint32_t l = 0; l < u.layers; l++) free(u.a[l]), free(u.across[l]), free(u.t[l]), free(u.flat[l]);
     free(u.x0), free(u.x1), free(u.fx), free(u.y0), free(u.y1), free(u.fy);
-    static int nlog;
-    if (nlog++ < 48) LOG("[fonts] %ux%u sheet made %dx in %.1f ms%s\n", w, h, n, (SDL_GetTicksNS() - t0) / 1e6, ok ? "" : " (out of memory: empty)");
+    if (!ok) LOG("[fonts] %ux%u sheet at %dx: out of memory, left empty\n", w, h, n);
+    return ok;
 }
