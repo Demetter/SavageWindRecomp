@@ -234,7 +234,9 @@ static void clock_probe(uint64_t vfr);
 static void log_screens(void);
 static void player_dump(uint64_t vfr);
 
+uint64_t g_game_frames;  // (the game's frames: the VFR updates; in-run A/B switches key on its parity)
 void rt_vfr_update(uint64_t vfr) {
+    g_game_frames++;
     extern bool nvn_timeline(void);
     if (nvn_timeline()) LOG("[tl] %.3f %x vfr\n", plat_now_ns() / 1e6, kernel_current_thread_handle());
     extern uint64_t g_fs_vfr;  // (SAVAGEWIND_FRAME_LOG=2, nvn/objects.c)

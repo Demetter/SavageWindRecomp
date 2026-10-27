@@ -513,6 +513,15 @@ def _view_rec_cbs(gen, a):
             f'  /* {a:#x}: mov w1, #0x20 (command buffers of a list: at least its parts) */')
 
 
+# ... and where each cut reads the part counts (1.9.0 f_7000fb98bc: `ldp w9, w10, [x10, #0x28]`, at least / at most):
+# the most through the runtime, for the in-run A/B against the Switch build's 3 (runtime/hle/jobs.c rt_view_rec_cut).
+def _view_rec_cut(gen, a):
+    assert _word(gen, a) == 0x29452949, hex(_word(gen, a))  # ldp w9, w10, [x10, #0x28]
+    return ('{ extern uint32_t rt_view_rec_cut(uint32_t); c->x[9] = LD32(c->x[10] + 0x28); '
+            'c->x[10] = rt_view_rec_cut(LD32(c->x[10] + 0x2c)); }'
+            f'  /* {a:#x}: ldp w9, w10, [x10, #0x28] (the part counts of a cut) */')
+
+
 # ... and a draw list no view cut, which the consumer (1.9.0 f_7000fab5e0) records whole on the one thread drawing the
 # layer (`bl f_7000fab328` with range 0..-1, after its search found no record of parts for the list's pass): cut into
 # parts recorded on every core and then drawn as the views' parts are (runtime/hle/jobs.c rt_view_rec_inline); a list
@@ -1474,6 +1483,7 @@ PATCHES = {
     'view_rec_parts': _view_rec_parts,
     'view_rec_items': _view_rec_items,
     'view_rec_cbs': _view_rec_cbs,
+    'view_rec_cut': _view_rec_cut,
     'view_rec_inline': _view_rec_inline,
     'layer_step_dl': _layer_step_dl,
     'layer_steps': _layer_steps,

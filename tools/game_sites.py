@@ -765,6 +765,7 @@ SITES = [
     # `mov w9, #0xb7` before madd w1, w8, w9, w10 -> 183 n + 6), and each list's record of its parts' command buffers
     # (f_7000faa800: `mov w1, #0x20`, 32 each). Both clamp an overflow to slot 0 without a word.
     Site('view_rec_items', 'code', '528016e9 528000ca a909a2c8 910302c0 a90aa2c8 f94027e8 aa1503e2 91040277', 0),
+    Site('view_rec_cut', 'code', '29452949 1ac90908 6b0a011f 1a8ab119 34000019/ff00001f 71000729 b9403ea8 b9000fe9', 0),
     Site('view_rec_cbs', 'code', '52800401 aa1403e2 52800103 91016100 94000000/fc000000 910006e8 92407d17 6b0802bf', 0),
     # ... and the lists no view cut (a pass made at draw time): the consumer f_7000fab5e0 finds no record of parts for the
     # list's pass and records the whole list inline (bl f_7000fab328, range 0..-1) on the one thread drawing the layer.
@@ -960,7 +961,7 @@ OPTIONAL_GROUPS = [
      'heap_root_flags',
      'root_heap_size',
      'jobs_pool_got', 'job_thread_proc', 'job_thread_res',
-     'view_rec_jobs', 'view_rec_parts', 'view_rec_items', 'view_rec_cbs',
+     'view_rec_jobs', 'view_rec_parts', 'view_rec_items', 'view_rec_cbs', 'view_rec_cut',
      'view_rec_inline', 'view_rec_consume', 'view_rec_part', 'view_rec_ctx',
      'view_rec_ctx_fini', 'view_rec_item_end', 'view_rec_lock', 'view_rec_unlock',
      'view_rec_record', 'view_rec_begin', 'view_rec_end', 'layer_step_dl',
@@ -1485,6 +1486,7 @@ KNOWN = {
         'view_rec_parts': 0x7000fb3ef4,
         'view_rec_items': 0x7000fb3d04,
         'view_rec_cbs': 0x7000faa864,
+        'view_rec_cut': 0x7000fb9924,
         'view_rec_inline': 0x7000fab6bc,
         'view_rec_consume': 0x7000fab5e0,
         'view_rec_part': 0x7000fab13c,

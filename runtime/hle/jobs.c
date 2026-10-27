@@ -631,6 +631,16 @@ uint32_t rt_view_rec_parts(void) {
     return (uint32_t)n;
 }
 
+// (testing) SAVAGEWIND_VIEW_REC_AB=1: the views' lists cut into the Switch build's 3 parts in odd game frames and into
+// the cores' count in even ones (tools/patches.py _view_rec_cut, where f_7000fb98bc reads the count each cut), for
+// consecutive frames compared in one run.
+uint32_t rt_view_rec_cut(uint32_t stored) {
+    static int ab = -1;
+    if (ab < 0) ab = getenv("SAVAGEWIND_VIEW_REC_AB") && atoi(getenv("SAVAGEWIND_VIEW_REC_AB"));
+    extern uint64_t g_game_frames;
+    return ab && (g_game_frames & 1) ? 3 : stored;
+}
+
 // A draw list no view cut into parts (tools/patches.py _view_rec_inline): the consumer f_7000fab5e0(list, draw
 // context, pass, view, x4) found no record of parts for the list's pass and is about to record the whole list on the
 // one thread drawing the layer. Instead its parts - contiguous ranges, at least VRI_MIN draws each, up to the view parts'
@@ -759,9 +769,14 @@ int rt_layer_step_dl(void) {
 // display list begun with key first + i and put in the renderer's list, which the submit sorts by key - the GPU gets
 // the steps in order, as from one thread. 0: the loop does it.
 enum { LS_INFO, LS_DRAW, LS_INSERT, LS_BEGIN, LS_END, LS_CTX, LS_CTX_FINI, LS_DLG_GOT };
-typedef struct { const uint64_t *fns; uint64_t r, layer, dlg0, dlg1; uint32_t key0, n, steps[64]; } LsTask;
+typedef struct { const uint64_t *fns; uint64_t r, layer, dlg0, dlg1; uint32_t key0, n, steps[64], turn; } LsTask;
+static pthread_mutex_t g_ls_one = PTHREAD_MUTEX_INITIALIZER;  // (SAVAGEWIND_LAYER_STEPS=2: one step at a time)
+static int g_ls_mode;
 static void ls_step(Cpu *c, void *arg, uint32_t k) {
     LsTask *t = arg;
+    if (g_ls_mode == 2) pthread_mutex_lock(&g_ls_one);
+    if (g_ls_mode == 4)  // (testing: other threads, the steps' order kept)
+        for (uint32_t v; (v = __atomic_load_n(&t->turn, __ATOMIC_ACQUIRE)) != k;) wait_change(&t->turn, v, false);
     const uint64_t *fns = t->fns;
     uint32_t i = t->steps[k];
     uint64_t sp = c->sp, arena = LD64(t->r + 0x7d8);
@@ -789,13 +804,15 @@ static void ls_step(Cpu *c, void *arg, uint32_t k) {
     c->x[0] = ctx;
     guest_call(c, fns[LS_CTX_FINI]);
     c->sp = sp;
+    if (g_ls_mode == 2) pthread_mutex_unlock(&g_ls_one);
+    if (g_ls_mode == 4) __atomic_store_n(&t->turn, k + 1, __ATOMIC_RELEASE), plat_wake_u32_all(&t->turn);
 }
 int rt_layer_steps(Cpu *c, const uint64_t *fns) {
     static int enabled = -1;
-    if (enabled < 0) enabled = getenv("SAVAGEWIND_LAYER_STEPS") && atoi(getenv("SAVAGEWIND_LAYER_STEPS"));
+    if (enabled < 0) enabled = getenv("SAVAGEWIND_LAYER_STEPS") ? atoi(getenv("SAVAGEWIND_LAYER_STEPS")) : 0, g_ls_mode = enabled;
     uint32_t count = (uint32_t)c->x[25], flags = (uint32_t)c->x[21];
     if (!enabled || !(c->x[20] & 1) || count < 2 || count > 64 || !on()) return 0;
-    LsTask t = {fns, c->x[22], c->x[23], c->x[19], LD64(LD64(fns[LS_DLG_GOT]) + 8), LD32(c->sp + 0xc), 0, {0}};
+    LsTask t = {fns, c->x[22], c->x[23], c->x[19], LD64(LD64(fns[LS_DLG_GOT]) + 8), LD32(c->sp + 0xc), 0, {0}, 0};
     for (uint32_t i = 0; i < count; i++) {
         uint64_t vt = LD64(t.layer);
         bool skip = false;
@@ -807,6 +824,19 @@ int rt_layer_steps(Cpu *c, const uint64_t *fns) {
         c->x[0] = t.layer, c->x[1] = i;
         guest_call(c, LD64(vt + 0x80));
         if (!skip && ((c->x[0] & 1 ? 4u : 2u) & flags)) t.steps[t.n++] = i;
+    }
+    if (g_ls_mode == 5 && t.n > 2) {  // (testing: the first step here, then the rest at once on every core)
+        ls_step(c, &t, 0);
+        LsTask r = t;
+        r.n = t.n - 1;
+        memmove(r.steps, t.steps + 1, r.n * sizeof r.steps[0]);
+        if (!rt_jobs_fork_join(c, ls_step, &r, r.n))
+            for (uint32_t k = 0; k < r.n; k++) ls_step(c, &r, k);
+        return 1;
+    }
+    if (g_ls_mode == 3) {  // (testing: every step on this thread, in order, each with a context of its own)
+        for (uint32_t k = 0; k < t.n; k++) ls_step(c, &t, k);
+        return 1;
     }
     if (t.n > 1 && rt_jobs_fork_join(c, ls_step, &t, t.n)) return 1;
     for (uint32_t k = 0; k < t.n; k++) ls_step(c, &t, k);

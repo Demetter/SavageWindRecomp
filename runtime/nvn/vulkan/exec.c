@@ -341,8 +341,34 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
 }
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
+// (measuring) SAVAGEWIND_VK_INLINE_REC_PROBE=1: the render thread's own recording inside inline passes of parallel
+// lists (what a worker recording a whole pass would have to take or suspend for), by caller, every 600 frames
+static int inl_probe = -1;
+static struct { void *ra; uint64_t n; } inl_sites[32];
+static uint64_t inl_calls, inl_passes, inl_frame0;
+static void inl_note(void *ra) {
+    int i = 0;
+    while (i < 32 && inl_sites[i].ra && inl_sites[i].ra != ra) i++;
+    if (i < 32) inl_sites[i].ra = ra, inl_sites[i].n++;
+    inl_calls++;
+    uint64_t f = renderer_present_count();
+    if (!inl_frame0) inl_frame0 = f;
+    if (f - inl_frame0 >= 600) {
+        LOG("[inline-rec] %llu frames: %.1f render-thread records a frame inside inline passes (%.1f inline passes a frame); "
+            "by caller:", (unsigned long long)(f - inl_frame0), (double)inl_calls / (f - inl_frame0),
+            (double)inl_passes / (f - inl_frame0));
+        for (int k = 0; k < 32 && inl_sites[k].ra; k++)
+            LOG(" %p:%.1f", inl_sites[k].ra, (double)inl_sites[k].n / (f - inl_frame0));
+        LOG("\n");
+        memset(inl_sites, 0, sizeof inl_sites), inl_calls = inl_passes = 0, inl_frame0 = f;
+    }
+}
 VkCommandBuffer vk_cmd(void) {
     if (t_xw >= 0) return t_xcb;  // (a translation worker: its chunk's buffer)
+    if (__builtin_expect(inl_probe != 0, 0)) {
+        if (inl_probe < 0) inl_probe = getenv("SAVAGEWIND_VK_INLINE_REC_PROBE") != NULL;
+        if (inl_probe && par_list && in_pass && pass_inline) inl_note(__builtin_return_address(0));
+    }
     if (par_list && in_pass && !pass_inline) return par_rcmd();  // (the render thread inside a pass of a parallel list: its own, in order)
     Sub *s = sub();
     if (!s->main_begun) {
@@ -2206,6 +2232,7 @@ static void begin_pass(bool cube_layers) {
     {
         NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
         pass_inline = par_list && par_inline_mask && t0 && (par_inline_mask >> vk_texture_scale_group(t0) & 1);
+        if (inl_probe > 0 && pass_inline) inl_passes++;
     }
     if (g_gpuprof_frame || vk_frame_trace_on || vk_pass_gpu) {
         NvnTexture *t = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
