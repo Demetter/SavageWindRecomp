@@ -255,6 +255,16 @@ SITES = [
          'f9005e7f', 0),
     Site('arena_begin_rec', 'code', '9b285b28 394446ca 6b18013f b940890b f940490c 1a9f8309 6b0a017f 5280030b', 0),
     Site('arena_end_rec', 'code', '9b294d13 aa1403e0 94000000/fc000000 b9409a68 0b080008 11000d08 121e7508 b9009a68', 0),
+    # the per-core state picking a 0x1e0-byte entry (BOTW-JOBS-NATIVE.md #9; tools/patches.py _cstate_*):
+    # the constructor's zeroing, and each accessor's base and bound
+    Site('cstate_ctor_a', 'code', 'b91a727f f90d367f f9400bf3 a8c27bfd d65f03c0', 0),
+    Site('cstate_ctor_b', 'code', 'f90d367f f9400bf3 a8c27bfd d65f03c0', 0),
+    Site('cstate_set_base', 'code', '8b080288 a9417bfd 8b09090a 71000d3f 9a883148 b9000113 a9424ff4 9100c3ff', 0),
+    Site('cstate_set_bound', 'code', '71000d3f 9a883148 b9000113 a9424ff4 9100c3ff d65f03c0 94000000/fc000000 14000000/fc000000', 0),
+    Site('cstate_get_base', 'code', '8b080268 f9400bf3 8b09090a 71000d3f 9a883148 b9400100 a8c27bfd d65f03c0', 0),
+    Site('cstate_get_bound', 'code', '71000d3f 9a883148 b9400100 a8c27bfd d65f03c0 94000000/fc000000 14000000/fc000000', 0),
+    Site('cstate_slot_base', 'code', '8b080268 8b09090a 71000d3f 52800109 9a883148 5280014a b9400108 7100091f', 0),
+    Site('cstate_slot_bound', 'code', '71000d3f 52800109 9a883148 5280014a b9400108 7100091f 9a890149 7100051f', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -288,7 +298,10 @@ OPTIONAL_GROUPS = [
      'arena_pool_addr', 'arena_pool_cpu', 'arena_pool_offset',
      'arena_blocks_alloc', 'arena_buffers_alloc', 'arena_reset',
      'arena_free_0', 'arena_free_1', 'arena_free_2',
-     'arena_free_fn', 'arena_begin_rec', 'arena_end_rec'),
+     'arena_free_fn', 'arena_begin_rec', 'arena_end_rec',
+     'cstate_ctor_a', 'cstate_ctor_b', 'cstate_set_base',
+     'cstate_set_bound', 'cstate_get_base', 'cstate_get_bound',
+     'cstate_slot_base', 'cstate_slot_bound'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -456,6 +469,14 @@ KNOWN = {
         'arena_free_fn': 0x7000000680,
         'arena_begin_rec': 0x7000ef350c,
         'arena_end_rec': 0x7000ef365c,
+        'cstate_ctor_a': 0x7000eed9d4,
+        'cstate_ctor_b': 0x7000eed9d8,
+        'cstate_set_base': 0x7000eedeec,
+        'cstate_set_bound': 0x7000eedef8,
+        'cstate_get_base': 0x7000eedf4c,
+        'cstate_get_bound': 0x7000eedf58,
+        'cstate_slot_base': 0x7000eedfa8,
+        'cstate_slot_bound': 0x7000eedfb0,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

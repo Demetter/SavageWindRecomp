@@ -6,8 +6,8 @@
 // the game (the objects they serve are singletons made at boot).
 //
 // (check) SAVAGEWIND_PERCORE_POISON=1: when a block is made, the object's own array is filled with a pattern that
-// faults on use (counts of 0x100, pointers into the null page), and every ~600 frames the pattern is checked: a missed
-// read faults at once, a missed write is logged with the array and offset.
+// faults on use (counts of 0x100, pointers into the null page; byte arrays 0xa5), and every ~600 frames the pattern is
+// checked: a missed read of a count or pointer faults at once, a missed write is logged with the array and offset.
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -27,6 +27,24 @@ static struct {
 static int g_nblocks;  // (published with release after the entry is filled; entries never change afterwards)
 static pthread_mutex_t g_m = PTHREAD_MUTEX_INITIALIZER;
 static int g_poison = -1;
+
+// The pattern over an array of `bytes`: 8-byte units, then a 4-byte one, then bytes (0xa5) - write it, or the offset
+// of the first unit that no longer holds it (-1: all do).
+static int64_t poison(uint64_t a, uint32_t bytes, int write) {
+    uint32_t o = 0;
+    for (; o + 8 <= bytes; o += 8)
+        if (write) ST64(a + o, POISON);
+        else if (LD64(a + o) != POISON) return o;
+    if (o + 4 <= bytes) {
+        if (write) ST32(a + o, (uint32_t)POISON);
+        else if (LD32(a + o) != (uint32_t)POISON) return o;
+        o += 4;
+    }
+    for (; o < bytes; o++)
+        if (write) ST8(a + o, 0xa5);
+        else if (LD8(a + o) != 0xa5) return o;
+    return -1;
+}
 
 // The block for obj's array at +field of slots of `stride` bytes, which the Switch sized for `switch_slots` cores
 // (with_system: its last slot is the system core's threads').
@@ -48,8 +66,7 @@ uint64_t rt_percore_block(uint64_t obj, uint32_t field, uint32_t stride, uint32_
     uint64_t block = ((uint64_t)(uintptr_t)b + 63) & ~63ull;
     if (g_poison < 0) g_poison = getenv("SAVAGEWIND_PERCORE_POISON") && atoi(getenv("SAVAGEWIND_PERCORE_POISON"));
     uint32_t bytes = switch_slots * stride;
-    if (g_poison)
-        for (uint32_t o = 0; o + 8 <= bytes; o += 8) *(uint64_t *)(uintptr_t)(obj + field + o) = POISON;
+    if (g_poison) poison(obj + field, bytes, 1);
     g_blocks[n].obj = obj, g_blocks[n].block = block, g_blocks[n].field = field, g_blocks[n].bytes = bytes;
     __atomic_store_n(&g_nblocks, n + 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_m);
@@ -78,13 +95,12 @@ void rt_percore_check(void) {
     static uint8_t reported[PERCORE_MAX];
     for (int i = 0; i < n; i++) {
         if (reported[i]) continue;
-        for (uint32_t o = 0; o + 8 <= g_blocks[i].bytes; o += 8)
-            if (*(uint64_t *)(uintptr_t)(g_blocks[i].obj + g_blocks[i].field + o) != POISON) {
-                LOG("[percore] MISSED WRITE: %llx +%#x, the game's own array written at +%#x\n",
-                    (unsigned long long)g_blocks[i].obj, g_blocks[i].field, o);
-                reported[i] = 1;
-                break;
-            }
+        int64_t o = poison(g_blocks[i].obj + g_blocks[i].field, g_blocks[i].bytes, 0);
+        if (o >= 0) {
+            LOG("[percore] MISSED WRITE: %llx +%#x, the game's own array written at +%#llx\n",
+                (unsigned long long)g_blocks[i].obj, g_blocks[i].field, (unsigned long long)o);
+            reported[i] = 1;
+        }
     }
 }
 

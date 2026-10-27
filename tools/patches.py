@@ -413,11 +413,11 @@ def _ctx(obj):
     return f'rt_percore_block({obj}, 0x30, 0x288, 4, 1)'
 
 
-def _ctx_patch(word, body, what):
+def _ctx_patch(word, body, what, structure='per-core contexts'):
     def patch(gen, a):
         w = _word(gen, a)
         assert (w == word) if word is not None else (w >> 26 == 0x25), hex(w)  # (None: a bl)
-        return '{ ' + _CTX_DECL + body(gen, a) + ' }' + f'  /* {a:#x}: {what} (per-core contexts) */'
+        return '{ ' + _CTX_DECL + body(gen, a) + ' }' + f'  /* {a:#x}: {what} ({structure}) */'
     return patch
 
 
@@ -493,6 +493,31 @@ def _arena_rec(word, mov, dst, obj, core):  # smaddl x<dst>, w<core>, w<0x28>, x
                 f'c->x[{dst}] = rt_percore_slot(c->x[{obj}], 0x88, 0x28, 3, 0, (int32_t)c->x[{core}]) - 0x88; }}'
                 f'  /* {a:#x}: smaddl x{dst}, w{core}, w, x{obj} (command arenas: the current core\'s record) */')
     return patch
+
+
+# The per-core state (BOTW-JOBS-NATIVE.md #9): each core's choice of one of its singleton's 0x1e0-byte entries, three
+# u32s at +0x1a68, lives in a runtime block with a slot for every game core. The accessors take the block for the
+# game's array and bound the core by the game's core count (a core without a slot uses core 0's, as the game does past
+# its three); the constructor zeroes every slot.
+def _cstate(obj):
+    return f'rt_percore_block({obj}, 0x1a68, 4, 3, 0)'
+
+
+_cstate_ctor = _ctx_patch(0xb91a727f, lambda gen, a: (  # the first of the constructor's two stores: every core's
+    f'uint64_t b = {_cstate("c->x[19]")}; for (int i = 0, n = rt_game_cores(); i < n; i++) ST32(b + 4ull * i, 0);'),
+    'str wzr, [x19, #0x1a70]: zero every core\'s state', 'per-core state')
+_cstate_ctor_done = _ctx_patch(0xf90d367f, lambda gen, a: '(void)0;',
+                               'str xzr, [x19, #0x1a68]: (every core\'s zeroed at the first)', 'per-core state')
+
+
+def _cstate_base(word, obj):  # add x8, x<obj>, x8 (x8 = 0x1a68): the game's array -> the block
+    return _ctx_patch(word, lambda gen, a: f'c->x[8] = {_cstate(f"c->x[{obj}]")};',
+                      f'add x8, x{obj}, x8: every core\'s state', 'per-core state')
+
+
+_CSTATE_BOUND = _ctx_patch(0x71000d3f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[9], (uint32_t)rt_game_cores()));',
+                           'cmp w9, #3: a core with a slot', 'per-core state')
+
 
 PATCHES = {
     'pause_options_update': _pause_option_state,
@@ -582,6 +607,14 @@ PATCHES = {
     'ctx_flag_base': _ctx_patch(0x9b284d28, lambda gen, a: (
         f'c->x[8] = {_ctx("c->x[19]")} - 0x30 + (uint64_t)((int64_t)(int32_t)c->x[9] * (int64_t)(int32_t)c->x[8]);'),
         'smaddl x8, w9, w8, x19: the current core\'s context'),
+    'cstate_ctor_a': _cstate_ctor,
+    'cstate_ctor_b': _cstate_ctor_done,
+    'cstate_set_base': _cstate_base(0x8b080288, 20),
+    'cstate_set_bound': _CSTATE_BOUND,
+    'cstate_get_base': _cstate_base(0x8b080268, 19),
+    'cstate_get_bound': _CSTATE_BOUND,
+    'cstate_slot_base': _cstate_base(0x8b080268, 19),
+    'cstate_slot_bound': _CSTATE_BOUND,
     'arena_setup': _arena_setup,
     'arena_reset': _arena_reset,
     'arena_free_0': _arena_free(0xf9404808, True),
