@@ -932,6 +932,95 @@ def _rec4c_any(group_off, loads):  # three loads of a group's ring counts: {offs
 _REC4C_G1 = ((0xb9443268, 0x430), (0xb9484a68, 0x848))  # (ldr w8, [x19, #0x430 / #0x848]: rings 1 and 2 of group 1)
 _REC4C_G2 = ((0xb94c6268, 0xc60), (0xb9507a68, 0x1078), (0xb9549268, 0x1490))
 
+
+# #19 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): per-core rings - 0x28-byte objects (the count of cores at +8, the
+# capacity per core at +0xc, entries at +0x10 laid out [cursor][core], a cursor per core at +0x18). The makers size the
+# entries and set the count for every core; the cursors live in a block per ring (the makers and the reset zero them);
+# the appends take the block and bound the core; ring A's walker loops over every core, and rings B's and C's walkers
+# (unrolled for three) go on from their third loop over every further core - their second and third loops keep the
+# core on the stack as the game wrote them.
+def _ring19_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core rings')
+
+
+def _cur19(ring):
+    return f'rt_percore_block({ring}, 0x18, 4, 3, 0)'
+
+
+def _ring19_n(word, dst, per_core, add, what):  # mov <dst>, #(3 x per_core + add): the same for every core
+    return _ring19_patch(word, lambda gen, a: f'c->x[{dst}] = (uint64_t)({per_core:#x}ll * rt_game_cores() + {add:#x});',
+                         what)
+
+
+def _ring19_zero(ring, gap):  # str wzr, [xR, #0x20] and, gap later, str xzr, [xR, #0x18]: every core's cursor (second)
+    return {0: _ring19_patch(0xb900201f | ring << 5, lambda gen, a: '(void)0;', f'str wzr, [x{ring}, #0x20]: (zeroed next)'),
+            gap: _ring19_patch(0xf9000c1f | ring << 5, lambda gen, a: (
+                f'extern void rt_ring19_zero(uint64_t); rt_ring19_zero(c->x[{ring}]);'),
+                f'str xzr, [x{ring}, #0x18]: every core\'s cursor zeroed')}
+
+
+_RING19_ADD = {  # add x8, x0, #0x18; cmp w2, #3: the ring's block, the core's bound
+    0: _ring19_patch(0x91006008, lambda gen, a: f'c->x[8] = {_cur19("c->x[0]")};', 'add x8, x0, #0x18: every core\'s cursor'),
+    4: _ring19_patch(0x71000c5f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[2], (uint32_t)rt_game_cores()));',
+                     'cmp w2, #3: a core with a cursor')}
+
+
+def _ring19_c_rest(gen, a):  # bl make (ring C's 24th entry): it and every further core's
+    make = gen.sites['ring19_c_make_fn']
+    return _ring19_patch(None, lambda gen, a: (
+        f'extern void rt_ring19_c_rest(Cpu *, uint64_t, uint64_t); rt_ring19_c_rest(c, c->x[20], {make:#x}ull);'),
+        'bl: the 24th entry and every further core\'s')(gen, a)
+
+
+def _ring19_c0(word, dst, ring):  # ldr w<dst>, [x<ring>, #0x18]: core 0's cursor
+    return _ring19_patch(word, lambda gen, a: f'c->x[{dst}] = LD32({_cur19(f"c->x[{ring}]")});',
+                         f'ldr w{dst}, [x{ring}, #0x18]: core 0\'s cursor')
+
+
+def _ring19_c1(word, dst, ring, var):  # ldr w<dst>, [x<ring>, #0x1c]: core 1's cursor, its core kept at [sp + var]
+    return _ring19_patch(word, lambda gen, a: (
+        f'ST32(c->sp + {var:#x}, 1); c->x[{dst}] = LD32({_cur19(f"c->x[{ring}]")} + 4);'),
+        f'ldr w{dst}, [x{ring}, #0x1c]: core 1\'s cursor (its core kept)')
+
+
+def _b_target(gen, a, cond):  # a conditional branch's target (asserting its condition)
+    w = _word(gen, a)
+    assert w & 0xff00001f == 0x54000000 | cond, hex(w)
+    return a + ((((w >> 5) & 0x7ffff) ^ 0x40000) - 0x40000) * 4
+
+
+def _ring19_next(word, dst, ring, var, out, lt_off):
+    """The third loop's head (ldr w<dst>, [x<ring>, #0x20]) and its `b.lt` (lt_off later) past the walker's end (`out`
+    after the head): the next core after the one at [sp + var] - none left, the end; a core without entries, the next."""
+    def head(gen, a):
+        return _ring19_patch(word, lambda gen, a: (
+            f'{{ uint32_t k = LD32(c->sp + {var:#x}) + 1; if (k >= (uint32_t)rt_game_cores()) goto L_{a + out:x}; '
+            f'ST32(c->sp + {var:#x}, k); c->x[{dst}] = LD32({_cur19(f"c->x[{ring}]")} + 4ull * k); }}'),
+            f'ldr w{dst}, [x{ring}, #0x20]: the next core\'s cursor')(gen, a)
+    def lt(gen, a):
+        assert _b_target(gen, a, 0xb) == a - lt_off + out
+        return (f'{{ if (COND_LT(c)) goto L_{a - lt_off:x}; }}'
+                f'  /* {a:#x}: b.lt: a core without entries, then the next (per-core rings) */')
+    return {0: head, lt_off: lt}
+
+
+def _ring19_mov(var):  # mov w8, #2: the loop's core
+    return _ring19_patch(0x52800048, lambda gen, a: f'c->x[8] = LD32(c->sp + {var:#x});', 'mov w8, #2: the loop\'s core')
+
+
+def _ring19_ccmp(var):  # ccmp w8, #2, #0, hi: against the loop's core
+    return _ring19_patch(0x7a428900, lambda gen, a: (
+        f'if (COND_HI(c)) (void)(subs32(c, (uint32_t)c->x[8], LD32(c->sp + {var:#x}))); else c->nzcv = 0;'),
+        'ccmp w8, #2, #0, hi: against the loop\'s core')
+
+
+def _ring19_end(head_back, loop_back):  # b.ne <loop>: the core's last entry done, then the next core
+    def patch(gen, a):
+        assert _b_target(gen, a, 0x1) == a - loop_back
+        return (f'{{ if (!COND_EQ(c)) goto L_{a - loop_back:x}; goto L_{a - head_back:x}; }}'
+                f'  /* {a:#x}: b.ne: the core\'s last entry, then the next core (per-core rings) */')
+    return patch
+
 # #26 (BOTW-JOBS-NATIVE.md): a 0x58-byte string per core (sead FixedSafeString<64>: vtable, pointer to the inline
 # buffer at +0x14, capacity 0x40 at +0x10) in a function-local static at 0x7001e96c20 of f_7001594a84, indexed by the
 # core (unbounded) and made by its guarded init, unrolled for three. A block keyed by the static's address: the init
@@ -1396,6 +1485,31 @@ PATCHES = {
     'rec4c_any_1b': _rec4c_any(8, ((0, 0xb9401a68), (8, _REC4C_G1[0][0]), (0x10, _REC4C_G1[1][0]))),
     'rec4c_any_2a': _rec4c_any(0xc50, ((0, _REC4C_G2[0][0]), (8, _REC4C_G2[1][0]), (0x10, _REC4C_G2[2][0]))),
     'rec4c_any_2b': _rec4c_any(0xc50, ((0, _REC4C_G2[0][0]), (8, _REC4C_G2[1][0]), (0x10, _REC4C_G2[2][0]))),
+    'ring19_a_size': _ring19_n(0x52908000, 0, 0x80 * 0x58, 0, 'mov w0, #0x8400: every core\'s entries'),
+    'ring19_a_count': _ring19_n(0x52803008, 8, 0x80, 0, 'mov w8, #0x180: every core\'s entries made'),
+    'ring19_a_cores': _ring19_n(0xd2800068, 8, 1, 0, 'mov x8, #3: the count of cores'),
+    'ring19_b_size': _ring19_n(0x52842000, 0, 0x40 * 0x2c, 0, 'mov w0, #0x2100: every core\'s entries'),
+    'ring19_b_start': {0: _ring19_n(0x92841fe8, 8, -0x40 * 0x2c, 0, 'mov x8, #-0x2100: from every core\'s first entry'),
+                       4: _ring19_n(0x52842089, 9, 0x40 * 0x2c, 4, 'mov w9, #0x2104: (the same, +4)'),
+                       8: _ring19_n(0x5284218a, 10, 0x40 * 0x2c, 0xc, 'mov w10, #0x210c: (the same, +0xc)')},
+    'ring19_b_cores': _ring19_n(0xd2800068, 8, 1, 0, 'mov x8, #3: the count of cores'),
+    'ring19_c_size': _ring19_n(0x52817400, 0, 8 * 0x7c, 0, 'mov w0, #0xba0: every core\'s entries'),
+    'ring19_c_rest': _ring19_c_rest,
+    'ring19_c_cores': _ring19_n(0xd2800068, 8, 1, 0, 'mov x8, #3: the count of cores'),
+    'ring19_a_zero': _ring19_zero(23, 0xc), 'ring19_b_zero': _ring19_zero(22, 0xc), 'ring19_c_zero': _ring19_zero(22, 4),
+    'ring19_reset': _ring19_patch(0xf941a408, lambda gen, a: (
+        'extern void rt_ring19_reset(Cpu *); rt_ring19_reset(c); return;'), 'ldr x8, [x0, #0x348]: every ring\'s cursors'),
+    'ring19_add_a': _RING19_ADD, 'ring19_add_c': _RING19_ADD,
+    'ring19_wa_base': _ring19_patch(0x910062e9, lambda gen, a: f'c->x[9] = {_cur19("c->x[23]")};',
+                                    'add x9, x23, #0x18: every core\'s cursor'),
+    'ring19_wa_bound': _ring19_patch(0xf1000f7f, lambda gen, a: '(void)(subs64(c, c->x[27], (uint64_t)rt_game_cores()));',
+                                     'cmp x27, #3: every core'),
+    'ring19_wb_c0': _ring19_c0(0xb9401a96, 22, 20), 'ring19_wb_c1': _ring19_c1(0xb9401e88, 8, 20, 0xc),
+    'ring19_wb_ck': _ring19_next(0xb9402288, 8, 20, 0xc, 0xf8, 0xc),
+    'ring19_wb_mov': _ring19_mov(0xc), 'ring19_wb_ccmp': _ring19_ccmp(0xc), 'ring19_wb_end': _ring19_end(0xf4, 0xd8),
+    'ring19_wc_c0': _ring19_c0(0xb940181b, 27, 0), 'ring19_wc_c1': _ring19_c1(0xb9401e9b, 27, 20, 4),
+    'ring19_wc_ck': _ring19_next(0xb940229b, 27, 20, 4, 0x188, 8),
+    'ring19_wc_mov': _ring19_mov(4), 'ring19_wc_ccmp': _ring19_ccmp(4), 'ring19_wc_end': _ring19_end(0x184, 0x168),
     'str26_init_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
                                     'add x22, x22, #0xc20: every core\'s string'),
     'str26_init_rest': _str26_rest,

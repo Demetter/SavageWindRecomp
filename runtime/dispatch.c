@@ -427,13 +427,17 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
         static int nseen;
         uint64_t off = 0;
         const char *nm = host_sym(pc, &off);
-        if (!nm) nm = "?";
+        if (!nm) {  // our own executable: its offset from rt_fault_watch maps to a function with nm/addr2line
+            nm = "savagewind rt_fault_watch";
+            off = pc - (uint64_t)(uintptr_t)&rt_fault_watch;
+        }
         bool found = false;
         for (int i = 0; i < nseen; i++) found |= seen[i] == pc;
         if (!found && nseen < 256) {
             seen[nseen++] = pc;
-            fprintf(stderr, "[watch] +%#llx of %llx by %s+%llx\n", (unsigned long long)(fa - g_watch_lo),
-                    (unsigned long long)g_watch_lo, nm, (unsigned long long)off);
+            fprintf(stderr, "[watch] +%#llx of %llx by %s+%llx (%s, thread %x)\n", (unsigned long long)(fa - g_watch_lo),
+                    (unsigned long long)g_watch_lo, nm, (unsigned long long)off, g_fault_is_write ? "write" : "read",
+                    kernel_current_thread_handle());
             extern void kernel_log_guest_chain(void);
             kernel_log_guest_chain();  // (the guest calls that led there: lr and frame records)
         }

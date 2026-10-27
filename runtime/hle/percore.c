@@ -908,6 +908,34 @@ int rt_rec4c_any(uint64_t group) {
     return 0;
 }
 
+// ---- #19: per-core rings - 0x28-byte objects at +0x348 / +0x350 / +0x358 of their owner (made by f_70010605dc 1.9.0):
+// the count of cores at +8 (the makers' literal 3), the capacity per core at +0xc, the entries at +0x10 laid out
+// [cursor][core], a cursor per core at +0x18 and the capacity again at +0x24. Each core appends at its own cursor; the
+// walkers go over every core's entries. The makers size the entries and set the count for every core (tools/patches.py);
+// the cursors live in a block per ring.
+#define CUR19(ring) rt_percore_block(ring, 0x18, 4, 3, 0)
+
+// A ring's cursors, all zeroed (its maker's, the owner's reset).
+void rt_ring19_zero(uint64_t ring) {
+    uint64_t b = CUR19(ring);
+    for (uint64_t i = 0, n = (uint64_t)rt_game_cores(); i < n; i++) ST32(b + 4 * i, 0);
+}
+
+// f_7001060774 (1.9.0): every ring's cursors zeroed.
+void rt_ring19_reset(Cpu *c) {
+    for (uint32_t o = 0x348; o <= 0x358; o += 8) rt_ring19_zero(LD64(c->x[0] + o));
+}
+
+// Ring C's maker f_7001060a0c (1.9.0) constructs its 24 entries unrolled; at the last call: that entry's and every
+// further core's (8 a core), each made and its +0x74 zeroed (the maker zeroes the 24th's after the call).
+void rt_ring19_c_rest(Cpu *c, uint64_t entries, uint64_t make) {
+    for (uint64_t e = 23, n = 8 * (uint64_t)rt_game_cores(); e < n; e++) {
+        c->x[0] = entries + 0x7c * e;
+        guest_call(c, make);
+        if (e != 23) ST32(entries + 0x7c * e + 0x74, 0);
+    }
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);
