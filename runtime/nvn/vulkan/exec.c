@@ -4351,7 +4351,8 @@ static bool mvo_wanted(void) {
 #define MVO_JUMP 1.0f
 #define MVO_JUMP_REL 0.25f
 typedef struct { uint64_t key, akey; uint32_t off, size; } MvoEntry;  // (akey: the draw's address key, mvo_akey)
-typedef struct { MvoEntry *e; uint32_t n, cap; uint8_t *data; uint64_t used, dcap; uint32_t *tab; uint64_t frame; } MvoFrame;
+// (tab: generation << 32 | entry + 1; a slot of another generation is empty - no clearing each frame)
+typedef struct { MvoEntry *e; uint32_t n, cap, gen; uint8_t *data; uint64_t used, dcap; uint64_t *tab; uint64_t frame; } MvoFrame;
 static MvoFrame mvo[2];
 static int mvo_cur;
 static uint64_t mvo_draw;  // this draw's key
@@ -4359,7 +4360,7 @@ static uint64_t mvo_akey;  // ... and its address key (mvo_prepare)
 static uint64_t mvo_base;  // ... before its occurrence
 static uint32_t mvo_nth;   // ... its occurrence
 static uint64_t mvo_occ_key[MVO_TAB];
-static uint32_t mvo_occ[MVO_TAB];
+static uint32_t mvo_occ[MVO_TAB], mvo_occ_gen[MVO_TAB];  // (as tab: valid in the current frame's generation)
 static uint64_t mvo_stats[7];  // cbufs: previous found, missing, rejected (a jump); draws: moved by themselves, still;
                                // draws matched by their buffers, by mvo_pick
 static VkDescriptorBufferInfo mvo_prev_ubo[18];  // (this thread: the velocity draw's bindings 100 + k)
@@ -4378,9 +4379,8 @@ static void mvo_frame_check(void) {
     mvo_cur ^= 1;
     f = &mvo[mvo_cur];
     if (!f->tab) f->tab = calloc(MVO_TAB, sizeof *f->tab);
-    else memset(f->tab, 0, MVO_TAB * sizeof *f->tab);
-    f->n = 0, f->used = 0, f->frame = fr;
-    memset(mvo_occ_key, 0, sizeof mvo_occ_key);
+    static uint32_t gens;
+    f->n = 0, f->used = 0, f->frame = fr, f->gen = ++gens;
     static uint64_t logged;
     if (fr >= logged + 600) {
         logged = fr;
@@ -4399,8 +4399,9 @@ static void mvo_draw_key(const CmdRec *r, bool indexed) {
     for (int i = 0; i < draw_nargs(indexed); i++) h = mvo_mix(h, r->x[i]);
     if (!h) h = 1;
     uint32_t s = (uint32_t)(h ^ (h >> 29)) & (MVO_TAB - 1);
-    while (mvo_occ_key[s] && mvo_occ_key[s] != h) s = (s + 1) & (MVO_TAB - 1);
-    if (!mvo_occ_key[s]) { mvo_occ_key[s] = h; mvo_occ[s] = 0; }
+    uint32_t g = mvo[mvo_cur].gen;
+    while (mvo_occ_gen[s] == g && mvo_occ_key[s] != h) s = (s + 1) & (MVO_TAB - 1);
+    if (mvo_occ_gen[s] != g) { mvo_occ_gen[s] = g; mvo_occ_key[s] = h; mvo_occ[s] = 0; }
     mvo_base = h, mvo_nth = mvo_occ[s];
     mvo_draw = mvo_occ_draw(h, mvo_occ[s]++);
 }
@@ -4428,15 +4429,15 @@ static void mvo_record(int k, const void *src, uint32_t size) {
     }
     f->e[f->n] = (MvoEntry){key, mvo_akey, off, size};
     uint32_t s = (uint32_t)(key ^ (key >> 31)) & (MVO_TAB - 1);
-    while (f->tab[s]) s = (s + 1) & (MVO_TAB - 1);
-    f->tab[s] = ++f->n;
+    while ((uint32_t)(f->tab[s] >> 32) == f->gen) s = (s + 1) & (MVO_TAB - 1);
+    f->tab[s] = (uint64_t)f->gen << 32 | ++f->n;
 }
 
 static const MvoEntry *mvo_find(const MvoFrame *f, uint64_t draw, int k) {  // the previous frame's copy, or NULL
     uint64_t key = mvo_mix(draw, (uint64_t)k);
     uint32_t s = (uint32_t)(key ^ (key >> 31)) & (MVO_TAB - 1);
-    while (f->tab[s]) {
-        const MvoEntry *c = &f->e[f->tab[s] - 1];
+    while ((uint32_t)(f->tab[s] >> 32) == f->gen) {
+        const MvoEntry *c = &f->e[(uint32_t)f->tab[s] - 1];
         if (c->key == key) return c;
         s = (s + 1) & (MVO_TAB - 1);
     }
