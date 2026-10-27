@@ -637,6 +637,24 @@ SITES = [
     Site('q27_add3_bufs', 'code', '9104a269 8b0a112b 71000d5f 8b0a0a6a 9a893169 b942a14b b940012c f940052d', 0),
     Site('q27_add3_bound', 'code', '71000d5f 8b0a0a6a 9a893169 b942a14b b940012c f940052d 6b0b019f 1a9f816b', 0),
     Site('q27_add3_cur', 'code', '8b0a0a6a 9a893169 b942a14b b940012c f940052d 6b0b019f 1a9f816b 937d7d6b', 0),
+    # #4c's rings (BOTW-JOBS-NATIVE.md #4; tools/patches.py _rec4c_*, runtime/hle/percore.c): the constructor's end, the
+    # push's base and bound, the drain's pops and its checks of the rings' counts
+    Site('rec4c_ctor_end', 'code', 'b801051f 54000001/ff00001f f9400bf3 a8c27bfd d65f03c0', 2),
+    Site('rec4c_push_base', 'code', '9ba95109 71000d1f 9a943129 b940112a b9400928 6b08015f 5400000a/ff00001f 1100054b', 0),
+    Site('rec4c_push_bound', 'code', '71000d1f 9a943129 b940112a b9400928 6b08015f 5400000a/ff00001f 1100054b b900112b', 0),
+    Site('rec4c_push_pick', 'code', '9a943129 b940112a b9400928 6b08015f 5400000a/ff00001f 1100054b b900112b f940012b', 0),
+    Site('rec4c_pop_1', 'code', '94000000/fc000000 36000000/fff8001f b940026e 3400000e/ff00001f 2942abe9 aa1f03e8 b9401feb '
+         '2a1f03ed', 0),
+    Site('rec4c_pop_2', 'code', '94000000/fc000000 36000000/fff8001f b9400668 34000008/ff00001f bd400fe0 aa1f03e9 2a1f03ed '
+         '2940afea', 0),
+    Site('rec4c_any_1a', 'code', 'b9401808 390043ff b9001fff 35000008/ff00001f b9443268 35000008/ff00001f b9484a68 '
+         '34000008/ff00001f', 0),
+    Site('rec4c_any_1b', 'code', 'b9401a68 35000008/ff00001f b9443268 35000008/ff00001f b9484a68 35000008/ff00001f b2607fe8 '
+         '390003ff', 0),
+    Site('rec4c_any_2a', 'code', 'b94c6268 35000008/ff00001f b9507a68 35000008/ff00001f b9549268 34000008/ff00001f 52849308 '
+         '91314274', 0),
+    Site('rec4c_any_2b', 'code', 'b94c6268 35000008/ff00001f b9507a68 35000008/ff00001f b9549268 35000008/ff00001f a9444ff4 '
+         'a94357f6', 0),
     Site('main_data', 'data', '', 0),
     Site('main_end', 'end', '', 0),
 ]
@@ -767,7 +785,11 @@ OPTIONAL_GROUPS = [
      'rec4a_drop_rest', 'rec4a_release_fn', 'rec4a_drop_1',
      'rec4a_drop_0',
      'q27_add2_bufs', 'q27_add2_bound', 'q27_add2_cur',
-     'q27_add3_bufs', 'q27_add3_bound', 'q27_add3_cur'),
+     'q27_add3_bufs', 'q27_add3_bound', 'q27_add3_cur',
+     'rec4c_ctor_end', 'rec4c_push_base', 'rec4c_push_bound',
+     'rec4c_push_pick', 'rec4c_pop_1', 'rec4c_pop_2',
+     'rec4c_any_1a', 'rec4c_any_1b', 'rec4c_any_2a',
+     'rec4c_any_2b'),
 ]
 OPTIONAL = {n for g in OPTIONAL_GROUPS for n in g}
 
@@ -1213,6 +1235,16 @@ KNOWN = {
         'q27_add3_bufs': 0x700112f634,
         'q27_add3_bound': 0x700112f63c,
         'q27_add3_cur': 0x700112f640,
+        'rec4c_ctor_end': 0x700112bd94,
+        'rec4c_push_base': 0x7001150e74,
+        'rec4c_push_bound': 0x7001150e78,
+        'rec4c_push_pick': 0x7001150e7c,
+        'rec4c_pop_1': 0x700115102c,
+        'rec4c_pop_2': 0x7001151148,
+        'rec4c_any_1a': 0x7001150ff0,
+        'rec4c_any_1b': 0x70011510ec,
+        'rec4c_any_2a': 0x7001151114,
+        'rec4c_any_2b': 0x700115120c,
         'main_data': 0x7001b7a000,
         'main_end': 0x7001e98000,
     },

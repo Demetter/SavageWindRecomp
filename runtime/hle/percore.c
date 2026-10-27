@@ -859,6 +859,55 @@ void rt_rec4b_states(Cpu *c) {
     }
 }
 
+// ---- #4c: per-slot rings (slot = sead's core table entry of the core) of the 0x3098-byte object at +0xbf0 of its
+// owner (made by f_700112b6a8 1.9.0): two groups, at +8 and at +0xc50, of 0x418-byte rings - a pointer to its own 64
+// 16-byte entries at +0x14, the capacity, the start (+0xc) and the count (+0x10). Jobs push to their slot's ring of a
+// group (f_7001150e2c); f_7001150fcc drains each group, the first non-empty ring first, into the object's merged
+// arrays. The game's code does this for three rings a group; these for one a slot (a block per group, keyed by it).
+#define RING4C(group) rt_percore_block(group, 0, 0x418, 3, 0)
+
+// The constructor's end: every slot's ring of both groups, made as the constructor makes the game's (empty entries:
+// their +8 all ones).
+void rt_rec4c_ctor(uint64_t obj) {
+    for (uint64_t g = obj + 8; g <= obj + 0xc50; g += 0xc48) {
+        uint64_t b = RING4C(g);
+        for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+            uint64_t r = b + 0x418 * s;
+            for (uint32_t o = 0; o < 0x418; o += 8) ST64(r + o, 0);
+            for (uint32_t e = 0; e < 0x40; e++) ST32(r + 0x14 + 0x10 * e + 8, 0xffffffffu);
+            ST64(r, r + 0x14), ST32(r + 8, 0x40);
+        }
+    }
+}
+
+// f_7001150ed4 / f_7001150f50 (1.9.0): the oldest entry of the group's first non-empty ring (by slot) to x1; w0: one
+// was there.
+void rt_rec4c_pop(Cpu *c) {
+    uint64_t b = RING4C(c->x[0]), out = c->x[1];
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++) {
+        uint64_t r = b + 0x418 * s;
+        int32_t cnt = (int32_t)LD32(r + 0x10);
+        if (!cnt) continue;
+        if (cnt >= 1) {
+            int32_t cap = (int32_t)LD32(r + 8), st = (int32_t)LD32(r + 0xc);
+            uint64_t e = LD64(r) + 16 * (int64_t)(st - (st < cap ? 0 : cap));
+            ST64(out, LD64(e)), ST64(out + 8, LD64(e + 8));
+            ST32(r + 0xc, (uint32_t)(st + 1 >= cap ? 0 : st + 1)), ST32(r + 0x10, (uint32_t)(cnt - 1));
+        }
+        c->x[0] = 1;
+        return;
+    }
+    c->x[0] = 0;
+}
+
+// Is any slot's ring of the group not empty? (f_7001150fcc: its three counts read one after another)
+int rt_rec4c_any(uint64_t group) {
+    uint64_t b = RING4C(group);
+    for (uint64_t s = 0, n = (uint64_t)rt_game_cores(); s < n; s++)
+        if (LD32(b + 0x418 * s + 0x10)) return 1;
+    return 0;
+}
+
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
 void rt_arena_free_blocks(Cpu *c, uint64_t obj, uint64_t free_fn) {
     uint64_t recs = ARENA_RECS(obj);

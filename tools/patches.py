@@ -906,6 +906,32 @@ def _rec4b_other1(gen, a):  # the scans of the slots' kind-1 lists for a candida
         f'goto L_{a + 0x100:x};'), 'sxtw x11, w11: every slot\'s kind-1 list scanned')(gen, a)
 
 
+# #4c (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): the rings of the 0x3098-byte object at +0xbf0 of its owner - two
+# groups (at +8 and +0xc50) of a 0x418-byte ring per slot, in a block per group (keyed by the group). The constructor's
+# end makes every slot's rings; the push takes the block and bounds the slot; the drain's pops (the first non-empty
+# ring of a group) are the runtime's, and its checks of the rings' counts go over every slot.
+def _ring4c(group):
+    return f'rt_percore_block({group}, 0, 0x418, 3, 0)'
+
+
+def _rec4c_pop(gen, a):  # bl f_7001150ed4 / f_7001150f50 (byte-identical: patched at their one call each)
+    return _rec4_patch(None, lambda gen, a: 'extern void rt_rec4c_pop(Cpu *); rt_rec4c_pop(c);',
+                       'bl: the first non-empty ring of every slot\'s')(gen, a)
+
+
+def _rec4c_any(group_off, loads):  # three loads of a group's ring counts: {offset: (word)}; any slot's at the first
+    (o0, w0), *rest = loads
+    out = {o0: _rec4_patch(w0, lambda gen, a: (
+        f'extern int rt_rec4c_any(uint64_t); c->x[8] = (uint32_t)rt_rec4c_any(c->x[19] + {group_off:#x});'),
+        'ldr w8: any slot\'s ring not empty')}
+    for o, w in rest:
+        out[o] = _rec4_patch(w, lambda gen, a: 'c->x[8] = 0;', 'ldr w8: (every slot\'s at the first)')
+    return out
+
+
+_REC4C_G1 = ((0xb9443268, 0x430), (0xb9484a68, 0x848))  # (ldr w8, [x19, #0x430 / #0x848]: rings 1 and 2 of group 1)
+_REC4C_G2 = ((0xb94c6268, 0xc60), (0xb9507a68, 0x1078), (0xb9549268, 0x1490))
+
 # #26 (BOTW-JOBS-NATIVE.md): a 0x58-byte string per core (sead FixedSafeString<64>: vtable, pointer to the inline
 # buffer at +0x14, capacity 0x40 at +0x10) in a function-local static at 0x7001e96c20 of f_7001594a84, indexed by the
 # core (unbounded) and made by its guarded init, unrolled for three. A block keyed by the static's address: the init
@@ -1355,6 +1381,21 @@ PATCHES = {
     'rec4b_upd_any_d': _rec4b_any(8, _REC4B_ANY8),
     'rec4b_upd_keep_a': _rec4b_keep_a,
     'rec4b_upd_other1': _rec4b_other1,
+    'rec4c_ctor_end': _rec4_patch(0xf9400bf3, lambda gen, a: (
+        'extern void rt_rec4c_ctor(uint64_t); rt_rec4c_ctor(c->x[19]); c->x[19] = LD64(c->sp + 0x10);'),
+        'ldr x19, [sp, #0x10]: every slot\'s rings first'),
+    'rec4c_push_base': _rec4_patch(0x9ba95109, lambda gen, a: (
+        f'c->x[9] = {_ring4c("c->x[20]")} + 0x418ull * (uint32_t)c->x[8];'), 'umaddl x9, w8, w9, x20: the slot\'s ring'),
+    'rec4c_push_bound': _rec4_patch(0x71000d1f, lambda gen, a: (
+        '(void)(subs32(c, (uint32_t)c->x[8], (uint32_t)rt_game_cores()));'), 'cmp w8, #3: a slot with a ring'),
+    'rec4c_push_pick': _rec4_patch(0x9a943129, lambda gen, a: (
+        f'c->x[9] = (uint32_t)c->x[8] < (uint32_t)rt_game_cores() ? c->x[9] : {_ring4c("c->x[20]")};'),
+        'csel x9, x9, x20, lo: the slot\'s ring (else the first)'),
+    'rec4c_pop_1': _rec4c_pop, 'rec4c_pop_2': _rec4c_pop,
+    'rec4c_any_1a': _rec4c_any(8, ((0, 0xb9401808), (0x10, _REC4C_G1[0][0]), (0x18, _REC4C_G1[1][0]))),
+    'rec4c_any_1b': _rec4c_any(8, ((0, 0xb9401a68), (8, _REC4C_G1[0][0]), (0x10, _REC4C_G1[1][0]))),
+    'rec4c_any_2a': _rec4c_any(0xc50, ((0, _REC4C_G2[0][0]), (8, _REC4C_G2[1][0]), (0x10, _REC4C_G2[2][0]))),
+    'rec4c_any_2b': _rec4c_any(0xc50, ((0, _REC4C_G2[0][0]), (8, _REC4C_G2[1][0]), (0x10, _REC4C_G2[2][0]))),
     'str26_init_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
                                     'add x22, x22, #0xc20: every core\'s string'),
     'str26_init_rest': _str26_rest,
