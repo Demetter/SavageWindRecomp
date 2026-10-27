@@ -646,6 +646,126 @@ def _wd_base(word, dst, obj, field, idx, what):  # add x<dst>, x<obj>, <idx> (co
                      what + f': every core\'s {field}')
 
 
+# #6 (BOTW-JOBS-NATIVE.md): a u32 per core (+0xe70) and a float per core (+0xe7c) of their owner; five accessors take
+# the current core's (< 3), two per-frame sums add the first `sead core count` of them (unrolled up to three) and clear
+# them, the constructor zeroes both. Blocks with a slot for every core; each sum over its count at its first load.
+def _pair6(obj, field):
+    return f'rt_percore_block({obj}, {field:#x}, 4, 3, 0)'
+
+
+def _pair6_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core pairs')
+
+
+def _pair6_base(word, obj, field):
+    return _pair6_patch(word, lambda gen, a: f'c->x[8] = {_pair6(f"c->x[{obj}]", field)};',
+                        f'add x8, x{obj}, #{field:#x}: every core\'s')
+
+
+_PAIR6_BOUND = _pair6_patch(0x71000d3f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[9], (uint32_t)rt_game_cores()));',
+                            'cmp w9, #3: a core with a slot')
+def _PAIR6_NONE(word, what):
+    return _pair6_patch(word, lambda gen, a: '(void)0;', what + ' at the first)')
+
+
+_PAIR6_SUM_U = _pair6_patch(0xb94e7260, lambda gen, a: (  # w8: the sead core count
+    f'uint64_t b = {_pair6("c->x[19]", 0xe70)}; uint32_t s = 0, n = (uint32_t)c->x[8], m = (uint32_t)rt_game_cores(); '
+    'if (n > m) n = m; for (uint32_t i = 0; i < n; i++) { s += LD32(b + 4ull * i); ST32(b + 4ull * i, 0); } c->x[0] = s;'),
+    'ldr w0, [x19, #0xe70]: the sum of every counted core\'s, cleared')
+_PAIR6_SUM_F = _pair6_patch(0xbd4e7e60, lambda gen, a: (  # w8: the sead core count
+    f'uint64_t b = {_pair6("c->x[19]", 0xe7c)}; union {{ float f; uint32_t u; }} s = {{ 0.0f }}, v; '
+    'uint32_t n = (uint32_t)c->x[8], m = (uint32_t)rt_game_cores(); if (n > m) n = m; '
+    'for (uint32_t i = 0; i < n; i++) { v.u = LD32(b + 4ull * i); s.f = i ? s.f + v.f : v.f; ST32(b + 4ull * i, 0); } '
+    'c->v[0] = VV(s.u);'), 'ldr s0, [x19, #0xe7c]: the sum of every counted core\'s, cleared')
+_PAIR6_ZERO = _pair6_patch(0xf907427f, lambda gen, a: (
+    f'uint64_t a = {_pair6("c->x[19]", 0xe70)}, b = {_pair6("c->x[19]", 0xe7c)}; '
+    'for (int i = 0, n = rt_game_cores(); i < n; i++) { ST32(a + 4ull * i, 0); ST32(b + 4ull * i, 0); }'),
+    'str xzr, [x19, #0xe80]: zero every core\'s pair')
+
+
+# #5 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): per-slot results (slot = sead's core table entry of the core, < 3):
+# 0x40-byte records at +0x1138, u32s at +0x1238, floats at +0x6f0, in blocks with a slot for every core. The accessors
+# take the blocks and bound the slot by the game's core count; the merge (first valid record) and the float pick
+# (largest magnitude) run in the runtime over every slot; the floats' two zeroings zero every slot.
+def _slot5_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-slot results')
+
+
+def _slot5_base(word, dst, obj, field, stride):
+    return _slot5_patch(word, lambda gen, a: f'c->x[{dst}] = rt_percore_block(c->x[{obj}], {field:#x}, {stride:#x}, 3, 0);',
+                        f'add x{dst}, x{obj}, #{field:#x}: every slot')
+
+
+_SLOT5_BOUND = _slot5_patch(0x71000d1f, lambda gen, a: '(void)(subs32(c, (uint32_t)c->x[8], (uint32_t)rt_game_cores()));',
+                            'cmp w8, #3: a slot with a block entry')
+
+
+def _slot5_fzero(word, obj, what):
+    return _slot5_patch(word, lambda gen, a: (
+        f'uint64_t b = rt_percore_block(c->x[{obj}], 0x6f0, 4, 3, 0); '
+        'for (int i = 0, n = rt_game_cores(); i < n; i++) ST32(b + 4ull * i, 0);'), what)
+
+
+def _slot5_whole(word, fn, what):
+    def patch(gen, a):
+        assert _word(gen, a) == word, hex(_word(gen, a))
+        return f'{{ extern void {fn}(Cpu *); {fn}(c); return; }}  /* {a:#x}: per-slot results: {what} */'
+    return patch
+
+
+# #12 (BOTW-JOBS-NATIVE.md; runtime/hle/percore.c): the graphics singleton's 0xfd8-byte objects per core, pointers at
+# +0x70. The core-indexed accessors (through the core map f_7000fba16c) take them from a block with a slot for every
+# core; other code picks the first three by a fixed offset (roles), so the game's array stays and the block's first
+# three mirror it. The init makes every core's at its first store; its second and third makes take the block's.
+def _obj12_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core graphics objects')
+
+
+_OBJ12 = 'rt_percore_block_live(c->x[22], 0x70, 8, 3)'
+_OBJ12_DECL = 'extern uint64_t rt_percore_block_live(uint64_t, uint32_t, uint32_t, uint32_t); '
+
+
+def _obj12_first(gen, a):  # str x25, [x22, #0x70]: core 0's (x25, just made); then every other core's
+    alloc, ctor = gen.sites['obj12_alloc_fn'], gen.sites['obj12_ctor_fn']
+    return _obj12_patch(0xf9003ad9, lambda gen, a: (
+        _OBJ12_DECL + 'extern void rt_obj12_make(Cpu *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t); '
+        f'ST64(c->x[22] + 0x70, c->x[25]); rt_obj12_make(c, c->x[22], c->x[25], c->x[21], {alloc:#x}ull, {ctor:#x}ull);'),
+        'str x25, [x22, #0x70]: every core\'s object')(gen, a)
+
+
+def _obj12_take(k):  # bl alloc: the block's object k (made at the first)
+    return _obj12_patch(None, lambda gen, a: _OBJ12_DECL + f'c->x[0] = LD64({_OBJ12} + {8 * k});',
+                        f'bl: object {k} (made at the first)')
+
+
+def _obj12_base(word, reg):  # add x8, x<reg>, w0, uxtw #3 (then [x8, #0x70]): the core's object from the block
+    return _obj12_patch(word, lambda gen, a: (
+        _OBJ12_DECL + f'c->x[8] = rt_percore_block_live(c->x[{reg}], 0x70, 8, 3) - 0x70 + ((uint64_t)(uint32_t)c->x[0] << 3);'),
+        f'add x8, x{reg}, w0, uxtw #3: the core\'s object')
+
+
+# #26 (BOTW-JOBS-NATIVE.md): a 0x58-byte string per core (sead FixedSafeString<64>: vtable, pointer to the inline
+# buffer at +0x14, capacity 0x40 at +0x10) in a function-local static at 0x7001e96c20 of f_7001594a84, indexed by the
+# core (unbounded) and made by its guarded init, unrolled for three. A block keyed by the static's address: the init
+# makes the first three in it, then (at its last store) every other core's the same way; the accessors take the block.
+def _str26(reg, lo):
+    return f'rt_percore_block(c->x[{reg}] + {lo:#x}, 0, 0x58, 3, 0)'
+
+
+def _str26_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core strings')
+
+
+def _str26_rest(gen, a):  # str x26, [x22]: string 2's final vtable; then every further core's string (x24 / x26 vtables)
+    fn = _fn(gen, 'str26_init_fn')
+    return _str26_patch(0xf90002da, lambda gen, a: (
+        f'extern void {fn}(Cpu *); ST64(c->x[22], c->x[26]); uint64_t b = c->x[22] - 0xb0, x0 = c->x[0]; '
+        'for (uint64_t i = 3, n = (uint64_t)rt_game_cores(); i < n; i++) { uint64_t r = b + i * 0x58; '
+        'ST64(r, c->x[24]); ST64(r + 8, r + 0x14); ST32(r + 0x10, 0x40); '
+        f'c->x[0] = r; c->x[30] = {a + 4:#x}ull; {fn}(c); ST8(LD64(r + 8), 0); ST64(r, c->x[26]); }} c->x[0] = x0;'),
+        'str x26, [x22]: string 2 done, then every further core\'s')(gen, a)
+
+
 def _wd_ticks(gen, a):  # str x0, [x23]: core 0's tick (x0, just read), then every other core's
     return _wd_patch(0xf90002e0, lambda gen, a: (
         f'extern void {_fn(gen, "wd_tick_fn")}(Cpu *); uint64_t b = {_wd("c->x[19]", "tick")}; ST64(b, c->x[0]); '
@@ -675,6 +795,37 @@ def _lin_rec(word, obj, idx, mul):  # smaddl x8, w<idx>, w<mul (0x58)>, x<obj>
         f'c->x[8] = rt_percore_block(c->x[{obj}], 0x38, 0x58, 3, 0) - 0x38 + '
         f'(uint64_t)((int64_t)(int32_t)c->x[{idx}] * (int64_t)(int32_t)c->x[{mul}]);'),
         f'smaddl x8, w{idx}, w{mul}, x{obj}: the core\'s record', 'per-core linear allocators')
+
+
+# #24 (BOTW-JOBS-NATIVE.md): per-core pointer lists in the game's data (0x810 bytes each at 0x7001e93918: u32 count,
+# u32 capacity 0x100, a pointer to their inline entries) and a byte per core (0x7001e95148). Blocks keyed by the
+# globals' addresses (as the code forms them: page + offset) with a slot for every core; the static init makes every
+# core's list, every accessor takes the block and bounds the core by the game's core count.
+def _list24_patch(word, body, what):
+    return _ctx_patch(word, body, what, 'per-core lists')
+
+
+def _list24_base(word, reg, lo, stride, what):  # add x<reg>, x<reg>, #lo: the global -> its block
+    return _list24_patch(word, lambda gen, a: f'c->x[{reg}] = rt_percore_block(c->x[{reg}] + {lo:#x}, 0, {stride:#x}, 3, 0);',
+                         what)
+
+
+def _list24_bound(word, reg):
+    return _list24_patch(word, lambda gen, a: f'(void)(subs32(c, (uint32_t)c->x[{reg}], (uint32_t)rt_game_cores()));',
+                         f'cmp w{reg}, #3: a core with a slot')
+
+
+_LIST24_INIT = _list24_patch(0x91246129, lambda gen, a: (
+    'uint64_t b = rt_percore_block(c->x[9] + 0x918, 0, 0x810, 3, 0); '
+    'for (uint64_t i = 0, n = (uint64_t)rt_game_cores(); i < n; i++) { '
+    'ST64(b + i * 0x810, 0x10000000000ull); ST64(b + i * 0x810 + 8, b + i * 0x810 + 0x10); } c->x[9] = b;'),
+    'add x9, x9, #0x918: every core\'s list (empty, 0x100 entries); the game\'s stores fill the first three again')
+
+
+# #22 (BOTW-JOBS-NATIVE.md): a u16 counter per core at +0xb8 of its owner (unbounded; f_700118b52c adds to the
+# core's), zeroed by f_700118b58c: a block with a slot for every core.
+def _cnt22(obj):
+    return f'rt_percore_block({obj}, 0xb8, 2, 3, 0)'
 
 
 def _rec17_new(gen, a):
@@ -881,6 +1032,75 @@ PATCHES = {
     'lin_rec_d': _lin_rec(0x9b280028, 0, 1, 8),
     'lin_rec_e': _ctx_patch(0x9100e008, lambda gen, a: 'c->x[8] = rt_percore_block(c->x[0], 0x38, 0x58, 3, 0);',
                             'add x8, x0, #0x38: every core\'s record', 'per-core linear allocators'),
+    'list24_init': _LIST24_INIT,
+    'list24_a_base': _list24_base(0x91246108, 8, 0x918, 0x810, 'add x8, x8, #0x918: every core\'s list'),
+    'list24_a_bound': _list24_bound(0x71000c3f, 1),
+    'list24_b_bytes': _list24_base(0x910522d6, 22, 0x148, 1, 'add x22, x22, #0x148: every core\'s byte'),
+    'list24_b_base': _list24_base(0x91246129, 9, 0x918, 0x810, 'add x9, x9, #0x918: every core\'s list'),
+    'list24_b_bound1': _list24_bound(0x71000d1f, 8),
+    'list24_b_bound2': _list24_bound(0x71000d1f, 8),
+    'list24_b_bound3': _list24_bound(0x71000d1f, 8),
+    'list24_b_bound4': _list24_bound(0x71000d1f, 8),
+    'list24_c_base': _list24_base(0x91246108, 8, 0x918, 0x810, 'add x8, x8, #0x918: every core\'s list'),
+    'list24_c_bound': _list24_bound(0x71000c3f, 1),
+    'list24_d_base': _list24_base(0x91246108, 8, 0x918, 0x810, 'add x8, x8, #0x918: every core\'s list'),
+    'list24_d_bound': _list24_bound(0x71000c3f, 1),
+    'cnt22_add_base': _ctx_patch(0x8b080688, lambda gen, a: f'c->x[8] = {_cnt22("c->x[20]")} - 0xb8 + (c->x[8] << 1);',
+                                 'add x8, x20, x8, lsl #1: the core\'s counter', 'per-core u16 counters'),
+    'cnt22_reset_a': _ctx_patch(0x7901781f, lambda gen, a: (
+        f'uint64_t b = {_cnt22("c->x[0]")}; for (int i = 0, n = rt_game_cores(); i < n; i++) ST16(b + 2ull * i, 0);'),
+        'strh wzr, [x0, #0xbc]: zero every core\'s counter', 'per-core u16 counters'),
+    'cnt22_reset_b': _ctx_patch(0xb900b81f, lambda gen, a: '(void)0;', 'str wzr, [x0, #0xb8]: (zeroed at the first)',
+                                'per-core u16 counters'),
+    'pair6_a_base': _pair6_base(0x9139c288, 20, 0xe70), 'pair6_a_bound': _PAIR6_BOUND,
+    'pair6_b_base': _pair6_base(0x9139c268, 19, 0xe70), 'pair6_b_bound': _PAIR6_BOUND,
+    'pair6_c_base': _pair6_base(0x9139f268, 19, 0xe7c), 'pair6_c_bound': _PAIR6_BOUND,
+    'pair6_d_base': _pair6_base(0x9139f268, 19, 0xe7c), 'pair6_d_bound': _PAIR6_BOUND,
+    'pair6_e_base': _pair6_base(0x9139f268, 19, 0xe7c), 'pair6_e_bound': _PAIR6_BOUND,
+    'pair6_sum_u0': _PAIR6_SUM_U,
+    'pair6_sum_uz0': _PAIR6_NONE(0xb90e727f, 'str wzr, [x19, #0xe70]: (cleared'),
+    'pair6_sum_u1': _pair6_patch(0xb94e7669, lambda gen, a: 'c->x[9] = 0;', 'ldr w9, [x19, #0xe74]: (summed at the first)'),
+    'pair6_sum_uz1': _PAIR6_NONE(0xb90e767f, 'str wzr, [x19, #0xe74]: (cleared'),
+    'pair6_sum_u2': _pair6_patch(0xb94e7a68, lambda gen, a: 'c->x[8] = 0;', 'ldr w8, [x19, #0xe78]: (summed at the first)'),
+    'pair6_sum_uz2': _PAIR6_NONE(0xb90e7a7f, 'str wzr, [x19, #0xe78]: (cleared'),
+    'pair6_sum_f0': _PAIR6_SUM_F,
+    'pair6_sum_fz0': _PAIR6_NONE(0xb90e7e7f, 'str wzr, [x19, #0xe7c]: (cleared'),
+    'pair6_sum_f1': _pair6_patch(0xbd4e8260, lambda gen, a: 'c->v[0] = VV((uint32_t)0);', 'ldr s0, [x19, #0xe80]: (summed at the first)'),
+    'pair6_sum_fz1': _PAIR6_NONE(0xb90e827f, 'str wzr, [x19, #0xe80]: (cleared'),
+    'pair6_sum_f2': _pair6_patch(0xbd4e8660, lambda gen, a: 'c->v[0] = VV((uint32_t)0);', 'ldr s0, [x19, #0xe84]: (summed at the first)'),
+    'pair6_sum_fz2': _PAIR6_NONE(0xb90e867f, 'str wzr, [x19, #0xe84]: (cleared'),
+    'pair6_zero_a': _PAIR6_ZERO,
+    'pair6_zero_b': _PAIR6_NONE(0xf9073e7f, 'str xzr, [x19, #0xe78]: (zeroed'),
+    'pair6_zero_c': _PAIR6_NONE(0xf9073a7f, 'str xzr, [x19, #0xe70]: (zeroed'),
+    # #21 (BOTW-JOBS-NATIVE.md): a flip byte per core at +0x98 (unbounded; f_7001062ccc toggles the core's and picks a
+    # table entry with it), zeroed by the constructor f_7001062940: a block with a slot for every core
+    'flip21_base': _ctx_patch(0x91026288, lambda gen, a: 'c->x[8] = rt_percore_block(c->x[20], 0x98, 1, 3, 0);',
+                              'add x8, x20, #0x98: every core\'s flip byte', 'per-core flip bytes'),
+    'flip21_zero': _ctx_patch(0xb9009a9f, lambda gen, a: (
+        'uint64_t b = rt_percore_block(c->x[20], 0x98, 1, 3, 0); '
+        'for (int i = 0, n = rt_game_cores(); i < n; i++) ST8(b + i, 0); ST8(c->x[20] + 0x9b, 0);'),
+        'str wzr, [x20, #0x98]: zero every core\'s flip byte (and +0x9b)', 'per-core flip bytes'),
+    'slot5_rec_base': _slot5_base(0x8b0902a9, 9, 21, 0x1138, 0x40), 'slot5_rec_bound': _SLOT5_BOUND,
+    'slot5_u_base': _slot5_base(0x8b090289, 9, 20, 0x1238, 4), 'slot5_u_bound': _SLOT5_BOUND,
+    'slot5_f_base': _slot5_base(0x911bc269, 9, 19, 0x6f0, 4), 'slot5_f_bound': _SLOT5_BOUND,
+    'slot5_merge': _slot5_whole(0x52822e88, 'rt_rec5_merge', 'the merge over every slot'),
+    'slot5_pick': _slot5_whole(0xbd46f000, 'rt_f5_pick', 'the float pick over every slot'),
+    'slot5_fz_a': _slot5_fzero(0xb906fa7f, 19, 'str wzr, [x19, #0x6f8]: zero every slot\'s float'),
+    'slot5_fz_b': _slot5_patch(0xf9037a7f, lambda gen, a: '(void)0;', 'str xzr, [x19, #0x6f0]: (zeroed at the first)'),
+    'slot5_fz_c': _slot5_fzero(0xf903781f, 0, 'str xzr, [x0, #0x6f0]: zero every slot\'s float'),
+    'slot5_fz_d': _slot5_patch(0xb906f81f, lambda gen, a: '(void)0;', 'str wzr, [x0, #0x6f8]: (zeroed at the first)'),
+    'obj12_first': _obj12_first,
+    'obj12_alloc1': _obj12_take(1), 'obj12_ctor1': _obj12_patch(None, lambda gen, a: '(void)0;', 'bl: (made at the first)'),
+    'obj12_alloc2': _obj12_take(2), 'obj12_ctor2': _obj12_patch(None, lambda gen, a: '(void)0;', 'bl: (made at the first)'),
+    'obj12_a': _obj12_base(0x8b204e88, 20), 'obj12_b': _obj12_base(0x8b204ee8, 23), 'obj12_c': _obj12_base(0x8b204f48, 26),
+    'obj12_d': _obj12_base(0x8b204e88, 20), 'obj12_e': _obj12_base(0x8b204e88, 20),
+    'str26_init_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
+                                    'add x22, x22, #0xc20: every core\'s string'),
+    'str26_init_rest': _str26_rest,
+    'str26_a_base': _str26_patch(0x913082d6, lambda gen, a: f'c->x[22] = {_str26(22, 0xc20)};',
+                                 'add x22, x22, #0xc20: every core\'s string'),
+    'str26_b_base': _str26_patch(0x913082f7, lambda gen, a: f'c->x[23] = {_str26(23, 0xc20)};',
+                                 'add x23, x23, #0xc20: every core\'s string'),
     'busy_inc_bound': _BUSY_BOUND,
     'busy_inc_base': _BUSY_BASE,
     'busy_dec_bound': _BUSY_BOUND,

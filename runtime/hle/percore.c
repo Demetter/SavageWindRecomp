@@ -90,9 +90,21 @@ static int64_t poison(uint64_t a, uint32_t bytes, int write) {
     return -1;
 }
 
+static uint64_t block_of(uint64_t obj, uint32_t field, uint32_t stride, uint32_t switch_slots, int with_system, int live);
+
 // The block for obj's array at +field of slots of `stride` bytes, which the Switch sized for `switch_slots` cores
 // (with_system: its last slot is the system core's threads').
 uint64_t rt_percore_block(uint64_t obj, uint32_t field, uint32_t stride, uint32_t switch_slots, int with_system) {
+    return block_of(obj, field, stride, switch_slots, with_system, 0);
+}
+
+// The same for an array the game keeps using as well (its slots are roles some code picks by a fixed index): the
+// block's first switch_slots slots mirror it (the caller keeps them equal), the array is not poisoned.
+uint64_t rt_percore_block_live(uint64_t obj, uint32_t field, uint32_t stride, uint32_t switch_slots) {
+    return block_of(obj, field, stride, switch_slots, 0, 1);
+}
+
+static uint64_t block_of(uint64_t obj, uint32_t field, uint32_t stride, uint32_t switch_slots, int with_system, int live) {
     Entry *e = find(__atomic_load_n(&g_tab, __ATOMIC_ACQUIRE), obj, field);
     if (e) return e->block;
     pthread_mutex_lock(&g_m);
@@ -106,14 +118,14 @@ uint64_t rt_percore_block(uint64_t obj, uint32_t field, uint32_t stride, uint32_
     if (!b) FATAL("percore: out of memory\n");
     uint64_t block = ((uint64_t)(uintptr_t)b + 63) & ~63ull;
     if (g_poison < 0) g_poison = getenv("SAVAGEWIND_PERCORE_POISON") && atoi(getenv("SAVAGEWIND_PERCORE_POISON"));
-    uint32_t bytes = switch_slots * stride;
-    if (g_poison) poison(obj + field, bytes, 1);
+    uint32_t bytes = live ? 0 : switch_slots * stride;  // (a live array: nothing poisoned, nothing checked)
+    if (g_poison && bytes) poison(obj + field, bytes, 1);
     e = add(obj, field);
     e->block = block, e->field = field, e->bytes = bytes;
     __atomic_store_n(&e->obj, obj, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_m);
     LOG("[percore] %llx +%#x: %zu slots of %#x (the game's %u%s)%s\n", (unsigned long long)obj, field, slots, stride,
-        switch_slots, with_system ? ", the last the system core's" : "", g_poison ? "; its own array poisoned" : "");
+        switch_slots, with_system ? ", the last the system core's" : "", live ? "; the game's array kept" : g_poison ? "; its own array poisoned" : "");
     return block;
 }
 
@@ -440,6 +452,58 @@ void rt_lin_init(Cpu *c, const uint64_t *fn) {
     guest_call(c, fn[3]);
     c->x[0] = obj, c->x[1] = 1, c->x[2] = 2, c->x[3] = x5;
     guest_call(c, fn[4]);
+}
+
+// ---- #5: per-slot results (slot = sead's core table entry of the core): a 0x40-byte record per slot at +0x1138 (+0x3c
+// a valid byte), a u32 per slot at +0x1238, a float per slot at +0x6f0. Jobs fill their slot's; the merge and the
+// float pick read every slot's.
+#define REC5(obj) rt_percore_block(obj, 0x1138, 0x40, 3, 0)
+#define F5(obj) rt_percore_block(obj, 0x6f0, 4, 3, 0)
+
+// f_7000c30e74 (1.9.0): the first valid record (by slot) is the result (its first 0x3c bytes to +0x11f8, +0x1234 = 1);
+// every slot's valid byte cleared.
+void rt_rec5_merge(Cpu *c) {
+    uint64_t obj = c->x[0], b = REC5(obj);
+    int n = rt_game_cores();
+    for (int i = 0; i < n; i++) {
+        uint64_t r = b + 0x40ull * (uint64_t)i;
+        if (!LD8(r + 0x3c)) continue;
+        for (uint32_t o = 0; o < 0x30; o += 8) ST64(obj + 0x11f8 + o, LD64(r + o));
+        ST64(obj + 0x1228, LD64(r + 0x30)), ST32(obj + 0x1230, LD32(r + 0x38)), ST8(obj + 0x1234, 1);
+        break;
+    }
+    for (int i = 0; i < n; i++) ST8(b + 0x40ull * (uint64_t)i + 0x3c, 0);
+}
+
+// f_7000c33098 (1.9.0): the slot float with the largest magnitude (the first of equals; a NaN first slot gives 0), in s0.
+void rt_f5_pick(Cpu *c) {
+    uint64_t b = F5(c->x[0]);
+    union { float f; uint32_t u; } v, best;
+    v.u = LD32(b);
+    float a = v.f > 0.0f ? v.f : -v.f, top = a != a ? -1.0f : (a > -1.0f ? a : -1.0f);
+    best.f = a > -1.0f ? v.f : 0.0f;
+    for (int i = 1, n = rt_game_cores(); i < n; i++) {
+        v.u = LD32(b + 4ull * (uint64_t)i);
+        a = v.f > 0.0f ? v.f : -v.f;
+        if (a > top) best.f = v.f, top = a;
+    }
+    c->v[0] = VV(best.u);
+}
+
+// ---- #12: per-core 0xfd8-byte objects of the graphics singleton (pointers at +0x70; core-indexed accessors use the
+// current core's, other code uses the first three by a fixed index - roles). Its init f_700105bf6c (1.9.0) makes three;
+// at its first store this makes every other core's too (the game's second and third then take them).
+void rt_obj12_make(Cpu *c, uint64_t obj, uint64_t first, uint64_t heap, uint64_t alloc, uint64_t ctor) {
+    uint64_t b = rt_percore_block_live(obj, 0x70, 8, 3);
+    ST64(b, first);
+    for (uint64_t i = 1, n = (uint64_t)rt_game_cores(); i < n; i++) {
+        c->x[0] = 0xfd8, c->x[1] = heap, c->x[2] = 8;
+        guest_call(c, alloc);
+        uint64_t p = c->x[0];
+        c->x[0] = p, c->x[1] = 0;
+        guest_call(c, ctor);
+        ST64(b + 8 * i, p);
+    }
 }
 
 // The destructor f_7000ef2f54 (1.9.0): every core's block list (made with an 8-byte header) back to the heap (free_fn).
