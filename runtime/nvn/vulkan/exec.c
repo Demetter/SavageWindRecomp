@@ -10104,24 +10104,62 @@ static void *par_worker(void *arg) {
 static _Atomic int par_helpers_n;  // helper indexes given out (after the translation workers')
 int par_help_on = -1;
 int vk_par_pending(void) { return par_help_on > 0 && par_ring && atomic_load(&par_take) < atomic_load(&par_put); }
-int vk_par_help(void) {
-    if (par_help_on <= 0 || !par_ring || atomic_load(&par_take) >= atomic_load_explicit(&par_put, memory_order_acquire)) return 0;
+// Published chunks recorded on this thread as a translation worker of its own index; the number recorded. A chunk
+// sets this thread's per-chunk state (the pass, the draw in hand, its memos), saved here and put back after.
+static int par_help_here(void) {
+    if (!par_ring || atomic_load(&par_take) >= atomic_load_explicit(&par_put, memory_order_acquire)) return 0;
     static __thread ParCtx *x;
     static __thread XState hst;
     if (!x) {
         int k = atomic_fetch_add(&par_helpers_n, 1), xw = par_workers + k;
-        if (xw >= PAR_MAX) { par_help_on = 0; return 0; }
+        if (xw >= PAR_MAX) return 0;
         x = calloc(1, sizeof *x);
         par_ctx_init(x, xw);
     }
-    int sx = t_xw, sw = t_worker;
-    bool sro = vk_tex_ro;
-    XState *sst = st_tls;
+    struct {
+        int xw, w, sub, nfb, ncolor_samples[2];
+        bool ro, q, out, dfb, fbb, fbany[4];
+        XState *stp;
+        uint64_t seq, gens[5], fs;
+        VkCommandBuffer xcb;
+        VkFormat color[8], depth, stencil;
+        uint32_t w_h[2], lw_pos, uub_pos;
+        float sx, sy;
+        __typeof__(vel) vel;
+        const void *taa, *shadow, *up, *lw, *vprev;
+        NvnTexture *fbt[4];
+        VkImageView fbv[4];
+    } sv = {t_xw, t_worker, t_sub, nfeedback, {(int)pass_ncolor, (int)pass_samples}, vk_tex_ro, vkq_on, pass_out,
+            draw_feedback, fb_barrier, {0}, st_tls, t_seq, {key_gen, prog_gen, sbuf_gen, material_tex_gen, dyn_epoch},
+            g_cur_fs_hash, t_xcb, {0}, pass_depth, pass_stencil, {pass_w, pass_h}, t_lw_pos, t_uub_pos, pass_sx, pass_sy,
+            vel, t_taa, t_shadow_src, t_scene_up, t_lw, t_vel_prev, {0}, {0}};
+    memcpy(sv.color, pass_color, sizeof sv.color), memcpy(sv.fbany, feedback_any_type, sizeof sv.fbany);
+    memcpy(sv.fbt, feedback_tex, sizeof sv.fbt), memcpy(sv.fbv, feedback_view, sizeof sv.fbv);
     t_xw = x->xw, t_worker = PAR_BASE + x->xw, vk_tex_ro = true, st_tls = &hst;
+    vkq_on = false;  // (its own buffer, directly: the recording thread waits for this chunk)
     int n = 0;
     for (uint64_t i; (i = par_claim()) != UINT64_MAX; n++) par_exec(x, i);
-    t_xw = sx, t_worker = sw, vk_tex_ro = sro, st_tls = sst;
+    t_xw = sv.xw, t_worker = sv.w, t_sub = sv.sub, nfeedback = sv.nfb, pass_ncolor = (uint32_t)sv.ncolor_samples[0];
+    pass_samples = (uint32_t)sv.ncolor_samples[1], vk_tex_ro = sv.ro, vkq_on = sv.q, pass_out = sv.out;
+    draw_feedback = sv.dfb, fb_barrier = sv.fbb, st_tls = sv.stp, t_seq = sv.seq, key_gen = sv.gens[0] + 1;
+    prog_gen = sv.gens[1] + 1, sbuf_gen = sv.gens[2] + 1, material_tex_gen = sv.gens[3] + 1, dyn_epoch = sv.gens[4] + 1;
+    g_cur_fs_hash = sv.fs, t_xcb = sv.xcb, pass_depth = sv.depth, pass_stencil = sv.stencil, pass_w = sv.w_h[0];
+    pass_h = sv.w_h[1], t_lw_pos = sv.lw_pos, t_uub_pos = sv.uub_pos, pass_sx = sv.sx, pass_sy = sv.sy, vel = sv.vel;
+    t_taa = sv.taa, t_shadow_src = sv.shadow, t_scene_up = sv.up, t_lw = sv.lw, t_vel_prev = sv.vprev;
+    memcpy(pass_color, sv.color, sizeof sv.color), memcpy(feedback_any_type, sv.fbany, sizeof sv.fbany);
+    memcpy(feedback_tex, sv.fbt, sizeof sv.fbt), memcpy(feedback_view, sv.fbv, sizeof sv.fbv);
     return n;
+}
+int vk_par_help(void) { return par_help_on > 0 ? par_help_here() : 0; }
+// (the render thread, its list planned) the list's last chunks: it helps record them rather than wait for the
+// workers' backlog in the drain - as a PC job system's waiting thread does. SAVAGEWIND_VK_PAR_DRAIN_HELP=0: waits;
+// PERFX_DRAINHELP A/Bs it.
+static int par_drain_help(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_PAR_DRAIN_HELP") ? atoi(getenv("SAVAGEWIND_VK_PAR_DRAIN_HELP")) : 1;
+    if (!on || (perfx_trial(PERFX_DRAINHELP) && !perfx(PERFX_DRAINHELP))) return 0;
+    if (on == 2 && (renderer_present_count() & 1)) return 0;  // (2: even frames only, an in-run A/B for pixels)
+    return par_help_here();
 }
 
 static void par_start(void) {
@@ -12060,6 +12098,7 @@ void backend_execute(uint64_t handle) {
     if (drain < 0) drain = getenv("SAVAGEWIND_VK_LIST_DRAIN") ? atoi(getenv("SAVAGEWIND_VK_LIST_DRAIN")) != 0 : 1;
     bool detach = (perfx_trial(PERFX_DETACH) ? perfx(PERFX_DETACH) : !drain) && !bc_active && !g_vk.native_multi_draw &&
                   !safe_overlap_list_active && perf_survey_mode == SURVEY_OFF && !gcp_active() && !rdc_on();
+    if (par_list) par_drain_help();  // (the list's last chunks: recorded here too, not only waited for)
     if (detach) {
         dj_wait_all();
         par_sync();
