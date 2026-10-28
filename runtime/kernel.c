@@ -774,7 +774,47 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
     return R_OK;
 }
 
+// The game's condition variables as a PC's (with native locks; SAVAGEWIND_NATIVE_CV=0: the kernel's, below). Every
+// nn::os object that blocks - Semaphore, Event, MessageQueue, ConditionVariable, sead's and Havok's over them - waits
+// in InternalConditionVariable, i.e. svcWaitProcessWideKeyAtomic / svcSignalProcessWideKey on a key word. Through the
+// kernel each wait and each signal took its one lock, scanned its wait list and went through a host condition
+// variable (Kakariko, 28 Oct: the main thread's waits for Havok's physics jobs in nn::os::AcquireSemaphore ~9% of its
+// time, its ReleaseSemaphore / SetEvent signals ~6%). Here the key word itself is the condition: bit 0 says a thread
+// may wait (set before the mutex is let go, as the console orders it - the SDK's Signal skips the call while the key
+// reads 0), the rest counts signals; a waiter sleeps on the word until the count moves, a signal moves it and wakes
+// one sleeper (or all). Spurious wakeups are possible, as with any condition variable (nn::os's users loop). No
+// priority order among waiters, as with a PC's.
+static int cv_mode(void) {  // 1: native waits (2: an in-launch A/B with PERFX_NCV: signals then wake both kinds)
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("SAVAGEWIND_NATIVE_CV"), *x = getenv("SAVAGEWIND_PERFX");  // (the game starts before
+        m = !g_native_mutex || (e && !strcmp(e, "0")) ? 0 : x && (strtoul(x, NULL, 0) & PERFX_NCV) ? 2 : 1;  // perfx's init)
+    }
+    return m;
+}
+static uint32_t ncv_wait(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
+    uint32_t *k = u32p(key);
+    uint32_t s = __atomic_or_fetch(k, 1, __ATOMIC_SEQ_CST);  // (a thread waits: before the mutex is let go)
+    nmutex_unlock(u32p(mutex));
+    KThread *t = t_cur;
+    bool held = t && t->core_held >= 0;
+    if (held) core_release(t);
+    uint64_t end = timeout >= 0 ? plat_now_ns() + (uint64_t)timeout : UINT64_MAX;
+    uint32_t r = R_OK;
+    while (__atomic_load_n(k, __ATOMIC_ACQUIRE) == s) {
+        if (g_rt_unwind) { r = R_CANCELLED; break; }
+        uint64_t now = timeout >= 0 ? plat_now_ns() : 0;
+        if (now >= end) { r = R_TIMEOUT; break; }
+        plat_wait_u32(k, s, end - now < LOCK_SLICE_NS ? end - now : LOCK_SLICE_NS);
+    }
+    if (held) core_acquire(t);
+    if (r == R_OK) nmutex_lock(u32p(mutex), tag);  // (timed out: returns without it, as the console's - the SDK takes it)
+    return r;
+}
+
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
+    int m = cv_mode();
+    if (m == 1 || (m == 2 && (perfx_now() & PERFX_NCV))) return ncv_wait(mutex, key, tag, timeout);
     klock();
     KThread *t = t_cur;
     // The key says "a thread waits" before the mutex is let go, as the real kernel orders it: a signaller takes
@@ -812,6 +852,16 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
 }
 
 static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
+    int m = cv_mode();
+    if (m) {  // (native: the count moves, a sleeper wakes; in the A/B the kernel's waiters are woken below too)
+        uint32_t *k = u32p(key);
+        if (__atomic_load_n(k, __ATOMIC_RELAXED)) {
+            __atomic_add_fetch(k, 2, __ATOMIC_SEQ_CST);
+            if (count == 1) plat_wake_u32_one(k);
+            else plat_wake_u32_all(k);
+        }
+        if (m == 1) return;
+    }
     klock();
     int woken = 0;
     bool any_left = false;
@@ -836,7 +886,7 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     }
     for (KThread *t = g_waitlist; t; t = t->wnext)
         if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key) any_left = true;
-    if (!any_left) __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);
+    if (!any_left && !m) __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);  // (A/B: native waiters may sleep on it)
     pthread_mutex_unlock(&g_klock);
 }
 

@@ -22,6 +22,7 @@
 #include "../kernel.h"
 #include "../platform.h"
 #include "../rt.h"
+#include "../nvn/nvn.h"  // (NvnFnStat: the layer Draw jobs' NVN calls by function)
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -103,12 +104,29 @@ static int g_jt;
 typedef struct { uint64_t vt, w18, w20, n, ns, max, obj, nvn, calls, sn, swait, shold; } JobTime;
 int g_nvn_time;                          // (runtime/nvn/nvn.h: NVN calls timed on their thread)
 __thread uint64_t t_nvn_ticks, t_nvn_calls;
+__thread int t_nvn_tag;                  // (a layer's Draw job running: its NVN calls counted by function)
+static NvnFnStat *g_nvn_fns;
+void nvn_fn_note(NvnFnStat *s, uint64_t ticks) {
+    if (!__atomic_exchange_n(&s->listed, 1, __ATOMIC_ACQ_REL)) {
+        NvnFnStat *h = __atomic_load_n(&g_nvn_fns, __ATOMIC_ACQUIRE);
+        do s->next = h; while (!__atomic_compare_exchange_n(&g_nvn_fns, &h, s, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    }
+    __atomic_add_fetch(&s->n, 1, __ATOMIC_RELAXED), __atomic_add_fetch(&s->ticks, ticks, __ATOMIC_RELAXED);
+}
 __thread uint64_t t_shadow_n, t_shadow_wait, t_shadow_hold;  // (runtime/nvn/cmdbuf.c: its records' lock)
 static double g_tick_ns;                 // (ns per plat_ticks() tick)
 #define JT_N 1024
 static JobTime g_jtab[JT_N];
 static pthread_mutex_t g_jt_m = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_jt_t0;
+static int jobtime_is_draw(uint64_t g, uint32_t idx) {  // (1.9.0) a layer's Draw job: class 0x7001d07978, +0x18 0
+    uint32_t cap = LD32(g + 0x80);
+    uint64_t arr = LD64(g + 0x88);
+    if (!cap || idx >= cap || idx >= LD32(g + G_JOBS) || arr < GUEST_LO || arr + 8ull * cap > GUEST_HI) return 0;
+    uint64_t job = LD64(arr + 8ull * idx);
+    if (job < GUEST_LO || job + 0x28 > GUEST_HI) return 0;
+    return LD64(job) == 0x7001d07978ull && LD32(job + 0x18) == 0;
+}
 static void jobtime_note(uint64_t g, uint32_t idx, uint64_t ns, uint64_t ticks, uint64_t calls, uint64_t sn,
                          uint64_t swait, uint64_t shold) {
     // (a base group: its job array +0x88 holds +0x80 entries, its job count +0x90; every pointer checked as guest memory)
@@ -154,6 +172,17 @@ static void jobtime_note(uint64_t g, uint32_t idx, uint64_t ns, uint64_t ticks, 
     if (now - g_jt_t0 >= 2000000000ull) {
         double s = (now - g_jt_t0) / 1e9;
         bool shown[JT_N] = {0};
+        {   // the layer Draw jobs' NVN calls by function, the most called first (counts since the start)
+            NvnFnStat *top[24] = {0};
+            for (NvnFnStat *f = __atomic_load_n(&g_nvn_fns, __ATOMIC_ACQUIRE); f; f = f->next)
+                for (int k = 0; k < 24; k++)
+                    if (!top[k] || f->n > top[k]->n) { memmove(top + k + 1, top + k, (23 - k) * sizeof top[0]); top[k] = f; break; }
+            char buf[1600]; int k = 0;
+            for (int i = 0; i < 24 && top[i] && k < (int)sizeof buf - 80; i++)
+                k += snprintf(buf + k, sizeof buf - k, " %s %llu (%.0f us)", top[i]->name, (unsigned long long)top[i]->n,
+                              top[i]->ticks * g_tick_ns / 1e3);
+            if (k) LOG("[jobs-time] layer Draw jobs' NVN calls since the start:%s\n", buf);
+        }
         LOG("[jobs-time] the jobs with the most time (class, +0x18, +0x20: a second, mean, longest)\n");
         for (int r = 0; r < 16; r++) {
             int b = -1;
@@ -329,9 +358,11 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     for (;;) {
         c->x[0] = g, c->x[1] = grab, c->x[2] = c->sp, c->x[3] = w;
         uint32_t jt_idx = g_jt ? LD32(g + G_NEXT) : 0;  // (SAVAGEWIND_JOBS_JOBTIME: the job this call claims, as a rule)
+        if (g_jt) t_nvn_tag = jobtime_is_draw(g, jt_idx);
         uint64_t jt0 = g_jt ? plat_now_ns() : 0, jtk = t_nvn_ticks, jtc = t_nvn_calls;
         uint64_t jsn = t_shadow_n, jsw = t_shadow_wait, jsh = t_shadow_hold;
         guest_call(c, vfn(g, V_RUN_CHUNK));
+        t_nvn_tag = 0;
         bool last = c->x[0] & 1;
         if (g_jt && LD32(c->sp) == 1)
             jobtime_note(g, jt_idx, plat_now_ns() - jt0, t_nvn_ticks - jtk, t_nvn_calls - jtc, t_shadow_n - jsn,

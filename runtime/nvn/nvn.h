@@ -8,13 +8,19 @@
 // code and the NVN layer's
 extern int g_nvn_time;
 extern __thread uint64_t t_nvn_ticks, t_nvn_calls;
+extern __thread int t_nvn_tag;  // (jobs.c: a layer's Draw job is running - its calls counted by function)
+typedef struct NvnFnStat { const char *name; struct NvnFnStat *next; uint64_t n, ticks; int listed; } NvnFnStat;
+void nvn_fn_note(NvnFnStat *s, uint64_t ticks);
 #define NVN(name)                                                                           \
     static void hle_##name##_body(Cpu *c);                                                  \
+    static NvnFnStat nvn_fs_##name = {#name};                                               \
     HLE_FUNC(#name, hle_##name) {                                                           \
         if (__builtin_expect(g_nvn_time, 0)) {                                              \
             uint64_t t0_ = plat_ticks();                                                     \
             hle_##name##_body(c);                                                           \
-            t_nvn_ticks += plat_ticks() - t0_, t_nvn_calls++;                                \
+            uint64_t d_ = plat_ticks() - t0_;                                                \
+            t_nvn_ticks += d_, t_nvn_calls++;                                                \
+            if (t_nvn_tag) nvn_fn_note(&nvn_fs_##name, d_);                                  \
         } else hle_##name##_body(c);                                                        \
     }                                                                                       \
     static void hle_##name##_body(Cpu *c)
