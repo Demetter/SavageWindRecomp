@@ -342,6 +342,30 @@ static void wait_change(const uint32_t *w, uint32_t v, bool core_held) {
 
 static void help(Cpu *c);  // (fork-join, below)
 
+// A worker with no game work: the frame's translation chunks while there are any (one job system for the game's
+// jobs and the renderer's, SAVAGEWIND_VK_PAR_HELP), else asleep on the pool's word until the next round or a poke.
+extern int vk_par_help(void), vk_par_pending(void);
+static int g_help_sleepers;  // (idle workers asleep in idle_wait)
+static Pool *g_help_pool;  // (the pool whose idle workers translate: the first with workers)
+static void idle_wait(Pool *p, uint32_t s) {
+    for (int i = 0; i < g_spin; i++) {
+        if (__atomic_load_n(&p->seq, __ATOMIC_ACQUIRE) != s) return;
+        if (vk_par_help()) i = 0;
+        PAUSE();
+    }
+    while (__atomic_load_n(&p->seq, __ATOMIC_ACQUIRE) == s && !g_rt_unwind) {
+        if (vk_par_help()) continue;
+        __atomic_add_fetch(&g_help_sleepers, 1, __ATOMIC_SEQ_CST);
+        if (!vk_par_pending()) plat_wait_u32(&p->seq, s, 50000000);
+        __atomic_sub_fetch(&g_help_sleepers, 1, __ATOMIC_SEQ_CST);
+    }
+}
+// (runtime/nvn/vulkan/exec.c par_close, a chunk published with every translation worker busy) one idle worker woken
+void rt_jobs_poke_helper(void) {
+    Pool *p = __atomic_load_n(&g_help_pool, __ATOMIC_ACQUIRE);
+    if (p && __atomic_load_n(&g_help_sleepers, __ATOMIC_SEQ_CST)) plat_wake_u32_one(&p->seq);
+}
+
 // The worker's share of one group, as the game's run does: chunks of its grab size until the group's jobs are all
 // claimed, its count of jobs added to the group's, the group's event signalled by whoever completes it; a barrier group
 // (type 1 or 2) is waited for before the worker goes on.
@@ -562,7 +586,12 @@ static void worker_loop(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32
             }
             if (!__atomic_sub_fetch(&p->busy, 1, __ATOMIC_SEQ_CST)) plat_wake_u32_all(&p->busy);
         }
-        wait_change(&p->seq, s, false);
+        if (vk_par_pending() || __atomic_load_n(&g_help_pool, __ATOMIC_RELAXED) == p) {
+            Pool *z = NULL;
+            __atomic_compare_exchange_n(&g_help_pool, &z, p, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        }
+        if (__atomic_load_n(&g_help_pool, __ATOMIC_RELAXED) == p) idle_wait(p, s);
+        else wait_change(&p->seq, s, false);
     }
 }
 

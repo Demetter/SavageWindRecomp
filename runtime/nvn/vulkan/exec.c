@@ -9650,6 +9650,7 @@ static _Atomic uint64_t par_put, par_take, par_done;
 static pthread_mutex_t par_m = PTHREAD_MUTEX_INITIALIZER, par_rec_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t par_rec_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic int par_sleepers, par_rec_waiting;
+extern int par_help_on;  // (SAVAGEWIND_VK_PAR_HELP: game job workers take chunks between their jobs, vk_par_help)
 static int par_workers = -1, par_chunk_draws, par_spin, par_jobs, par_prio;
 static pthread_cond_t par_wcv[PAR_MAX];  // (par_m) each worker's wake-up, and the ticket + 1 it sleeps for (0: awake)
 static uint64_t par_wait[PAR_MAX];
@@ -9845,11 +9846,14 @@ static void par_close_(int why) {
     atomic_store(&par_put, ++par_nput);  // (publishes the chunk)
     // Only the worker holding this chunk's ticket can go on: waking every sleeper (a broadcast) cost each of the others
     // a wake-up and a sleep per chunk, ~150 chunks a frame times the workers
-    if (atomic_load(&par_sleepers)) {
+    if (atomic_load(&par_sleepers)) {  // (one sleeping worker a chunk: it takes chunks while there are any)
         pthread_mutex_lock(&par_m);
         for (int w = 0; w < par_workers; w++)
-            if (par_wait[w] == par_nput) pthread_cond_signal(&par_wcv[w]);
+            if (par_wait[w]) { par_wait[w] = 0, pthread_cond_signal(&par_wcv[w]); break; }
         pthread_mutex_unlock(&par_m);
+    } else if (par_help_on > 0) {  // (every translation worker busy: a game job worker that sleeps, if any)
+        extern void rt_jobs_poke_helper(void);
+        rt_jobs_poke_helper();
     }
     if (c->prim) return;
     ParChunkExec e = {subs[c->sub].main, c};
@@ -10008,6 +10012,50 @@ static void par_run(ParChunk *c, VkCommandBuffer cb) {
     if (atomic_load(&par_rec_waiting)) { pthread_mutex_lock(&par_rec_m); pthread_cond_broadcast(&par_rec_cv); pthread_mutex_unlock(&par_rec_m); }
 }
 
+// A translating thread's own resources: a translation worker's, or a helper's - a game job worker that takes chunks
+// between its jobs (vk_par_help) - so a frame's translation and the game's jobs share the cores, as one job system.
+typedef struct {
+    int xw;
+    VkCommandPool pool;
+    struct { VkCommandBuffer *b; int n, used; uint64_t seq; } bufs[SUBS], pbufs[SUBS];  // (per submission slot, reused
+    // once it is: secondaries, and primaries for primary passes)
+} ParCtx;
+static void par_ctx_init(ParCtx *x, int xw) {
+    memset(x, 0, sizeof *x);
+    x->xw = xw;
+    VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
+                                  .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT};
+    VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &x->pool));
+}
+// The next published chunk nobody has taken: its number, or UINT64_MAX. (Chunks are taken, not dealt out: any free
+// thread records the next one.)
+static uint64_t par_claim(void) {
+    uint64_t i = atomic_load(&par_take);
+    while (i < atomic_load_explicit(&par_put, memory_order_acquire))
+        if (atomic_compare_exchange_weak(&par_take, &i, i + 1)) return i;
+    return UINT64_MAX;
+}
+static void par_exec(ParCtx *x, uint64_t i) {  // chunk i, taken, recorded with x's buffers
+    ParChunk *c = &par_ring[i % PAR_RING];
+    __typeof__(x->bufs[0]) *b = c->prim ? &x->pbufs[c->sub] : &x->bufs[c->sub];
+    if (b->seq != c->seq) b->seq = c->seq, b->used = 0;  // (the slot's earlier submission completed: sub_recycle)
+    if (b->used == b->n) {
+        b->b = realloc(b->b, (size_t)(b->n + 8) * sizeof *b->b);
+        if (!b->b) FATAL("parallel translation: out of memory\n");
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = x->pool,
+                                          .level = c->prim ? VK_COMMAND_BUFFER_LEVEL_PRIMARY : VK_COMMAND_BUFFER_LEVEL_SECONDARY,
+                                          .commandBufferCount = 8};
+        VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, b->b + b->n));
+        b->n += 8;
+    }
+    uint64_t w1 = pp_on ? plat_now_ns() : 0;
+    par_run(c, b->b[b->used++]);
+    if (w1) {
+        atomic_fetch_add_explicit(&pp_w_busy_ns, plat_now_ns() - w1, memory_order_relaxed);
+        ppc_cycles();
+    }
+}
+
 static void *par_worker(void *arg) {
     t_xw = (int)(intptr_t)arg;
     t_worker = PAR_BASE + t_xw;
@@ -10016,58 +10064,64 @@ static void *par_worker(void *arg) {
     static __thread XState wst;
     st_tls = &wst;
     kernel_sample_host_thread();  // (SAVAGEWIND_SAMPLE)
-    VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
-                                  .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT};
-    VkCommandPool pool;
-    VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &pool));
-    struct { VkCommandBuffer *b; int n, used; uint64_t seq; } bufs[SUBS] = {0}, pbufs[SUBS] = {0};  // (per submission
-    // slot, reused once it is: secondaries, and primaries for primary passes)
+    static __thread ParCtx x;
+    par_ctx_init(&x, t_xw);
     int prio = par_prio;
     for (;;) {
         if (atomic_load_explicit(&par_prio_now, memory_order_relaxed) != prio)
             prio = atomic_load(&par_prio_now), perf_thread_priority(prio);
-        if (t_xw >= atomic_load(&par_limit)) {  // (not among the workers in use; a ticket taken before is served)
+        if (t_xw >= atomic_load(&par_limit)) {  // (not among the workers in use)
             pthread_mutex_lock(&par_m);
             while (t_xw >= atomic_load(&par_limit)) pthread_cond_wait(&par_limit_cv, &par_m);
             pthread_mutex_unlock(&par_m);
         }
-        uint64_t i = atomic_fetch_add(&par_take, 1);
         uint64_t w0 = pp_on ? plat_now_ns() : 0;
-        for (int k = 0; k < par_spin && atomic_load_explicit(&par_put, memory_order_acquire) <= i; k++) __builtin_ia32_pause();
-        if (atomic_load(&par_put) <= i) {  // (asleep until its chunk is published: par_close wakes this worker alone)
+        uint64_t i = par_claim();
+        for (int k = 0; i == UINT64_MAX && k < par_spin; k++) __builtin_ia32_pause(), i = par_claim();
+        if (i == UINT64_MAX) {  // (asleep until a chunk is published: par_close wakes one sleeper a chunk)
             pthread_mutex_lock(&par_m);
             atomic_fetch_add(&par_sleepers, 1);
-            par_wait[t_xw] = i + 1;
             if (w0) atomic_fetch_add_explicit(&pp_w_sleeps, 1, memory_order_relaxed);
-            while (atomic_load(&par_put) <= i) {
+            while (atomic_load(&par_take) >= atomic_load(&par_put) && t_xw < atomic_load(&par_limit)) {
+                par_wait[t_xw] = 1;  // (again after a wake-up another worker beat it to: the next chunk's to find it)
                 pthread_cond_wait(&par_wcv[t_xw], &par_m);
-                if (w0 && atomic_load(&par_put) <= i) atomic_fetch_add_explicit(&pp_w_futile, 1, memory_order_relaxed);
+                if (w0 && atomic_load(&par_take) >= atomic_load(&par_put)) atomic_fetch_add_explicit(&pp_w_futile, 1, memory_order_relaxed);
             }
             par_wait[t_xw] = 0;
             atomic_fetch_sub(&par_sleepers, 1);
             pthread_mutex_unlock(&par_m);
+            if (w0) atomic_fetch_add_explicit(&pp_w_wait_ns, plat_now_ns() - w0, memory_order_relaxed);
+            continue;
         }
-        ParChunk *c = &par_ring[i % PAR_RING];
-        __typeof__(bufs[0]) *b = c->prim ? &pbufs[c->sub] : &bufs[c->sub];
-        if (b->seq != c->seq) b->seq = c->seq, b->used = 0;  // (the slot's earlier submission completed: sub_recycle)
-        if (b->used == b->n) {
-            b->b = realloc(b->b, (size_t)(b->n + 8) * sizeof *b->b);
-            if (!b->b) FATAL("parallel translation: out of memory\n");
-            VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
-                                              .level = c->prim ? VK_COMMAND_BUFFER_LEVEL_PRIMARY : VK_COMMAND_BUFFER_LEVEL_SECONDARY,
-                                              .commandBufferCount = 8};
-            VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, b->b + b->n));
-            b->n += 8;
-        }
-        uint64_t w1 = w0 ? plat_now_ns() : 0;
-        par_run(c, b->b[b->used++]);
-        if (w1) {
-            atomic_fetch_add_explicit(&pp_w_wait_ns, w1 - w0, memory_order_relaxed);
-            atomic_fetch_add_explicit(&pp_w_busy_ns, plat_now_ns() - w1, memory_order_relaxed);
-            ppc_cycles();
-        }
+        if (w0) atomic_fetch_add_explicit(&pp_w_wait_ns, plat_now_ns() - w0, memory_order_relaxed);
+        par_exec(&x, i);
     }
     return NULL;
+}
+
+// (another thread: a game job worker between its jobs, runtime/hle/jobs.c) records published chunks while there are
+// any, as a translation worker of its own index; the number recorded. SAVAGEWIND_VK_PAR_HELP=1 (in test).
+static _Atomic int par_helpers_n;  // helper indexes given out (after the translation workers')
+int par_help_on = -1;
+int vk_par_pending(void) { return par_help_on > 0 && par_ring && atomic_load(&par_take) < atomic_load(&par_put); }
+int vk_par_help(void) {
+    if (par_help_on <= 0 || !par_ring || atomic_load(&par_take) >= atomic_load_explicit(&par_put, memory_order_acquire)) return 0;
+    static __thread ParCtx *x;
+    static __thread XState hst;
+    if (!x) {
+        int k = atomic_fetch_add(&par_helpers_n, 1), xw = par_workers + k;
+        if (xw >= PAR_MAX) { par_help_on = 0; return 0; }
+        x = calloc(1, sizeof *x);
+        par_ctx_init(x, xw);
+    }
+    int sx = t_xw, sw = t_worker;
+    bool sro = vk_tex_ro;
+    XState *sst = st_tls;
+    t_xw = x->xw, t_worker = PAR_BASE + x->xw, vk_tex_ro = true, st_tls = &hst;
+    int n = 0;
+    for (uint64_t i; (i = par_claim()) != UINT64_MAX; n++) par_exec(x, i);
+    t_xw = sx, t_worker = sw, vk_tex_ro = sro, st_tls = sst;
+    return n;
 }
 
 static void par_start(void) {
@@ -10083,6 +10137,7 @@ static void par_start(void) {
     const char *e = getenv("SAVAGEWIND_VK_PAR");
     extern int rt_render_workers_default(void);
     par_workers = e ? atoi(e) : rt_render_workers_default();
+    par_help_on = getenv("SAVAGEWIND_VK_PAR_HELP") ? atoi(getenv("SAVAGEWIND_VK_PAR_HELP")) : 0;
     if (par_workers < 0) par_workers = 0;
     if (par_workers > PAR_MAX) par_workers = PAR_MAX;
     e = getenv("SAVAGEWIND_VK_PAR_CHUNK");
