@@ -799,14 +799,32 @@ static uint32_t ncv_wait(uint64_t mutex, uint64_t key, uint32_t tag, int64_t tim
     KThread *t = t_cur;
     bool held = t && t->core_held >= 0;
     if (held) core_release(t);
-    uint64_t end = timeout >= 0 ? plat_now_ns() + (uint64_t)timeout : UINT64_MAX;
+    uint64_t t0 = plat_now_ns(), end = timeout >= 0 ? t0 + (uint64_t)timeout : UINT64_MAX;
     uint32_t r = R_OK;
+    // A thread whose last waits were short spins a little first: the signal then lands without a sleep and a wake
+    // (Havok's job queue hands its physics jobs back and forth in nn::os semaphores many times a frame: its step was
+    // ~80% the main thread waiting with no physics job running). SAVAGEWIND_CV_SPIN_US: the spin (PERFX_CVSPIN A/Bs it);
+    // off by default: 20 us measured -0.6% (5 of 25 neighbour blocks faster, p99 6.62 -> 5.48 ms; Kakariko 720p, 28 Oct).
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) spin_ns = (getenv("SAVAGEWIND_CV_SPIN_US") ? atoi(getenv("SAVAGEWIND_CV_SPIN_US")) : 0) * 1000;
+    if (spin_ns && t && t->block_ns < 4 * (uint64_t)spin_ns && (!perfx_trial(PERFX_CVSPIN) || (perfx_now() & PERFX_CVSPIN))) {
+        uint64_t stop = t0 + (uint64_t)spin_ns < end ? t0 + (uint64_t)spin_ns : end;
+        for (unsigned i = 1; __atomic_load_n(k, __ATOMIC_ACQUIRE) == s; i++) {
+            if (!(i & 15) && plat_now_ns() >= stop) break;
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+    }
     while (__atomic_load_n(k, __ATOMIC_ACQUIRE) == s) {
         if (g_rt_unwind) { r = R_CANCELLED; break; }
         uint64_t now = timeout >= 0 ? plat_now_ns() : 0;
         if (now >= end) { r = R_TIMEOUT; break; }
         plat_wait_u32(k, s, end - now < LOCK_SLICE_NS ? end - now : LOCK_SLICE_NS);
     }
+    if (t) t->block_ns = plat_now_ns() - t0;
     if (held) core_acquire(t);
     if (r == R_OK) nmutex_lock(u32p(mutex), tag);  // (timed out: returns without it, as the console's - the SDK takes it)
     return r;
