@@ -9831,6 +9831,12 @@ static void draw_(CmdRec *r, bool indexed) {
     if (ptp_on > 0) pp_draw(r, indexed, f.pr);
     if (ss_on > 0) ss_draw(f.pr, ss_cur_depth);
     ppc_add(PPC_FRONT, 1);
+    // (diagnostics) PERFX_NOBACK: every draw's rest dropped after its front half - the frame's images are wrong, the
+    // game's work is the same: what the per-draw translation costs the frame, as an upper bound. SAVAGEWIND_VK_NOBACK=1:
+    // always (to A/B the game's own changes without the translation's load)
+    static int noback = -1;
+    if (noback < 0) noback = getenv("SAVAGEWIND_VK_NOBACK") ? atoi(getenv("SAVAGEWIND_VK_NOBACK")) : 0;
+    if (noback || (perfx_trial(PERFX_NOBACK) && perfx(PERFX_NOBACK))) { ppc_add(PPC_BACK_FAIL, 1); return; }
     if (f.par_ok) par_draw(r, indexed, &f), ppc_add(PPC_PAR, 1);  // (its rest recorded by a worker)
     else if (!draw_back(r, indexed, &f)) { ppc_add(PPC_BACK_FAIL, 1); return; }
     draw_after(&f);

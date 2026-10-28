@@ -917,6 +917,22 @@ static void vri_steal(Cpu *c, void *arg, uint32_t slot) {  // (a helper) the tai
         if (atomic_compare_exchange_weak(&t->ends, &e, e - (1ull << 32))) vri_part(c, t, tl - 1), atomic_fetch_add(&t->stolen, 1);
     }
 }
+// (statistics) the inline lists' time on the list's own thread: all of it, the fork (its own parts and the wait for the
+// helpers'), the consumer called again for the helpers' parts; every 2 s "[jobs] view recording time"
+static _Atomic uint64_t g_vri_tm[6];  // lists, draws, ns, fork ns, consumer ns, lists with stolen parts
+static void vri_time_note(uint32_t draws, uint64_t ns, uint64_t fork_ns, uint64_t cons_ns, bool stolen) {
+    atomic_fetch_add(&g_vri_tm[0], 1), atomic_fetch_add(&g_vri_tm[1], draws), atomic_fetch_add(&g_vri_tm[2], ns);
+    atomic_fetch_add(&g_vri_tm[3], fork_ns), atomic_fetch_add(&g_vri_tm[4], cons_ns), atomic_fetch_add(&g_vri_tm[5], stolen);
+    static _Atomic uint64_t last;
+    uint64_t now = plat_now_ns(), l = atomic_load(&last);
+    if (now - l < 2000000000ull || !atomic_compare_exchange_strong(&last, &l, now)) return;
+    uint64_t v[6];
+    for (int i = 0; i < 6; i++) v[i] = atomic_exchange(&g_vri_tm[i], 0);
+    if (!v[0]) return;
+    LOG("[jobs] view recording time: %llu lists, %.0f draws each, %.1f us each on the list's thread (fork %.1f, consumer "
+        "again %.1f), %.0f%% with helpers' parts\n", (unsigned long long)v[0], (double)v[1] / v[0], v[2] / 1e3 / v[0],
+        v[3] / 1e3 / v[0], v[4] / 1e3 / v[0], 100.0 * v[5] / v[0]);
+}
 int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     // (off unless SAVAGEWIND_VIEW_REC_INLINE=1; =2 in even game frames only, an A/B.) The list's own thread records parts
     // from the front straight into its open command buffer, as the game records the whole list; job threads of its pool
@@ -934,6 +950,16 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     extern uint64_t g_game_frames;
     if (enabled == 2 && (g_game_frames & 1)) return 0;  // (=2: the game's inline recording in odd game frames, an A/B)
     uint64_t list = c->x[23], dctx = c->x[19], pass = c->x[22], view = c->x[21], x4 = c->x[20];
+    if (enabled == 3 && !t_vri) {  // (=3, timing only: the game's own recording of the list, timed as the parts below)
+        uint64_t t0 = plat_now_ns();
+        t_vri = 1;
+        c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
+        guest_call(c, fns[VRI_CONSUME]);
+        t_vri = 0;
+        vri_time_note(LD32(list + 0x3c), plat_now_ns() - t0, 0, 0, false);
+        return 1;
+    }
+    uint64_t vt0 = plat_now_ns();
     static int min_draws = -1;  // (a part's draws at least: its fixed cost - draw state, command buffer - stays small)
     if (min_draws < 0) min_draws = getenv("SAVAGEWIND_VRI_MIN") && atoi(getenv("SAVAGEWIND_VRI_MIN")) > 0 ? atoi(getenv("SAVAGEWIND_VRI_MIN")) : 24;
     uint32_t total = LD32(list + 0x3c), parts = 2 * rt_view_rec_parts();
@@ -970,18 +996,22 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
         guest_call(c, VRI_STEP_MODE_GET);
         t.mode = (uint32_t)c->x[0];
     }
+    uint64_t vt1 = plat_now_ns();
     if (!rt_jobs_fork_owner(c, vri_steal, &t, parts, vri_own)) {
         atomic_fetch_add(&g_vri_stat[2], 1);
         vri_own(c, &t);
     }
+    uint64_t vt2 = plat_now_ns();
     if (!atomic_load(&t.stolen)) {  // (all of it recorded in place, as the game does: no record to call)
         __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST);
+        vri_time_note(total, vt2 - vt0, vt2 - vt1, 0, false);
         return 1;
     }
     t_vri = 1;  // (the consumer again: it finds the helpers' parts in the list's record and calls them after the prefix)
     c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
     guest_call(c, fns[VRI_CONSUME]);
     t_vri = 0;
+    vri_time_note(total, plat_now_ns() - vt0, vt2 - vt1, plat_now_ns() - vt2, true);
     c->x[0] = list + 0x58;
     guest_call(c, fns[VRI_LOCK]);
     if (LD32(list + 0x50) == n0 + 1) ST32(list + 0x50, n0);
