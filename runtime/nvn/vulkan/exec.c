@@ -204,6 +204,15 @@ typedef struct {
     int wnpools[MT_MAX], wcur[MT_MAX];
     VkCommandBuffer *rsec;  // (parallel translation) the render thread's secondary buffers: what it records inside passes
     int nrsec, rsec_used;
+    // (parallel translation, primary passes) the submission in pieces, in order: its main buffer's segments and the
+    // primaries workers record whole passes into (prim[k], filled in when the worker is done); main is the segment being
+    // recorded, main_first the slot's first
+    VkCommandBuffer main_first, *segs;
+    int nsegs, segs_used;
+    struct { VkCommandBuffer cb; int prim; } parts[64];
+    int nparts;
+    struct PrimRec { VkCommandBuffer cb; int ready; } prim[64];
+    int nprim;
 } Sub;
 static Sub subs[SUBS];
 static int cur_sub;
@@ -223,6 +232,25 @@ static bool in_pass;
 // SAVAGEWIND_VK_PAR_INLINE=<mask of scale groups, 1 << RS_*> (default PAR_INLINE_DEFAULT)
 #define PAR_INLINE_DEFAULT (1 << RS_SHADOW | 1 << RS_NONE)
 static bool pass_inline;
+// (parallel translation) Primary passes: the shadow maps' passes recorded whole by the workers, each part of a pass in a
+// primary command buffer of the worker's own between segments of the submission's buffer - the render thread then
+// records none of their draws, and the GPU runs them as from the render thread (secondary buffers made those passes
+// 30-130% slower: pass_inline above). A pass begins in each primary (vkCmdBeginRendering ... End: the first with the
+// pass's load ops, later ones loading what is there) and in the submission's buffer where the render thread records
+// inside it itself. 28 Oct, 720p N=6 in one launch: +2.5% fps, p99 6.9 -> 5.3 ms; 5K +1%, p99 7.4 -> 6.5 ms; per-frame
+// alternation pixel-equal. SAVAGEWIND_VK_PAR_PRIMARY=0 off, 2 even frames only (an in-run A/B); PERFX_VKPRIM A/Bs it.
+static int prim_mode = -1;
+static bool pass_prim, prim_rt_open;  // the pass in progress is one; the render thread's own part of it is open
+static int prim_parts;                // parts of it begun so far
+static VkRenderingInfo prim_ri;
+static VkRenderingAttachmentInfo prim_da, prim_sa;
+static bool prim_has_d, prim_has_s;
+static void prim_info(VkRenderingInfo *ri, VkRenderingAttachmentInfo *da, VkRenderingAttachmentInfo *sa) {
+    *ri = prim_ri, *da = prim_da, *sa = prim_sa;  // (the next part of the pass: after the first, what is there)
+    if (prim_parts) da->loadOp = sa->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    ri->pDepthAttachment = prim_has_d ? da : NULL, ri->pStencilAttachment = prim_has_s ? sa : NULL;
+    ri->colorAttachmentCount = 0, ri->pColorAttachments = NULL;
+}
 static int par_inline_mask = -1;
 static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
 static uint32_t chunk_passes; // passes begun since the last submission
@@ -315,6 +343,8 @@ __attribute__((noinline)) static void sub_recycle(Sub *s) {
         }
         s->seq = submit_seq + 1;
         s->rsec_used = 0;
+        if (s->main_first) s->main = s->main_first;  // (primary passes: the segments again from the first)
+        s->segs_used = s->nparts = s->nprim = 0;
         s->main_begun = s->upload_begun = false;
         atomic_store_explicit(&s->fxr, 0, memory_order_relaxed);
         s->geometry = s->writes_heap = false;
@@ -370,20 +400,35 @@ VkCommandBuffer vk_cmd(void) {
         if (inl_probe && par_list && in_pass && pass_inline) inl_note(__builtin_return_address(0));
     }
     if (par_list && in_pass && !pass_inline) return par_rcmd();  // (the render thread inside a pass of a parallel list: its own, in order)
+    bool prim_part = pass_prim && in_pass && !prim_rt_open;  // (inside a primary pass: the workers' part so far goes
+    if (prim_part) par_close(PAR_REC);                        // first, then the pass goes on in the submission's buffer)
     Sub *s = sub();
     if (!s->main_begun) {
+        bool first = !s->nparts;  // (a later segment of a submission cut by primary passes: no start marks)
         begin_cb(&s->main, &s->main_begun);
-        vk_timing_begin(s->main, (unsigned)cur_sub, false);
+        if (!s->main_first) s->main_first = s->main;
         dyn_epoch++;
-        gp_mark(s->main, "(submission start; includes GPU idle before it)");
-        if (prof && prof_qp) {
-            vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
-            vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
-            s->ts = true;
+        if (first) {
+            vk_timing_begin(s->main, (unsigned)cur_sub, false);
+            gp_mark(s->main, "(submission start; includes GPU idle before it)");
+            if (prof && prof_qp) {
+                vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
+                vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
+                s->ts = true;
+            }
         }
+    }
+    if (prim_part) {
+        VkRenderingInfo ri;
+        VkRenderingAttachmentInfo da, sa;
+        prim_info(&ri, &da, &sa);
+        prim_rt_open = true, prim_parts++;
+        vkCmdBeginRendering(s->main, &ri);
+        dyn_epoch++;
     }
     return s->main;
 }
+
 
 VkCommandBuffer vk_upload_cmd(void) {
     if (t_xw >= 0) FATAL("translation worker asked for the upload buffer (a texture its draw samples wasn't prepared)\n");
@@ -651,6 +696,45 @@ static void gtl_list(uint64_t first, uint64_t last, uint64_t x0, uint64_t draws)
         (unsigned long long)x0, (unsigned long long)plat_now_ns());
 }
 
+static pthread_mutex_t par_rec_m;  // (parallel translation, below: the recording thread waiting for a worker)
+static pthread_cond_t par_rec_cv;
+static _Atomic int par_rec_waiting;
+// (primary passes) A submission with workers' primaries in it, made on the recording thread in its turn: each primary
+// waited for (its worker hands it over: par_run), then the whole list in order.
+typedef struct {
+    int n, prim[2 + 64];
+    VkCommandBufferSubmitInfo cbs[2 + 64];
+    VkSubmitInfo2 si;
+    VkSemaphoreSubmitInfo sig[2], wt;
+    struct PrimRec *recs;
+} PrimSubmit;
+static void prim_submit_replay(void *p) {
+    PrimSubmit *a = p;
+    for (int i = 0; i < a->n; i++) {
+        if (a->prim[i] < 0) continue;
+        struct PrimRec *r = &a->recs[a->prim[i]];
+        while (!__atomic_load_n(&r->ready, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_lock(&par_rec_m);
+            atomic_store(&par_rec_waiting, 1);
+            if (!__atomic_load_n(&r->ready, __ATOMIC_ACQUIRE)) {
+                struct timespec ts;  // (in slices: the worker's broadcast is only sent while a waiter shows)
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 200000;
+                if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+                pthread_cond_timedwait(&par_rec_cv, &par_rec_m, &ts);
+            }
+            atomic_store(&par_rec_waiting, 0);
+            pthread_mutex_unlock(&par_rec_m);
+        }
+        a->cbs[i].commandBuffer = r->cb;
+    }
+    a->si.pCommandBufferInfos = a->cbs, a->si.commandBufferInfoCount = (uint32_t)a->n;
+    a->si.pSignalSemaphoreInfos = a->sig, a->si.pWaitSemaphoreInfos = &a->wt;
+    VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &a->si, VK_NULL_HANDLE);
+    if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
+    VK_CHECK(sr);
+}
+
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
@@ -660,19 +744,25 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     if (vram_wait_needed()) vram_collect(true);
     bc_before_submit();
     Sub *s = sub();
-    if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
-    VkCommandBufferSubmitInfo cbs[2];
-    int n = 0;
+    if (!s->main_begun && !s->upload_begun && !wait && !signal && !s->nparts) return;
+    VkCommandBufferSubmitInfo cbs[2 + 64];
+    int n = 0, cbprim[2 + 64];
     if (s->upload_begun) {
         vk_full_barrier(s->upload);  // uploads complete before anything in the main buffer reads them
         vk_timing_end(s->upload, (unsigned)cur_sub, true);
         VK_CHECK(vkEndCommandBuffer(s->upload));
+        cbprim[n] = -1;
         cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->upload};
+    }
+    for (int i = 0; i < s->nparts; i++) {  // (primary passes: the segments so far and the workers' primaries, in order)
+        cbprim[n] = s->parts[i].prim;
+        cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->parts[i].cb};
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     vk_timing_end(s->main, (unsigned)cur_sub, false);
     VK_CHECK(vkEndCommandBuffer(s->main));
+    cbprim[n] = -1;
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
                                      .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
@@ -688,7 +778,14 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
         vk_timing_enqueue((unsigned)cur_sub, submit_seq + 1, atomic_load_explicit(&s->fxr, memory_order_relaxed));
-        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        VkResult sr = VK_SUCCESS;
+        if (s->nparts) {  // (on the recording thread, in order: each worker's primary once it is recorded)
+            PrimSubmit a = {.n = n, .si = si, .wt = wt, .recs = s->prim};
+            memcpy(a.cbs, cbs, (size_t)n * sizeof cbs[0]), memcpy(a.prim, cbprim, (size_t)n * sizeof cbprim[0]);
+            memcpy(a.sig, sig, sizeof sig);
+            if (!vkq_custom(prim_submit_replay, &a, sizeof a)) prim_submit_replay(&a);
+        } else
+            sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
         if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
         VK_CHECK(sr);
         PROF_ADD(prof_submit);
@@ -1980,7 +2077,10 @@ static void vk_end_pass_at(int line) {
     if (par_list) { par_close(PAR_PASS); rsec_end(); dyn_epoch++; }  // (the pass's secondary buffers all in, in order)
     fb_barrier = false;  // (see fb_barrier)
     in_pass = false;  // (first: vk_cmd() is the submission's own buffer again)
-    vkCmdEndRendering(vk_cmd());
+    if (pass_prim) {  // (a primary pass: the workers' parts end it themselves; the render thread's own part, if last, here)
+        if (prim_rt_open) vkCmdEndRendering(subs[cur_sub].main);
+        prim_rt_open = pass_prim = false;
+    } else vkCmdEndRendering(vk_cmd());
     for (int i = 0; i < pass_nfbl; i++) feedback_layout_move(vk_cmd(), pass_fbl[i], false);
     pass_nfbl = 0;
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
@@ -2233,6 +2333,9 @@ static void begin_pass(bool cube_layers) {
         NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
         pass_inline = par_list && par_inline_mask && t0 && (par_inline_mask >> vk_texture_scale_group(t0) & 1);
         if (inl_probe > 0 && pass_inline) inl_passes++;
+        if (prim_mode < 0) prim_mode = getenv("SAVAGEWIND_VK_PAR_PRIMARY") ? atoi(getenv("SAVAGEWIND_VK_PAR_PRIMARY")) : 1;
+        pass_prim = (prim_mode == 2 ? !(renderer_present_count() & 1) : prim_mode != 0) &&  // (2: even frames, an in-run A/B)
+                    (!perfx_trial(PERFX_VKPRIM) || perfx(PERFX_VKPRIM)) && pass_inline && !cube_layers && !pass_ncolor && has_d && vk_texture_scale_group(t0) == RS_SHADOW;
     }
     if (g_gpuprof_frame || vk_frame_trace_on || vk_pass_gpu) {
         NvnTexture *t = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
@@ -2264,9 +2367,14 @@ static void begin_pass(bool cube_layers) {
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL,
                           .flags = par_list && !pass_inline ? VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT : 0};
-    gb_game = true;
-    vkCmdBeginRendering(cb, &ri);
-    gb_game = false;
+    if (pass_prim) {  // (a primary pass: each part begins it where it is recorded)
+        prim_ri = ri, prim_da = da, prim_sa = sa, prim_has_d = has_d, prim_has_s = has_s;
+        prim_parts = 0, prim_rt_open = false;
+    } else {
+        gb_game = true;
+        vkCmdBeginRendering(cb, &ri);
+        gb_game = false;
+    }
     {   // (its attachments as they are now: an image made for the pass above is one too)
         TexBackend *att[9];
         int n = 0;
@@ -9461,6 +9569,10 @@ typedef struct {
     uint64_t *deferred;
     int ndef, cdef;
     VkCommandBuffer sec;  // (its worker's)
+    bool prim;            // (primary passes) its worker records a part of the pass in a primary of its own:
+    VkRenderingInfo ri;   // ... begun with this,
+    VkRenderingAttachmentInfo da, sa;
+    struct PrimRec *rec;  // ... handed over here when recorded
 } ParChunk;
 static ParChunk *par_ring;
 static bool state_apply(CmdRec *r, void *x);
@@ -9606,8 +9718,40 @@ static ParChunk *par_open(void) {
     c->uub_pos = atomic_load(&uub_nlog);
     c->nitems = c->nplans = c->nvel = c->ndef = c->ndraws = 0;
     c->sec = VK_NULL_HANDLE;
+    c->prim = pass_prim, c->rec = NULL;
+    if (pass_prim) {  // (the render thread's own part of the pass, if open, ends first; this one the next)
+        if (prim_rt_open) vkCmdEndRendering(subs[cur_sub].main), prim_rt_open = false;
+        prim_info(&c->ri, &c->da, &c->sa);
+        prim_parts++;
+    }
     par_cur = c;
     return c;
+}
+
+// (primary passes) The submission's buffer cut where a worker's primary goes: the segment so far ends and is the next
+// piece, the primary the one after, and recording goes on in a new segment (the slot's own, allocated once).
+static void prim_cut(ParChunk *c) {
+    Sub *s = &subs[c->sub];
+    if (s->nparts + 2 > 64 || s->nprim == 64) FATAL("primary passes: more than 64 pieces in a submission\n");
+    if (s->main_begun) {
+        VK_CHECK(vkEndCommandBuffer(s->main));
+        s->parts[s->nparts++] = (__typeof__(s->parts[0])){s->main, -1};
+        if (s->segs_used == s->nsegs) {
+            if (vkq_on) vkq_drain();  // (the pool is the recording thread's while it records: once per buffer)
+            s->segs = realloc(s->segs, (size_t)(s->nsegs + 8) * sizeof *s->segs);
+            if (!s->segs) FATAL("primary passes: out of memory\n");
+            VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g_vk.pool,
+                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 8};
+            VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, s->segs + s->nsegs));
+            s->nsegs += 8;
+        }
+        s->main = s->segs[s->segs_used++];
+        s->main_begun = false;
+    }
+    int k = s->nprim++;
+    s->prim[k].cb = VK_NULL_HANDLE, s->prim[k].ready = 0;
+    c->rec = &s->prim[k];
+    s->parts[s->nparts++] = (__typeof__(s->parts[0])){VK_NULL_HANDLE, k};
 }
 
 static uint64_t stat_par_close[PAR_NCLOSE];
@@ -9628,6 +9772,7 @@ static void par_close_(int why) {
     par_cur = NULL;
     stat_par_chunks++;
     stat_par_close[why ? why : PAR_OTHER]++;
+    if (c->prim) prim_cut(c);  // (a primary: its own piece of the submission, reserved before a worker can hand it over)
     atomic_store_explicit(&c->state, 1, memory_order_relaxed);
     atomic_store(&par_put, ++par_nput);  // (publishes the chunk)
     // Only the worker holding this chunk's ticket can go on: waking every sleeper (a broadcast) cost each of the others
@@ -9638,6 +9783,7 @@ static void par_close_(int why) {
             if (par_wait[w] == par_nput) pthread_cond_signal(&par_wcv[w]);
         pthread_mutex_unlock(&par_m);
     }
+    if (c->prim) return;
     ParChunkExec e = {subs[c->sub].main, c};
     vkq_custom(par_chunk_replay, &e, sizeof e);
 }
@@ -9674,7 +9820,8 @@ static void par_state(CmdRec *r) {  // (exec_list) a state record inside the chu
 // checked now
 static bool par_draw_ok(DrawFront *f) {
     Prog *pr = f->pr;
-    if (f->cube_layers || pass_out || f->material || scene_up.t || uub_log_full || !in_pass || st.rt_dirty || pass_inline) return false;
+    if (f->cube_layers || pass_out || f->material || scene_up.t || uub_log_full || !in_pass || st.rt_dirty || (pass_inline && !pass_prim))
+        return false;
     {   // (debugging) SAVAGEWIND_VK_PAR_KEEP=<mask>: draws kept on the render thread - 1 all (the parallel list's own
         // machinery only), 2 blended ones, 4 those not into the scene's or shadows' targets, 8 quads / fans / polygons
         static int keep = -1;
@@ -9742,7 +9889,14 @@ static void par_draw(CmdRec *r, bool indexed, DrawFront *f) {  // (draw_) a draw
 // ---- translation workers
 static void par_run(ParChunk *c, VkCommandBuffer cb) {
     t_sub = c->sub, t_seq = c->seq;
-    par_begin_cb(cb, c->color, c->ncolor, c->depth, c->stencil, c->samples);
+    if (c->prim) {  // (a part of a primary pass: begun here, ended below)
+        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+        c->ri.pDepthAttachment = c->ri.pDepthAttachment ? &c->da : NULL;
+        c->ri.pStencilAttachment = c->ri.pStencilAttachment ? &c->sa : NULL;
+        vkCmdBeginRendering(cb, &c->ri);
+    } else par_begin_cb(cb, c->color, c->ncolor, c->depth, c->stencil, c->samples);
     t_xcb = cb;
     par_state_copy(&st, &c->xs);
     memcpy(pass_color, c->color, sizeof pass_color);
@@ -9772,11 +9926,16 @@ static void par_run(ParChunk *c, VkCommandBuffer cb) {
         if (!draw_back(r, p->indexed, &f)) ppc_add(PPC_BACK_FAIL, 1);
     }
     t_vel_prev = NULL, nfeedback = 0;
+    if (c->prim) vkCmdEndRendering(cb);
     VK_CHECK(vkEndCommandBuffer(cb));
     host_upload_publish();  // (its uploads visible before the recording thread can submit them)
     hot_stats_publish();
     c->sec = cb;
-    atomic_store(&c->state, 2);
+    if (c->prim) {  // (handed to its submission, which the recording thread makes; the chunk's slot free at once)
+        c->rec->cb = cb;
+        __atomic_store_n(&c->rec->ready, 1, __ATOMIC_RELEASE);
+        atomic_store(&c->state, 0);
+    } else atomic_store(&c->state, 2);
     atomic_fetch_add(&par_done, 1);
     if (atomic_load(&par_rec_waiting)) { pthread_mutex_lock(&par_rec_m); pthread_cond_broadcast(&par_rec_cv); pthread_mutex_unlock(&par_rec_m); }
 }
@@ -9793,7 +9952,8 @@ static void *par_worker(void *arg) {
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT};
     VkCommandPool pool;
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &pool));
-    struct { VkCommandBuffer *b; int n, used; uint64_t seq; } bufs[SUBS] = {0};  // (per submission slot: reused once it is)
+    struct { VkCommandBuffer *b; int n, used; uint64_t seq; } bufs[SUBS] = {0}, pbufs[SUBS] = {0};  // (per submission
+    // slot, reused once it is: secondaries, and primaries for primary passes)
     int prio = par_prio;
     for (;;) {
         if (atomic_load_explicit(&par_prio_now, memory_order_relaxed) != prio)
@@ -9820,13 +9980,14 @@ static void *par_worker(void *arg) {
             pthread_mutex_unlock(&par_m);
         }
         ParChunk *c = &par_ring[i % PAR_RING];
-        __typeof__(bufs[0]) *b = &bufs[c->sub];
+        __typeof__(bufs[0]) *b = c->prim ? &pbufs[c->sub] : &bufs[c->sub];
         if (b->seq != c->seq) b->seq = c->seq, b->used = 0;  // (the slot's earlier submission completed: sub_recycle)
         if (b->used == b->n) {
             b->b = realloc(b->b, (size_t)(b->n + 8) * sizeof *b->b);
             if (!b->b) FATAL("parallel translation: out of memory\n");
             VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
-                                              .level = VK_COMMAND_BUFFER_LEVEL_SECONDARY, .commandBufferCount = 8};
+                                              .level = c->prim ? VK_COMMAND_BUFFER_LEVEL_PRIMARY : VK_COMMAND_BUFFER_LEVEL_SECONDARY,
+                                              .commandBufferCount = 8};
             VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, b->b + b->n));
             b->n += 8;
         }
