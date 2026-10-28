@@ -885,6 +885,23 @@ static void ls_time_note(uint64_t layer, uint32_t step, uint64_t ns) {
         if (!e->layer) {
             uint64_t steps = LD64(layer + 0xc0);  // (f_7000ef0264: the steps, 0x820 bytes each; +8 its draw methods)
             *e = (LsTime){layer, step, steps ? LD32(steps + step * 0x820ull + 8) : 0, 0, 0, 0};
+            static uint64_t told[64];  // (each layer step's draw methods once: the method, its delegate at +0x3c - vtable,
+            static int ntold;          // object, member function - for the audit of what a step draws)
+            bool seen = false;
+            for (int k = 0; k < ntold; k++) seen |= told[k] == (layer ^ step);
+            if (!seen && ntold < 64 && steps) {
+                told[ntold++] = layer ^ step;
+                uint64_t s = steps + step * 0x820ull, ms = LD64(s + 0x10);
+                LOG("[layer-steps] layer %llx (vtable %llx) step %u: %u methods\n", (unsigned long long)layer,
+                    (unsigned long long)LD64(layer), step, e->methods);
+                for (uint32_t j = 0; j < e->methods && j < 16 && ms; j++) {
+                    uint64_t m = LD64(ms + 8ull * j), d = m + 0x3c;
+                    LOG("[layer-steps]   method %u %llx (vtable %llx) flags %x delegate vtable %llx invoke %llx object %llx "
+                        "fn %llx adj %llx\n", j, (unsigned long long)m, (unsigned long long)LD64(m), LD8(m + 0x38),
+                        (unsigned long long)LD64(d), (unsigned long long)LD64(LD64(d)), (unsigned long long)LD64(d + 8),
+                        (unsigned long long)LD64(d + 0x10), (unsigned long long)LD64(d + 0x18));
+                }
+            }
         }
         e->n++, e->ns += ns;
         if (ns > e->max) e->max = ns;

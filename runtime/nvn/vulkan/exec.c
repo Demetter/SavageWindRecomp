@@ -464,6 +464,18 @@ void vk_full_barrier(VkCommandBuffer cb) {
 //    pass drew without a barrier of its own (a render-target change orders that on its hardware), and Vulkan orders
 //    attachment writes only within a pass.
 //  - none between dispatches (BOTW's chains of one-warp jobs run side by side) or before the first pass after them.
+//  - between dispatches the game ordered ("order primitives" alone, nothing but dispatches since the last barrier:
+//    BOTW's GPU particle emitters, each updated after the one before - in a row once dispatch_batch.inc runs a pass's
+//    updates ahead of its draws): a compute-to-compute barrier only when the dispatch reads or writes what one since
+//    the barrier wrote, or writes what one read (storage and uniform buffers; any image bound counts), as a native
+//    renderer orders work by what it uses (gb_dispatch_barrier);
+//  - the same barrier before a pass, with dispatches since the last one (each emitter's update, then its draws):
+//    the pass's stages after what the dispatches wrote, its fragments after the earlier passes' fragments - not a
+//    drain of the GPU; a full one still when a draw since stored to memory;
+//  - a pass's targets count as drawn (gb_covered) when it ends, only those it wrote: a pass that reads its depth
+//    (the translucent ones) leaves it as it was, and the particle updates that sample it after need no full barrier.
+//  SAVAGEWIND_VK_DISPATCH_DEPS=0: the last three as before (a full barrier for each such game barrier, every target
+//  counted at the pass's start); =2: that in odd frames (an A/B within one run).
 // Each image keeps the barrier counts when a pass last drew into it: a vertex-stage or compute read of it before a full
 // barrier since ends the pass and gets a full one (gb_covered; fragment reads are covered by the pass's own barrier, and
 // a dispatch that stores counts as drawing). Checked against the old barriers in one run (mode 2: frames alternate):
@@ -490,12 +502,33 @@ static bool gb_game, gb_hook;     // the game's own command / our barrier is bei
 static uint64_t gb_ops, gb_ops_seen;  // work of ours recorded; the count at the last game pass / dispatch
 static uint64_t gb_full = 1, gb_frag = 1;  // barriers recorded: full ones; full or fragment ones
 static bool gb_drawn;             // a pass drew since the last barrier
-static uint64_t gb_stat[8];       // full barriers for a game barrier, for work of ours; fragment barriers after drawing;
-                                  // none; full for a list, a fence, a read; fragment barriers for a game barrier
+static bool gb_hard;              // gb_pending for a list, a fence or a read (not the game's barrier alone)
+static int gb_hard_src;           // (statistics) which of those
+static bool gb_passes;            // a pass began since the last barrier
+static bool gb_disp;              // a dispatch since the last barrier
+static bool gb_gstore;            // a draw that stores to memory since the last barrier
+static TexBackend *gb_attc[8], *gb_attd;  // (dependency mode) the pass in progress: its targets, stamped when it ends
+static uint64_t gb_att_full, gb_att_frag; // ... with the barrier counts at its start
+static uint16_t gb_wr;            // ... the targets it wrote: colour bits 0-7, depth / stencil 0x100
+static bool gb_att_open;
+static int gb_deps = -1;          // SAVAGEWIND_VK_DISPATCH_DEPS (above)
+static bool gb_deps_on(void) {
+    if (gb_deps < 0) { const char *e = getenv("SAVAGEWIND_VK_DISPATCH_DEPS"); gb_deps = e ? atoi(e) : 1; }
+    return gb_deps == 2 ? !(renderer_present_count() & 1) : gb_deps != 0;
+}
+typedef struct { uint64_t lo, hi; } GbRange;
+static GbRange gb_dw[256], gb_dr[512];  // the dispatches since the last barrier: ranges written, read
+static int gb_ndw, gb_ndr;
+static bool gb_dfull;             // ... more than those hold (every dispatch then depends)
+static uint64_t gb_stat[11];      // full barriers for a game barrier, for work of ours; fragment barriers after drawing;
+                                  // none; full for a list, a fence, a read; fragment barriers for a game barrier;
+                                  // none between independent dispatches; compute barriers between dependent ones;
+                                  // dependency barriers before a pass after dispatches
 
 static void consumer_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages);
 static void gb_recorded(bool full) {
-    gb_pending = gb_lazy = gb_drawn = false;
+    gb_pending = gb_lazy = gb_drawn = gb_hard = gb_passes = gb_disp = gb_gstore = false;
+    gb_ndw = gb_ndr = 0, gb_dfull = false;
     gb_bits = 0;
     gb_frag++;
     if (full) gb_full++;
@@ -531,6 +564,23 @@ static void gb_work(VkCommandBuffer cb) {
 static void gb_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
     if (!gb_on() || !gb_thread) { consumer_barrier(cb, stages); return; }
     int why = gb_pending ? (gb_src == 1 ? 0 : gb_src == 0 ? 4 : gb_src == 2 ? 5 : 6) : gb_ops != gb_ops_seen ? 1 : -1;
+    if (why == 0 && stages != VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT && !gb_hard && gb_bits == 1 && gb_disp &&
+        !gb_gstore && gb_ops == gb_ops_seen && !gb_ceiling && gb_deps_on()) {
+        VkMemoryBarrier2 mb[2] = {
+            {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+             .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+             .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT},
+            {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = GB_FRAG_STAGES, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+             .dstStageMask = GB_FRAG_STAGES, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT}};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = gb_drawn ? 2 : 1,
+                               .pMemoryBarriers = mb};
+        gb_hook = true;
+        vkCmdPipelineBarrier2(cb, &di);
+        gb_hook = false;
+        gb_recorded(false);
+        gb_stat[10]++;
+        return;
+    }
     if (why == 0 && gb_ceiling) {  // (research ceiling: no drain for the game's barriers)
         gb_fragment_barrier(cb, stages);
         why = 7;
@@ -551,8 +601,21 @@ static void gb_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
 static void gb_done(TexBackend *const *att, int n) {
     gb_lazy = false;
     gb_ops_seen = gb_ops;
+    if (att) gb_passes = true;
+    if (att && gb_on() && gb_thread && gb_deps_on()) {  // (dependency mode: when it ends, those it wrote: gb_pass_end)
+        gb_att_open = true, gb_att_full = gb_full, gb_att_frag = gb_frag, gb_wr = 0;
+        return;
+    }
     for (int i = 0; i < n; i++)
         if (att[i]) att[i]->gb_full = gb_full, att[i]->gb_frag = gb_frag, gb_drawn = true;
+}
+// (dependency mode) A game pass ended: the targets it wrote count as drawn from its start
+static void gb_pass_end(void) {
+    if (!gb_att_open) return;
+    gb_att_open = false;
+    for (int i = 0; i < 8; i++)
+        if (gb_attc[i] && (gb_wr & (1u << i))) gb_attc[i]->gb_full = gb_att_full, gb_attc[i]->gb_frag = gb_att_frag, gb_drawn = true;
+    if (gb_attd && (gb_wr & 0x100)) gb_attd->gb_full = gb_att_full, gb_attd->gb_frag = gb_att_frag, gb_drawn = true;
 }
 // A draw (stage 0 vertex, 1 fragment) or dispatch (5) samples t: whether a barrier since a pass last drew into it
 // covers that read (else the work needs a full one first)
@@ -2084,6 +2147,7 @@ static void vk_end_pass_at(int line) {
     if (par_list) { par_close(PAR_PASS); rsec_end(); dyn_epoch++; }  // (the pass's secondary buffers all in, in order)
     fb_barrier = false;  // (see fb_barrier)
     in_pass = false;  // (first: vk_cmd() is the submission's own buffer again)
+    gb_pass_end();
     if (pass_prim) {  // (a primary pass: the workers' parts end it themselves; the render thread's own part, if last, here)
         if (prim_rt_open) vkCmdEndRendering(subs[cur_sub].main);
         prim_rt_open = pass_prim = false;
@@ -2388,6 +2452,8 @@ static void begin_pass(bool cube_layers) {
         for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i] && st.rt.color[i]->backend) att[n++] = st.rt.color[i]->backend;
         if (st.rt.depth && st.rt.depth->backend) att[n++] = st.rt.depth->backend;
         gb_done(att, n);
+        for (int i = 0; i < 8; i++) gb_attc[i] = i < st.rt.ncolor && st.rt.color[i] ? st.rt.color[i]->backend : NULL;
+        gb_attd = st.rt.depth ? st.rt.depth->backend : NULL;
     }
     in_pass = true;  // (before the clear: a parallel list's pass takes secondary buffers only, vk_cmd)
     if (cube_clear) {
@@ -2578,6 +2644,8 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     begin_pass(false);
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
+    if (index >= 0) gb_wr |= (uint16_t)(1u << index);
+    if (depth || stencil) gb_wr |= 0x100;
     VkRect2D rect = scissor_rect();
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
@@ -7748,18 +7816,84 @@ bool vk_pso_wait(int ms, float *done) {
 
 #include "compute_shader_opt.inc"
 
+#include "particle_probe.inc"
+
+// (game barriers above) Before a dispatch: when the game ordered it after dispatches alone ("order primitives", no pass
+// or work of ours since the last barrier), a barrier only if it depends on them - a compute-to-compute one; otherwise
+// it runs beside them. Else gb_barrier.
+static uint64_t gb_dep_why[10];  // (statistics) -, other bits, a pass, work of ours, taken, a texture not covered; after: a list, -, a fence, a read
+static bool gb_dep_overlap(const GbRange *a, int n, uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < n; i++) if (lo < a[i].hi && a[i].lo < hi) return true;
+    return false;
+}
+static void gb_dispatch_barrier(VkCommandBuffer cb, ShaderInfo *si) {
+    bool on = gb_deps_on();
+    bool was_hard = gb_hard;
+    for (int k = 0; on && gb_pending && k < si->ntex; k++)  // (dispatch_compute checks these only with none pending)
+        if (!gb_covered(shader_texture_object(5, &si->tex[k]), 5)) { gb_hard = true, gb_src = gb_hard_src = 3; break; }
+    if (gb_pending && gb_thread)  // (statistics) what sends a dispatch the game ordered to gb_barrier
+        gb_dep_why[gb_hard ? (was_hard ? 6 + (gb_hard_src & 3) : 5) : gb_bits != 1 ? 1 : gb_passes ? 2 : gb_ops != gb_ops_seen ? 3 : 4]++;
+    if (!on || !gb_on() || !gb_thread || !gb_pending || gb_hard || gb_bits != 1 || gb_passes || gb_ops != gb_ops_seen ||
+        gb_ceiling) {
+        gb_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        return;
+    }
+    bool dep = gb_dfull;
+    for (int k = 0; k < si->ntex && !dep; k++) dep = si->tex[k].is_image;
+    for (int k = 0; k < 16 && !dep; k++) {
+        Range b = st.sbuf[5][k];
+        if (b.addr && b.size)
+            dep = gb_dep_overlap(gb_dw, gb_ndw, b.addr, b.addr + b.size) ||
+                  (si->writes_gmem && gb_dep_overlap(gb_dr, gb_ndr, b.addr, b.addr + b.size));
+    }
+    for (int k = 0; k < 18 && !dep; k++) {  // (with global memory a shader reads its uniform buffers through it too)
+        Range u = st.ubuf[5][k];
+        if (u.addr && u.size && ((si->cbuf_mask & (1u << k)) || si->uses_gmem))
+            dep = gb_dep_overlap(gb_dw, gb_ndw, u.addr, u.addr + u.size);
+    }
+    gb_pending = false, gb_bits = 0;
+    gb_lazy = true;  // (work of ours recorded before the dispatch still gets the full barrier: gb_work)
+    if (!dep) { gb_stat[8]++; return; }
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    gb_hook = true;
+    vkCmdPipelineBarrier2(cb, &di);
+    gb_hook = false;
+    gb_ndw = gb_ndr = 0, gb_dfull = false;  // (ordered after all of them now)
+    gb_stat[9]++;
+}
+// After a dispatch: its ranges into the set since the last barrier
+static void gb_dispatch_note(ShaderInfo *si) {
+    if (!gb_thread) return;
+    gb_disp = true;
+    for (int k = 0; k < 16; k++) {
+        Range b = st.sbuf[5][k];
+        if (!b.addr || !b.size) continue;
+        if (si->writes_gmem) { if (gb_ndw < 256) gb_dw[gb_ndw++] = (GbRange){b.addr, b.addr + b.size}; else gb_dfull = true; }
+        if (gb_ndr < 512) gb_dr[gb_ndr++] = (GbRange){b.addr, b.addr + b.size}; else gb_dfull = true;
+    }
+    for (int k = 0; k < 18; k++) {
+        Range u = st.ubuf[5][k];
+        if (!u.addr || !u.size || !((si->cbuf_mask & (1u << k)) || si->uses_gmem)) continue;
+        if (gb_ndr < 512) gb_dr[gb_ndr++] = (GbRange){u.addr, u.addr + u.size}; else gb_dfull = true;
+    }
+}
+
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program, g_vk.gmem_bda == 2 && (renderer_present_count() & 1));
     if (!cp || atomic_load(&cp->p.state) != 1) { stat_skipped++; return; }
+    if (ptp_on > 0) pp_dispatch(cp->si);
     gw_check((const uint32_t[6]){0, 0, 0, 0, 0, cp->si->cbuf_mask}, false, 0, 0);
     vk_end_pass();
     prepare_depth_comparisons(5,cp->si);
     VkCommandBuffer cb = vk_cmd();
     for (int i = 0; i < cp->si->ntex && !gb_pending; i++)
-        if (!gb_covered(shader_texture_object(5, &cp->si->tex[i]), 5)) gb_pending = true, gb_src = 3;
-    gb_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        if (!gb_covered(shader_texture_object(5, &cp->si->tex[i]), 5)) gb_pending = gb_hard = true, gb_src = gb_hard_src = 3;
+    gb_dispatch_barrier(cb, cp->si);
     if ((co_on() == 2 || co_on() == 4) && cp->target) {
         co_audit(cp, gx, gy, gz);
         cb = vk_cmd(); // the differential check may have submitted and waited
@@ -7814,6 +7948,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdDispatch(cb, dispatch_x, gy, gz);
     gb_game = false;
     gb_done(NULL, 0);
+    gb_dispatch_note(cp->si);
     if (cp->si->writes_gmem || cp->si->ntex) gb_drawn = true;  // (stores, maybe to images: the next pass orders after it)
     // (gpuprof: a row lasts until the next mark, idle GPU included; this separates the dispatch from what follows. At
     // Hyrule Castle, 27 Oct, cs ffe9487d2fdb1041 is 0.52 ms itself: 109 KB of straight-line code run by 44 warps, one
@@ -8703,6 +8838,17 @@ static bool par_draw_ok(DrawFront *f);
 static _Atomic uint64_t pp_pipe_ns;  // (SAVAGEWIND_VK_PAR_PROBE, below) time waited for the pipeline table's lock
 static void par_draw(CmdRec *r, bool indexed, DrawFront *f);
 
+// The draw's program for the state as it is (draw_front; the dispatch batch's look-ahead, dispatch_batch.inc)
+static Prog *state_program(uint32_t origin, uint32_t dmode) {
+    ShaderKey vkey = {0}, fkey = {0};
+    vkey.glsl = fkey.glsl = 1;
+    vkey.flip_y = fkey.flip_y = origin == 0;
+    vkey.depth_minus_one = dmode == 0;
+    for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    return get_program(st.program, &vkey, &fkey);
+}
+
 static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
     if (profd) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { stat_skipped++; return false; }
@@ -8716,13 +8862,7 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
         pm.constants[0] == st.program->stages[0].const_id && pm.constants[1] == st.program->stages[1].const_id) {
         pr = pm.pr;
     } else {
-        ShaderKey vkey = {0}, fkey = {0};
-        vkey.glsl = fkey.glsl = 1;
-        vkey.flip_y = fkey.flip_y = origin == 0;
-        vkey.depth_minus_one = dmode == 0;
-        for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
-        for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
-        pr = get_program(st.program, &vkey, &fkey);
+        pr = state_program(origin, dmode);
         pm.gen = prog_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
         pm.constants[0] = st.program->stages[0].const_id; pm.constants[1] = st.program->stages[1].const_id;
     }
@@ -8874,7 +9014,7 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
             for (int k = 0; k < st.rt.ncolor && !own; k++) own = st.rt.color[k] && st.rt.color[k]->backend == t->backend;
             if (own) continue;
             if (in_pass) vk_end_pass(), st.rt_dirty = true;
-            gb_pending = true, gb_src = 3;
+            gb_pending = gb_hard = true, gb_src = gb_hard_src = 3;
             break;
         }
         if (i < si->ntex) break;
@@ -8920,12 +9060,14 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
         else vmoved = false;
     }
     t_vel_prev = vmoved ? mvo_prev_ubo : NULL;  // (the sets built on this thread; a job carries its own: draw_job_run)
-    if (st.rt.depth && !depth_read_only()) pass_ds_written = true;
+    if (st.rt.depth && !depth_read_only()) pass_ds_written = true, gb_wr |= 0x100;
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)
         if (st.rt.color[i] && draw_writes_color(pr, i)) {
             pass_color_written |= (uint8_t)(1u << i);
             pass_color_unsynced |= (uint8_t)(1u << i);
+            gb_wr |= (uint16_t)(1u << i);
         }
+    if ((pr->vi && pr->vi->writes_gmem) || (pr->fi && pr->fi->writes_gmem)) gb_gstore = true;
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;
     uint8_t cls;
@@ -9608,6 +9750,7 @@ static void draw_(CmdRec *r, bool indexed) {
     DrawFront f;
     ppc_add(PPC_GAME, 1);
     if (!draw_front(r, indexed, &f)) return;
+    if (ptp_on > 0) pp_draw(r, indexed, f.pr);
     if (ss_on > 0) ss_draw(f.pr, ss_cur_depth);
     ppc_add(PPC_FRONT, 1);
     if (f.par_ok) par_draw(r, indexed, &f), ppc_add(PPC_PAR, 1);  // (its rest recorded by a worker)
@@ -11872,6 +12015,8 @@ static void ss_draw(const Prog *pr, int depth) {  // (draw_: a draw, its program
 }
 static int ss_cur_depth;  // (the depth of the list being walked, for draw_)
 
+#include "dispatch_batch.inc"
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     if (ss_on < 0) ss_on = getenv("SAVAGEWIND_VK_STATE_SRC") != NULL;
@@ -11885,17 +12030,23 @@ static void exec_list(uint64_t handle, int depth) {
     if (!depth && gb_mode == 2) gb_list_on = !(renderer_present_count() & 1);
     if (!depth && gb_mode == 3) gb_ceiling = (renderer_present_count() >> 4) & 1;
     if (!depth && gb_on()) {  // (a list from the queue: what came before it is ordered against it)
-        gb_thread = true, gb_pending = true, gb_src = 0;
+        gb_thread = true, gb_pending = gb_hard = true, gb_src = gb_hard_src = 0;
         vkq_work_hook = gb_work;
         static uint64_t logged;
         uint64_t fr = renderer_present_count();
         if (fr >= logged + 600) {
             logged = fr;
             LOG("[game-barriers] frame %llu: full for a game barrier %llu, for work of ours %llu, for a list %llu, for a "
-                "fence %llu, for a read %llu; fragment for a game barrier %llu, after drawing %llu; none %llu\n",
+                "fence %llu, for a read %llu; fragment for a game barrier %llu, after drawing %llu; none %llu; between "
+                "dispatches: none %llu, compute %llu; before a pass after dispatches %llu (ordered ones: bits %llu, pass %llu, ours %llu, taken %llu, "
+                "texture %llu, after a list %llu, fence %llu, read %llu)\n",
                 (unsigned long long)fr, (unsigned long long)gb_stat[0], (unsigned long long)gb_stat[1],
                 (unsigned long long)gb_stat[4], (unsigned long long)gb_stat[5], (unsigned long long)gb_stat[6],
-                (unsigned long long)gb_stat[7], (unsigned long long)gb_stat[2], (unsigned long long)gb_stat[3]);
+                (unsigned long long)gb_stat[7], (unsigned long long)gb_stat[2], (unsigned long long)gb_stat[3],
+                (unsigned long long)gb_stat[8], (unsigned long long)gb_stat[9], (unsigned long long)gb_stat[10],
+                (unsigned long long)gb_dep_why[1], (unsigned long long)gb_dep_why[2], (unsigned long long)gb_dep_why[3],
+                (unsigned long long)gb_dep_why[4], (unsigned long long)gb_dep_why[5], (unsigned long long)gb_dep_why[6],
+                (unsigned long long)gb_dep_why[8], (unsigned long long)gb_dep_why[9]);
         }
     }
     for (int guard = 0; guard < 10000000; guard++) {
@@ -11910,6 +12061,7 @@ static void exec_list(uint64_t handle, int depth) {
         __builtin_prefetch((const char *)r + 256);
         __builtin_prefetch((const char *)r + 320);
         if (r->op < CMD_COUNT) op_counts[r->op]++;
+        if (ptp_on) pp_op(r);
         if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS"))
             LOG("[op] %u depth %d: %llx %llx %llx %llx %llx\n", r->op, depth,
                 (unsigned long long)nvn_cmd_debug_arg(r,0), (unsigned long long)nvn_cmd_debug_arg(r,1),
@@ -11993,9 +12145,15 @@ static void exec_list(uint64_t handle, int depth) {
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
-        case CMD_DRAW_ARRAYS: draw(r, false); break;
-        case CMD_DRAW_ELEMENTS: draw(r, true); break;
+        case CMD_DISPATCH: {
+            if (db_n && db_take(r)) break;  // (run with the first dispatch of its pass: dispatch_batch.inc)
+            bool ahead = in_pass && gb_thread && db_on();
+            dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]);
+            if (ahead) db_batch(r);
+            break;
+        }
+        case CMD_DRAW_ARRAYS: db_skip_barrier = false; draw(r, false); break;
+        case CMD_DRAW_ELEMENTS: db_skip_barrier = false; draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS"))
                 LOG("[bind] update ubuf %llx (size %llu) +%llu: %llu bytes\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
@@ -12024,11 +12182,12 @@ static void exec_list(uint64_t handle, int depth) {
             vram_list_written(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (and the heap copy: draws read it in place)
             break;
         case CMD_BARRIER:  // (0: the start of a list the recorder made, not the game's)
+            if (db_skip_barrier && r->x[0] == 1) { db_skip_barrier = false; break; }  // (its dispatch ran ahead)
             if (r->x[0]) bt_note("B%llx ", (unsigned long long)r->x[0]), gb_pending = true, gb_src = 1, gb_bits |= (uint32_t)r->x[0];
             if (logfb > 0 && !fbskip) LOG("[feedback] barrier %#llx after %u draws\n", (unsigned long long)r->x[0], fb_draws);
             break;
         case CMD_FENCE_SYNC: {
-            gb_pending = true, gb_src = 2;
+            gb_pending = gb_hard = true, gb_src = gb_hard_src = 2;
             if (bc_active && bc_vertex_seq > vk_completed_seq()) bc_reasons |= BC_LIVE_VERTEX;
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("SAVAGEWIND_FENCE_FLUSH") ? 1 : 0;
