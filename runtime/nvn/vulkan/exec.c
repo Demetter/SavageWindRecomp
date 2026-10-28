@@ -9571,10 +9571,13 @@ static void draw_after(DrawFront *f) {
     }
 }
 
+static int ss_on, ss_cur_depth;  // (SAVAGEWIND_VK_STATE_SRC, below exec_list's)
+static void ss_draw(const Prog *pr, int depth);
 static void draw_(CmdRec *r, bool indexed) {
     DrawFront f;
     ppc_add(PPC_GAME, 1);
     if (!draw_front(r, indexed, &f)) return;
+    if (ss_on > 0) ss_draw(f.pr, ss_cur_depth);
     ppc_add(PPC_FRONT, 1);
     if (f.par_ok) par_draw(r, indexed, &f), ppc_add(PPC_PAR, 1);  // (its rest recorded by a worker)
     else if (!draw_back(r, indexed, &f)) { ppc_add(PPC_BACK_FAIL, 1); return; }
@@ -11750,8 +11753,98 @@ static void scan_measure(uint64_t handle) {
     frames = ns = 0, logged = f;
 }
 
+// (research, the redesign: Vulkan recorded where the game records NVN) SAVAGEWIND_VK_STATE_SRC=1: where each draw's
+// state was set - in the draw's own command list, in a list calling it (on the call stack), in another list (one
+// called earlier and returned), or never - per kind of state, every 600 frames ("[state-src]"). Render thread only.
+static int ss_on = -1;
+typedef struct { uint64_t list; int depth; } SsSrc;
+enum { SS_PROG, SS_FIXED, SS_VTX, SS_RT, SS_VIEW, SS_POOL, SS_CBUF, SS_TEX, SS_N };
+static const char *const ss_name[SS_N] = {"program", "fixed-function", "vertex", "render-targets", "viewport/scissor",
+                                          "pools", "constants", "textures"};
+static uint64_t ss_list[16];  // the list walked at each depth
+static SsSrc ss_cat[SS_N], ss_cb[6][18], ss_tx[6][32];
+static uint64_t ss_cnt[SS_N][4], ss_draws, ss_depth_draws[10], ss_self, ss_callers, ss_frame0;
+static void ss_set(SsSrc *s, int depth) { s->list = ss_list[depth & 15], s->depth = depth; }
+static void ss_note(const CmdRec *r, int depth) {  // (exec_list: a state record about to be applied)
+    int c = -1;
+    switch (r->op) {
+    case CMD_BIND_PROGRAM: c = SS_PROG; break;
+    case CMD_BIND_BLEND: case CMD_BIND_CHANNEL_MASK: case CMD_BIND_COLOR: case CMD_BIND_DEPTH_STENCIL:
+    case CMD_BIND_MULTISAMPLE: case CMD_BIND_POLYGON: case CMD_SET_BLEND_COLOR: case CMD_SET_STENCIL:
+    case CMD_SET_LINE_WIDTH: case CMD_SET_DEPTH_CLAMP: case CMD_SET_POLYGON_OFFSET: case CMD_SET_RASTERIZER_DISCARD:
+    case CMD_SET_PRIMITIVE_RESTART: c = SS_FIXED; break;
+    case CMD_BIND_VERTEX_ATTRIB: case CMD_BIND_VERTEX_STREAM: case CMD_BIND_VERTEX_BUFFERS: c = SS_VTX; break;
+    case CMD_SET_RENDER_TARGETS: c = SS_RT; break;
+    case CMD_SET_VIEWPORTS: case CMD_SET_SCISSORS: case CMD_SET_DEPTH_RANGES: c = SS_VIEW; break;
+    case CMD_SET_TEXTURE_POOL: case CMD_SET_SAMPLER_POOL: c = SS_POOL; break;
+    case CMD_BIND_UNIFORM_BUFFERS:
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 18 && r->x[0] < 6; i++) ss_set(&ss_cb[r->x[0]][r->x[1] + i], depth);
+        return;
+    case CMD_BIND_TEXTURES: case CMD_BIND_TEXTURES_DEFERRED:
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++) ss_set(&ss_tx[r->x[0]][r->x[1] + i], depth);
+        return;
+    default: return;
+    }
+    ss_set(&ss_cat[c], depth);
+}
+static int ss_class(const SsSrc *s, int depth) {  // 0 the draw's list, 1 a list calling it, 2 another list, 3 never
+    if (!s->list) return 3;
+    if (s->depth == depth && s->list == ss_list[depth & 15]) return 0;
+    if (s->depth < depth && ss_list[s->depth & 15] == s->list) return 1;
+    return 2;
+}
+static void ss_draw(const Prog *pr, int depth) {  // (draw_: a draw, its program resolved)
+    int worst_all = 0, k;
+    for (int c = 0; c < SS_N; c++) {
+        int w = 0;
+        if (c == SS_CBUF || c == SS_TEX) {
+            for (int sg = 0; sg < 2; sg++) {
+                const ShaderInfo *si = sg ? pr->fi : pr->vi;
+                if (!si) continue;
+                if (c == SS_CBUF) {
+                    for (k = 3; k < 21; k++)
+                        if (si->cbuf_mask & (1u << k)) { int x = ss_class(&ss_cb[sg][k - 3], depth); if (x > w) w = x; }
+                } else {
+                    for (k = 0; k < si->ntex; k++) {
+                        int slot = ((int)si->tex[k].handle_offset - 0x20) / 8;
+                        if (slot < 0 || slot >= 32) continue;
+                        int x = ss_class(&ss_tx[sg][slot], depth);
+                        if (x > w) w = x;
+                    }
+                }
+            }
+        } else w = ss_class(&ss_cat[c], depth);
+        ss_cnt[c][w]++;
+        if (w > worst_all && w < 3) worst_all = w;
+    }
+    ss_draws++, ss_depth_draws[depth < 9 ? depth : 9]++;
+    if (worst_all == 0) ss_self++;
+    else if (worst_all == 1) ss_callers++;
+    uint64_t fr = renderer_present_count();
+    if (!ss_frame0) ss_frame0 = fr;
+    if (fr < ss_frame0 + 600) return;
+    char b[1024];
+    int n = 0;
+    for (int c = 0; c < SS_N; c++)
+        n += snprintf(b + n, sizeof b - n, " %s %.1f/%.1f/%.1f/%.1f", ss_name[c], 100.0 * ss_cnt[c][0] / ss_draws,
+                      100.0 * ss_cnt[c][1] / ss_draws, 100.0 * ss_cnt[c][2] / ss_draws, 100.0 * ss_cnt[c][3] / ss_draws);
+    LOG("[state-src] %llu draws/frame; %% own list / a caller / another list / never:%s\n",
+        (unsigned long long)(ss_draws / (fr - ss_frame0)), b);
+    LOG("[state-src] draws with every state from their own list %.1f%%, from their own list or callers %.1f%%; draws by "
+        "list depth 0..9: %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n", 100.0 * ss_self / ss_draws,
+        100.0 * (ss_self + ss_callers) / ss_draws, (unsigned long long)ss_depth_draws[0], (unsigned long long)ss_depth_draws[1],
+        (unsigned long long)ss_depth_draws[2], (unsigned long long)ss_depth_draws[3], (unsigned long long)ss_depth_draws[4],
+        (unsigned long long)ss_depth_draws[5], (unsigned long long)ss_depth_draws[6], (unsigned long long)ss_depth_draws[7],
+        (unsigned long long)ss_depth_draws[8], (unsigned long long)ss_depth_draws[9]);
+    memset(ss_cnt, 0, sizeof ss_cnt), memset(ss_depth_draws, 0, sizeof ss_depth_draws);
+    ss_draws = ss_self = ss_callers = 0, ss_frame0 = fr;
+}
+static int ss_cur_depth;  // (the depth of the list being walked, for draw_)
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
+    if (ss_on < 0) ss_on = getenv("SAVAGEWIND_VK_STATE_SRC") != NULL;
+    if (ss_on) ss_list[depth & 15] = handle, ss_cur_depth = depth;
     if (lst_on < 0) lst_on = getenv("SAVAGEWIND_VK_LIST_STATS") != NULL;
     if (compact_probe < 0) {
         const char *e = getenv("SAVAGEWIND_NVN_COMPACT_RECORDS");
@@ -11808,6 +11901,7 @@ static void exec_list(uint64_t handle, int depth) {
                 if (i + 1 < r->x[0]) __builtin_prefetch((const void *)(uintptr_t)h[i + 1]);  // (~2800 calls a frame)
                 exec_list(h[i], depth + 1);
             }
+            if (ss_on) ss_cur_depth = depth;
             break;
         }
         case CMD_BIND_PROGRAM: case CMD_BIND_BLEND: case CMD_BIND_CHANNEL_MASK: case CMD_BIND_COLOR:
@@ -11819,6 +11913,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_DEPTH_CLAMP: case CMD_SET_RENDER_ENABLE: case CMD_SET_RASTERIZER_DISCARD: case CMD_SET_POLYGON_OFFSET:
         case CMD_SET_PRIMITIVE_RESTART: case CMD_SET_COPY_STRIDES:
             if (par_cur) par_state(r);  // (a chunk is being planned: its worker replays this record)
+            if (ss_on) ss_note(r, depth);
             state_apply(r, x);
             break;
         case CMD_CLEAR_COLOR: {
