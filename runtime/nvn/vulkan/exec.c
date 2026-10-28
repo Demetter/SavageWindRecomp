@@ -5135,6 +5135,8 @@ static _Atomic uint32_t ubo_snap_w, ubo_snap_r;
 static UboSnap *_Atomic ubo_snap_cur;
 static int ubo_submit_on = -1;
 static _Atomic uint64_t ubo_sub_cmp, ubo_sub_changed, ubo_sub_bytes, ubo_sub_t0;
+static struct { uint64_t addr, size, n, fs; } ubo_chg[16];
+static pthread_mutex_t ubo_chg_m = PTHREAD_MUTEX_INITIALIZER;
 static bool ubo_submit_enabled(void) {
     if (ubo_submit_on < 0) ubo_submit_on = getenv("SAVAGEWIND_VK_UBO_SUBMIT") != NULL;
     return ubo_submit_on;
@@ -5190,6 +5192,12 @@ static void ubo_submit_list_begin(void) {  // (backend_execute: the next list's 
             "(%.2f%%, %llu bytes); texture pools %llu, textures registered %llu\n", (unsigned long long)n,
             (unsigned long long)ch, n ? 100.0 * ch / n : 0.0, (unsigned long long)b, (unsigned long long)pools,
             (unsigned long long)reg);
+        pthread_mutex_lock(&ubo_chg_m);
+        for (int j = 0; j < 16 && ubo_chg[j].n; j++)
+            LOG("[ubo-submit]   changed: %llx +%llu, %llu times, last read by fs %016llx\n", (unsigned long long)ubo_chg[j].addr,
+                (unsigned long long)ubo_chg[j].size, (unsigned long long)ubo_chg[j].n, (unsigned long long)ubo_chg[j].fs);
+        memset(ubo_chg, 0, sizeof ubo_chg);
+        pthread_mutex_unlock(&ubo_chg_m);
         atomic_store(&ubo_sub_t0, now);
     }
 }
@@ -5203,7 +5211,14 @@ static void ubo_submit_check(uint64_t addr, uint64_t size) {
         if (e->addr != addr || e->size != size) continue;
         if (atomic_exchange(&e->done, 1)) return;
         atomic_fetch_add(&ubo_sub_cmp, 1);
-        if (ubo_hash((const void *)(uintptr_t)addr, size) != e->hash) atomic_fetch_add(&ubo_sub_changed, 1), atomic_fetch_add(&ubo_sub_bytes, size);
+        if (ubo_hash((const void *)(uintptr_t)addr, size) != e->hash) {
+            atomic_fetch_add(&ubo_sub_changed, 1), atomic_fetch_add(&ubo_sub_bytes, size);
+            pthread_mutex_lock(&ubo_chg_m);  // (which ranges: the 2 s report lists them)
+            int j = 0;
+            while (j < 16 && ubo_chg[j].n && (ubo_chg[j].addr != addr || ubo_chg[j].size != size)) j++;
+            if (j < 16) ubo_chg[j].addr = addr, ubo_chg[j].size = size, ubo_chg[j].n++, ubo_chg[j].fs = g_cur_fs_hash;
+            pthread_mutex_unlock(&ubo_chg_m);
+        }
         return;
     }
 }
