@@ -689,11 +689,11 @@ void vk_gpuprof_report(void) {
 // FRAME_LOG=2 now uses GPU queries (timing.c), with no CPU wake-up observer.
 // List CPU timestamps stay in their own clock domain, separate from GPU spans.
 static int gtl_on = -1;
-static void gtl_list(uint64_t first, uint64_t last, uint64_t x0, uint64_t draws) {
+static void gtl_list(uint64_t first, uint64_t last, uint64_t x0, uint64_t xe, uint64_t draws) {  // (xe: translated, the drain begins)
     if (last < first || draws < 100) return;
-    TRACE_LOG("[vklist] first %llu last %llu draws %llu begin_ns %llu end_ns %llu\n",
+    TRACE_LOG("[vklist] first %llu last %llu draws %llu begin_ns %llu translated_ns %llu end_ns %llu\n",
         (unsigned long long)first, (unsigned long long)last, (unsigned long long)draws,
-        (unsigned long long)x0, (unsigned long long)plat_now_ns());
+        (unsigned long long)x0, (unsigned long long)xe, (unsigned long long)plat_now_ns());
 }
 
 static pthread_mutex_t par_rec_m;  // (parallel translation, below: the recording thread waiting for a worker)
@@ -11916,7 +11916,7 @@ void backend_execute(uint64_t handle) {
     if (sync_submit < 0) sync_submit = getenv("SAVAGEWIND_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else renderer_submit();
-    uint64_t td = mt_list || trace_begin || a1d_enabled ? plat_now_ns() : 0;
+    uint64_t td = mt_list || trace_begin || a1d_enabled || gtl_on ? plat_now_ns() : 0;
     if(a1d_start)a1d_local[A1D_PRODUCER]+=td-a1d_start;
     if (trace_begin) cpu_phase_mark(NULL);
     if (trace_begin) vk_frame_trace_event("Translate and submit list", 1, trace_frame, submit_seq, trace_begin, td, 0, 0);
@@ -11948,7 +11948,7 @@ void backend_execute(uint64_t handle) {
     if (td && mt_list) STAT_ADD(stat_dj_drain_ns, trace_end - td);
     if (td && mt_list && survey_downstream_waits()) survey_dj_drain_ns += trace_end - td;
     if (trace_begin) vk_frame_trace_event("Wait for Vulkan recorder", 1, trace_frame, submit_seq, td, trace_end, 0, 0);
-    if (gtl_on) gtl_list(gtl_first, submit_seq, gtl_x0, cum_draws - gtl_draws);
+    if (gtl_on) gtl_list(gtl_first, submit_seq, gtl_x0, td, cum_draws - gtl_draws);
     {   // (research) SAVAGEWIND_LIST_STATS=1: per frame, the lists translated and their draws - how a frame's work could
         // be split across threads (whole lists, or chunks of big ones)
         if (list_stats_on()) {
