@@ -40,6 +40,7 @@ static bool host_test;  // (then a real controller is left out: the player's own
 static _Atomic int last_device;  // DEVICE_*: what the player used last
 static bool tilt_held;  // the tilt key: the mouse tilts the controller instead of turning the camera
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
+static bool user_input_off(void);        // (SAVAGEWIND_NO_USER_INPUT, below)
 
 static int held_key(int sc) {
     if (sc > BIND_MOUSE && sc <= BIND_MOUSE_LAST) return mouse_down[sc - BIND_MOUSE];
@@ -71,6 +72,22 @@ static void dead_zone(_Atomic int32_t *x, _Atomic int32_t *y, int32_t rx, int32_
     if (m <= dz || m <= 0) { *x = 0, *y = 0; return; }
     double k = (m >= 1 ? 1 : (m - dz) / (1 - dz)) / m;
     *x = (int32_t)lround(rx * k), *y = (int32_t)lround(ry * k);
+}
+
+// (runtime/hle/noclip.c) the noclip camera's controls, -1..1 each: right / forward from the move bindings and the left
+// stick, up from Space / Ctrl and the triggers; fast: Shift or the left stick's click
+void input_noclip_axes(float *right, float *forward, float *up, int *fast) {
+    *right = *forward = *up = 0, *fast = 0;
+    if (menu_input_captured()) return;
+    *right = (float)(held_key(g_bind_key[BIND_LS_RIGHT]) - held_key(g_bind_key[BIND_LS_LEFT])) + pad_lx / 32767.0f;
+    *forward = (float)(held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) + pad_ly / 32767.0f;
+    *up = (float)(keys_down[SDL_SCANCODE_SPACE] - (keys_down[SDL_SCANCODE_LCTRL] | keys_down[SDL_SCANCODE_RCTRL]));
+    *fast = keys_down[SDL_SCANCODE_LSHIFT] | keys_down[SDL_SCANCODE_RSHIFT];
+    if (pad) {
+        *up += (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) - SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER)) / 32767.0f;
+        *fast |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    }
+    for (float *v = right; v; v = v == right ? forward : v == forward ? up : NULL) *v = *v > 1 ? 1 : *v < -1 ? -1 : *v;
 }
 
 // Controller buttons (and the triggers as buttons) -> Switch buttons through g_bind_pad; the sticks stay the sticks.
@@ -265,8 +282,10 @@ void input_mouse_update(SDL_Window *w) {
         if (now != logged) LOG("[window] %s\n", now ? "in front" : "in the background (frame rate capped: SAVAGEWIND_BACKGROUND_FPS)");
         win_focused = now, logged = now;
     }
+    // (a scripted run keeps the mouse free unless the player's input is let through: SAVAGEWIND_NO_USER_INPUT=0, as
+    // noclip-debug.bat's scripted start does)
     bool want = w && win_focused && g_settings.mouse_camera && !menu_input_captured() && !menu_cursor_free() &&
-                !getenv("SAVAGEWIND_INPUT") && !getenv("SAVAGEWIND_HOST_INPUT");
+                !user_input_off();
     if (want == cur) return;
     cur = want;
     SDL_SetWindowRelativeMouseMode(w, want);
@@ -293,14 +312,17 @@ static bool test_event(const SDL_Event *e) {
 // Scripted test runs ignore the user's own input (a key or stick touched while a test drives the player spoils it):
 // SAVAGEWIND_NO_USER_INPUT=1, on by default whenever SAVAGEWIND_INPUT is set (or SAVAGEWIND_HOST_INPUT /
 // SAVAGEWIND_BIND_TEST; SAVAGEWIND_NO_USER_INPUT=0 lets it through again).
-bool input_user_blocked(const SDL_Event *e) {
+static bool user_input_off(void) {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("SAVAGEWIND_NO_USER_INPUT");
         on = v ? atoi(v) != 0 : (getenv("SAVAGEWIND_INPUT") || getenv("SAVAGEWIND_HOST_INPUT") || getenv("SAVAGEWIND_BIND_TEST"));
         if (on) LOG("[input] scripted run: keyboard, mouse and controllers ignored\n");
     }
-    if (!on) return false;
+    return on;
+}
+bool input_user_blocked(const SDL_Event *e) {
+    if (!user_input_off()) return false;
     if (test_event(e)) return false;  // (SAVAGEWIND_HOST_INPUT type: / sdlkey: / sdlpad: - the test's own presses)
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: case SDL_EVENT_TEXT_INPUT: case SDL_EVENT_TEXT_EDITING:
@@ -354,6 +376,11 @@ void input_handle_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F6 && !e->key.repeat) {
+            extern bool noclip_enabled(void);
+            extern volatile int g_noclip_toggle;
+            if (noclip_enabled()) g_noclip_toggle = 1;  // (runtime/hle/noclip.c, SAVAGEWIND_NOCLIP)
+        }
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F12 && !e->key.repeat)
             g_record_frames = !g_record_frames;
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F8 && !e->key.repeat) {
@@ -681,6 +708,11 @@ static void fill_state(Cpu *c) {
         int dy = (int)((d >> BTN_UP) & 1) - (int)((d >> BTN_DOWN) & 1);
         int32_t m = dx && dy ? 23170 : 32767;  // diagonals: same speed (32767 / sqrt 2)
         if (dx || dy) lx = dx * m, ly = dy * m;
+    }
+    {   // (runtime/hle/noclip.c) flying: the move keys and left stick steer the noclip camera, not Link - the game gets
+        // the camera, Plus and Minus only
+        extern volatile int g_noclip_active;
+        if (g_noclip_active) lx = ly = 0, b &= 1ull << BTN_PLUS | 1ull << BTN_MINUS;
     }
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;

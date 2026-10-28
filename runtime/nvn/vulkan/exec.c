@@ -4519,6 +4519,38 @@ static float halton(uint32_t i, uint32_t b) {
     return r;
 }
 
+// The scene camera as the game hands it to its shaders: the first draw of a frame with the scene's camera constants
+// (2336 bytes, projection row 3 = 0 0 -1 0 at word 40) - its first 48 words, for runtime tools (the noclip debug camera,
+// runtime/hle/noclip.c). Render thread writes, any thread reads under the lock.
+int g_noclip_camera;  // (set by runtime/hle/noclip.c when the debug camera is enabled)
+static pthread_mutex_t scene_cam_lock = PTHREAD_MUTEX_INITIALIZER;
+static float scene_cam[48];
+static uint64_t scene_cam_frame;
+bool vk_scene_camera(float out[48]) {
+    pthread_mutex_lock(&scene_cam_lock);
+    bool ok = scene_cam_frame != 0;
+    if (ok) memcpy(out, scene_cam, sizeof scene_cam);
+    pthread_mutex_unlock(&scene_cam_lock);
+    return ok;
+}
+static void scene_camera_note(void) {
+    uint64_t frame = renderer_present_count();
+    if (scene_cam_frame == frame + 1 || t_xw >= 0) return;  // (once a frame, on the render thread)
+    NvnTexture *d = st.rt.depth;  // (the player's camera: a draw into the scene's own depth - shadow, reflection and
+    if (!d || vk_texture_scale_group(d) != RS_SCENE) return;  // cube-map cameras have the same constants)
+    for (int c = 0; c < 18; c++) {
+        Range r = st.ubuf[0][c];
+        if (r.size != 2336 || !r.addr) continue;
+        const float *f = (const float *)(uintptr_t)r.addr;
+        if (f[40] != 0 || f[41] != 0 || f[42] != -1 || f[43] != 0) continue;
+        pthread_mutex_lock(&scene_cam_lock);
+        memcpy(scene_cam, f, sizeof scene_cam);
+        scene_cam_frame = frame + 1;
+        pthread_mutex_unlock(&scene_cam_lock);
+        return;
+    }
+}
+
 // (draw_, before its sets) a draw into the scene with the camera: this frame's camera, jitter and depth.
 static void taa_note_draw(void) {
     if (!dlaa_wanted()) {
@@ -8960,6 +8992,7 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
         g_cur_fs_hash = last_hash;
     }
     probe_small_pass(pr, r, indexed);
+    if (g_noclip_camera) scene_camera_note();
     bool cube_layers = cube_layer_draw(pr);
     if (cube_layers && cube_verify_draw(r, indexed)) return false;
     if (cube_layers) {

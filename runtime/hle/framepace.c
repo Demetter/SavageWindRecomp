@@ -269,6 +269,8 @@ void rt_vfr_update(uint64_t vfr) {
     }
     log_screens();
     player_dump(vfr);
+    extern void rt_noclip_update(void);  // runtime/hle/noclip.c (SAVAGEWIND_NOCLIP)
+    rt_noclip_update();
     extern void input_cam_frame(float ratio);  // runtime/hle/input.c: the mouse's motion in the frame, for the cameras
     if (!framepace_on()) {
         input_cam_frame(VF(float, vfr, VFR_RATIO));
