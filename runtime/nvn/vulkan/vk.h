@@ -45,6 +45,7 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, wide_lines;
+    int gmem_bda;  // shaders' global memory through device addresses (exec.c gmem_import; 2: A/B, odd frames bound)
     bool feat_aniso;  // samplerAnisotropy (Video > Anisotropic filtering)
     bool output_layer;        // vertex shaders can select a layered rendering attachment's face
     bool depth_clamp;          // depthClamp feature (nvnCommandBufferSetDepthClamp: shadow maps keep occluders before the near plane)

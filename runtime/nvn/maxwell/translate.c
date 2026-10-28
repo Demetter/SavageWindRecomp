@@ -24,6 +24,7 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+bool maxwell_gmem_bda;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -78,6 +79,7 @@ typedef struct {
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
+    bool gmem_bda;           // global memory through device addresses (maxwell_gmem_bda, not key->gmem_old)
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
     bool uses_shared;        // LDS / STS: compute shared memory, smem_words words (a power of two)
     uint32_t smem_words;
@@ -1130,6 +1132,48 @@ static void emit_tex(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
 }
 
 // ------------------------------------------------------------------ instruction translation
+// LDG / STG as a native shader does them: the guest address plus the guest-to-device offset (GMD, c[0]) is a pointer into
+// the heap buffer; one load or store as wide as the instruction (GW1 / GW2 / GW4: 32 / 64 / 128 bits, aligned as the
+// instruction requires); 8- and 16-bit accesses in their containing word (stores with atomics, as before). No rebase,
+// no software bounds check: the game's addresses are its heap's (on the console an address outside it faults too).
+static void emit_gmem_bda(Ctx *c, int d, bool store, int size, const char *addr) {
+    int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
+    sp(&c->body, "    { ulong ga = %s + GMD;\n", addr);
+    if (!store) {
+        if (size < 4) {
+            static const char *const sub[] = {"(wv >> sh) & 0xFFu", "uint(sx8(wv >> sh))", "(wv >> sh) & 0xFFFFu",
+                                              "uint(sx16(wv >> sh))"};
+            if (d != RZ) {
+                c->reg_used[d] = 1;
+                sp(&c->body, "      uint wv = GW1(ga & ~3ul).v; uint sh = uint(ga & %s) * 8u; r%d = %s;\n",
+                   size < 2 ? "3ul" : "2ul", d, sub[size]);
+            }
+        } else if (nw == 1) {
+            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = GW1(ga).v;\n", d); }
+        } else {
+            sp(&c->body, "      %s q = GW%d(ga).v;", nw == 2 ? "uvec2" : "uvec4", nw);
+            static const char comp[] = "xyzw";
+            for (int k = 0; k < nw; k++)
+                if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, " r%d = q.%c;", d + k, comp[k]); }
+            sp(&c->body, "\n");
+        }
+    } else {
+        c->uses_gmem_store = true;
+        if (size < 4) {
+            unsigned m = size < 2 ? 0xFFu : 0xFFFFu;
+            sp(&c->body, "      uint sh = uint(ga & %s) * 8u; atomicAnd(GW1(ga & ~3ul).v, ~(0x%xu << sh)); "
+               "atomicOr(GW1(ga & ~3ul).v, (%s & 0x%xu) << sh);\n", size < 2 ? "3ul" : "2ul", m, R(d), m);
+        } else if (nw == 1) {
+            sp(&c->body, "      GW1(ga).v = %s;\n", R(d));
+        } else {
+            sp(&c->body, "      GW%d(ga).v = %s(", nw, nw == 2 ? "uvec2" : "uvec4");
+            for (int k = 0; k < nw; k++) sp(&c->body, "%s%s", k ? ", " : "", R(d == RZ ? RZ : d + k));
+            sp(&c->body, ");\n");
+        }
+    }
+    sp(&c->body, "    }\n");
+}
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
@@ -1736,6 +1780,13 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
         else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
         else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        if (c->gmem_bda) {
+            char cb[256];
+            cbuf_ref(c, 0, GMEM_DELTA_OFFSET, NULL, cb);  // (c[0] holds the offset: declared, bound, sized)
+            cbuf_ref(c, 0, GMEM_DELTA_OFFSET + 4, NULL, cb);
+            emit_gmem_bda(c, d, store, size, addr);
+            goto gmem_done;
+        }
         sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
            (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
@@ -1782,6 +1833,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     sp(&c->body, "      if (ok) *(device uint *)(gmem + ga + %du) = %s;\n", k * 4, R(d == RZ ? RZ : d + k));
         }
         sp(&c->body, "    }\n");
+    gmem_done:;
     } else if (emit_half(c, w)) {
     } else if (OPM(0x50f8000000000000ull, 0xfff8000000000000ull)) {  // FSWZADD
         // per quad lane (laneid & 3), 2 bits of the swizzle pick: a+b, b-a, a-b, b
@@ -2051,6 +2103,7 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
+    "#extension GL_EXT_buffer_reference : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
     "uint as_u(uint x) { return x; }\n"
@@ -2228,7 +2281,14 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             sp(&s, "layout(std140, set = %d, binding = %d) uniform PCB%d { uvec4 pcb%d[%u]; };\n", set, 100 + i, i, i, n);
     }
     info->writes_gmem = info->uses_gmem && c->uses_gmem_store;
-    if (info->uses_gmem)
+    if (info->uses_gmem && c->gmem_bda) {
+        const char *ro = c->uses_gmem_store ? "" : "readonly ";
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 4) %sbuffer GW1 { uint v; };\n", ro);
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 8) %sbuffer GW2 { uvec2 v; };\n", ro);
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 16) %sbuffer GW4 { uvec4 v; };\n", ro);
+        sp(&s, "#define GMD (uint64_t(cb0[%d].x) | (uint64_t(cb0[%d].y) << 32))\n", GMEM_DELTA_OFFSET / 16,
+           GMEM_DELTA_OFFSET / 16);
+    } else if (info->uses_gmem)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
     if (c->uses_rscale) {  // (vertex shaders too: texel fetches from scaled targets, e.g. depth under the sun's flare)
@@ -2412,7 +2472,7 @@ const char *maxwell_translator_id(void) { return TRANSLATOR_ID; }
 
 uint32_t maxwell_translation_policy(void) {
     const char *e = getenv("SAVAGEWIND_CBR");
-    return e && atoi(e) != 0 ? 1u : 0u;
+    return (e && atoi(e) != 0 ? 1u : 0u) | (maxwell_gmem_bda ? 2u : 0u);
 }
 
 // Whether a translation depends on more than the binary and the key (debugging switches): not to be cached.
@@ -2994,6 +3054,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     c->stage = stage;
     c->ipa_mode = -1;
     c->glsl = key && key->glsl;
+    c->gmem_bda = c->glsl && maxwell_gmem_bda && !(key && key->gmem_old);
     // shared memory: the size the control section gives (1 KB if none), as a power of two up to 32 KB
     uint32_t sw = key && key->shared_size ? (key->shared_size + 3) / 4 : 256;
     for (c->smem_words = 1; c->smem_words < sw && c->smem_words < 8192; c->smem_words *= 2) {}

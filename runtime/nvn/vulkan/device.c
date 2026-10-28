@@ -317,6 +317,20 @@ static void create_device(void) {
     g_vk.native_multi_draw_ab=native_ab?strtoull(native_ab,NULL,10):0;
     if (native_mode) LOG("[vk] native multi-draw pilot mode %u (%s)\n", g_vk.native_multi_draw, g_vk.native_multi_draw ? "enabled" : "unavailable: mode or required features");
     vkq_native_multi_draw=g_vk.native_multi_draw;
+    {   // Shaders read and write the game's memory through device addresses (a guest address plus one offset is a GPU
+        // pointer: exec.c gmem_import, translate.c emit_gmem_bda), as native shaders use buffer pointers.
+        // SAVAGEWIND_GMEM_BDA=0: through the bound heap buffer with a bounds check per access, as before; =2: that in odd
+        // frames (compute), device addresses in even ones (an in-run A/B).
+        const char *e = getenv("SAVAGEWIND_GMEM_BDA");
+        int want = e ? atoi(e) : 1;
+        bool can = layer_have.bufferDeviceAddress && have.features.shaderInt64 && g_vk.host_import &&
+                   !getenv("SAVAGEWIND_VK_NO_GMEM");
+        g_vk.gmem_bda = can ? want : 0;
+        extern bool maxwell_gmem_bda;
+        maxwell_gmem_bda = g_vk.gmem_bda != 0;
+        LOG("[vk] shader global memory through %s\n", g_vk.gmem_bda == 2 ? "device addresses in even frames, the bound buffer "
+            "in odd ones (A/B)" : g_vk.gmem_bda ? "device addresses" : "the bound heap buffer");
+    }
     g_vk.output_layer = layer_have.shaderOutputLayer;
     if (gpl) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
@@ -363,7 +377,7 @@ static void create_device(void) {
                                             .pNext = m5 ? (void *)&m5_on : g_vk.custom_border ? (void *)&cbc
                                                                          : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                            .bufferDeviceAddress = g_vk.native_multi_draw != 0,
+                                            .bufferDeviceAddress = g_vk.native_multi_draw != 0 || g_vk.gmem_bda != 0,
                                             .shaderOutputLayer = g_vk.output_layer,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,

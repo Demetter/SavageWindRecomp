@@ -53,6 +53,7 @@ typedef struct {
     uint8_t velocity;
     uint8_t vel_vs;         // fragment: the vertex shader provides the two positions
     uint8_t vel_rt;         // fragment: the velocity's colour target
+    uint8_t gmem_old;       // (A/B) global memory through the bound heap buffer, bounds-checked, not device addresses
 } ShaderKey;
 
 typedef struct {
@@ -87,6 +88,10 @@ typedef struct {
 // Global memory (LDG/STG) is addressed through one buffer that wraps the guest heap.
 #define GMEM_BUFFER_INDEX 17
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// GLSL: global memory through device addresses (the heap buffer's, runtime/nvn/vulkan/exec.c gmem_import): a guest
+// address plus the guest-to-device offset in c[0] at GMEM_DELTA_OFFSET is a GPU pointer
+extern bool maxwell_gmem_bda;
+#define GMEM_DELTA_OFFSET 0x7f0
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

@@ -471,8 +471,12 @@ void vk_full_barrier(VkCommandBuffer cb) {
 // at the castle 5.13 -> 4.54 ms (27 Oct). SAVAGEWIND_VK_GAME_BARRIERS=0: a full barrier before every pass and dispatch.
 // (testing) SAVAGEWIND_VK_GAME_BARRIERS=2: on in even frames, off in odd ones (consecutive frames compared in one run);
 // SAVAGEWIND_GB_FRAG_READS=1: fragment reads checked too
+// (research, unsafe) SAVAGEWIND_VK_GAME_BARRIERS=3: in odd 16-frame blocks every game barrier is a fragment barrier
+// (no full drain) - the most GPU time dependency-driven barriers could recover, read from SAVAGEWIND_VK_PASS_GPU's
+// samples (every 16th frame) by block; images may break in those blocks
 static int gb_mode = -1;
 static bool gb_list_on = true;  // (mode 2: this list's)
+static bool gb_ceiling;         // (mode 3: this list's)
 static int gb_on(void) {
     if (gb_mode < 0) gb_mode = getenv("SAVAGEWIND_VK_GAME_BARRIERS") ? atoi(getenv("SAVAGEWIND_VK_GAME_BARRIERS")) : 1;
     return gb_mode == 2 ? gb_list_on : gb_mode != 0;
@@ -527,7 +531,10 @@ static void gb_work(VkCommandBuffer cb) {
 static void gb_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 stages) {
     if (!gb_on() || !gb_thread) { consumer_barrier(cb, stages); return; }
     int why = gb_pending ? (gb_src == 1 ? 0 : gb_src == 0 ? 4 : gb_src == 2 ? 5 : 6) : gb_ops != gb_ops_seen ? 1 : -1;
-    if (why == 0 && (gb_bits & 6u) && !(gb_bits & ~0x36u)) {  // (order fragments, with cache invalidations)
+    if (why == 0 && gb_ceiling) {  // (research ceiling: no drain for the game's barriers)
+        gb_fragment_barrier(cb, stages);
+        why = 7;
+    } else if (why == 0 && (gb_bits & 6u) && !(gb_bits & ~0x36u)) {  // (order fragments, with cache invalidations)
         gb_fragment_barrier(cb, stages);
         why = 7;
     } else if (why < 0 && gb_drawn && stages != VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
@@ -5283,7 +5290,10 @@ static VkDescriptorBufferInfo probe_cbuf_info(int stage, ShaderInfo *si, int k, 
     probe_cbuf(stage, k, d);
     return d;
 }
+static VkDescriptorBufferInfo gmem_info(void);
+static uint64_t gmem_delta;  // (below: the guest heap)
 static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
+    if (k == 0 && si->uses_gmem && g_vk.gmem_bda) (void)gmem_info();  // (device addresses: no heap binding does this)
     if (k == 0 && stage != 5) {
         uint64_t sgen = t_worker >= 0 && t_xw < 0 ? t_sbuf_gen : sbuf_gen;
         // A graphics stage's driver constants are its storage buffers' addresses: the same from draw to draw until
@@ -5302,12 +5312,14 @@ static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint3
             e[1] = (uint32_t)(st.sbuf[stage][i].addr >> 32);
             e[2] = (uint32_t)st.sbuf[stage][i].size;
         }
+        drv[GMEM_DELTA_OFFSET / 4] = (uint32_t)gmem_delta, drv[GMEM_DELTA_OFFSET / 4 + 1] = (uint32_t)(gmem_delta >> 32);
         VkDescriptorBufferInfo bi = ubo_span(copy_dedupe(stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
         if (stage >= 0 && stage < 5) { memo[stage].gen = sgen; memo[stage].seq = seq; memo[stage].size = size; memo[stage].bi = bi; }
         return bi;
     }
     if (k == 0) {
         uint32_t drv[0x800 / 4] = {0};
+        drv[GMEM_DELTA_OFFSET / 4] = (uint32_t)gmem_delta, drv[GMEM_DELTA_OFFSET / 4 + 1] = (uint32_t)(gmem_delta >> 32);
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
             for (int i = 0; i < 16; i++) {
@@ -5376,6 +5388,12 @@ static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint3
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static uint64_t gmem_delta;  // (g_vk.gmem_bda) the heap buffer's device address - HEAP_BASE: guest address -> GPU pointer
+static void gmem_address(VkBuffer buf) {
+    if (!g_vk.gmem_bda) return;
+    VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buf};
+    gmem_delta = vkGetBufferDeviceAddress(g_vk.dev, &ai) - HEAP_BASE;
+}
 
 static bool gmem_import(uint64_t size) {
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
@@ -5387,6 +5405,9 @@ static bool gmem_import(uint64_t size) {
     VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
                                             .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                             .pHostPointer = (void *)(uintptr_t)HEAP_BASE};
+    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    if (g_vk.gmem_bda) imp.pNext = &af;
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = size,
                                .memoryTypeIndex = (uint32_t)__builtin_ctz(mp.memoryTypeBits)};
     VkDeviceMemory mem;
@@ -5397,6 +5418,7 @@ static bool gmem_import(uint64_t size) {
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+    if (g_vk.gmem_bda) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
@@ -5411,6 +5433,7 @@ static bool gmem_import(uint64_t size) {
     gmem_buf = buf;
     gmem_mem = mem;
     gmem_size = size;
+    gmem_address(buf);
     LOG("[vk] guest heap imported for shader global memory: %llu MB\n", (unsigned long long)(size >> 20));
     return true;
 }
@@ -5451,6 +5474,9 @@ void backend_heap_set(uint64_t size) {
     if (type == UINT32_MAX || !get_fd) return;
     VkExportMemoryAllocateInfo ex = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
                                      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    if (g_vk.gmem_bda) ex.pNext = &af;
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ex, .allocationSize = size,
                                .memoryTypeIndex = type};
     VkDeviceMemory mem;
@@ -5478,10 +5504,12 @@ void backend_heap_set(uint64_t size) {
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+    if (g_vk.gmem_bda) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VkBuffer buf;
     VK_CHECK(vkCreateBuffer(g_vk.dev, &bi, NULL, &buf));  // (the heap is mapped now: no way back)
     VK_CHECK(vkBindBufferMemory(g_vk.dev, buf, mem, 0));
     gmem_buf = buf;
+    gmem_address(buf);
     gmem_mem = mem;
     gmem_size = size;
     gmem_mapped = true;
@@ -7269,21 +7297,24 @@ static void build_compute(void *arg) {
     atomic_store(&cp->p.state, atomic_load(&c->state) == 2 ? 1 : 2);
 }
 
-static struct CsEnt { uint64_t addr, constants; CsProg *cp; } g_cs_tab[256];
+static struct CsEnt { uint64_t addr, constants; bool old; CsProg *cp; } g_cs_tab[256];
 
-static CsProg *compute_program(NvnProgram *np) {
+// old: the variant with global memory through the bound heap buffer (SAVAGEWIND_GMEM_BDA=2, odd frames)
+static CsProg *compute_program(NvnProgram *np, bool old) {
     NvnShaderStage *ss = &np->stages[5];
     if (!ss->code_addr) return NULL;
     uint64_t constants = program_constants_id(ss);
     struct CsEnt *tab = g_cs_tab;
     int n = g_cs_n;
-    for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr && tab[i].constants == constants) return tab[i].cp;
+    for (int i = 0; i < n; i++)
+        if (tab[i].addr == ss->code_addr && tab[i].constants == constants && tab[i].old == old) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
-    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].constants = constants; tab[n].cp = cp; g_cs_n = n + 1; }
+    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].constants = constants; tab[n].old = old; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     ShaderKey k = {0};
     k.glsl = 1;
+    k.gmem_old = old;
     k.shared_size = ss->control ? *(const uint32_t *)(ss->control + 0x754) : 0;  // (next to the group size at 0x748)
     pthread_mutex_lock(&translate_lock);
     cp->si = vk_translate_program((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k,
@@ -7720,7 +7751,7 @@ bool vk_pso_wait(int ms, float *done) {
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
-    CsProg *cp = compute_program(st.program);
+    CsProg *cp = compute_program(st.program, g_vk.gmem_bda == 2 && (renderer_present_count() & 1));
     if (!cp || atomic_load(&cp->p.state) != 1) { stat_skipped++; return; }
     gw_check((const uint32_t[6]){0, 0, 0, 0, 0, cp->si->cbuf_mask}, false, 0, 0);
     vk_end_pass();
@@ -11852,6 +11883,7 @@ static void exec_list(uint64_t handle, int depth) {
     }
     if (lst_on) lst_begin(depth);
     if (!depth && gb_mode == 2) gb_list_on = !(renderer_present_count() & 1);
+    if (!depth && gb_mode == 3) gb_ceiling = (renderer_present_count() >> 4) & 1;
     if (!depth && gb_on()) {  // (a list from the queue: what came before it is ordered against it)
         gb_thread = true, gb_pending = true, gb_src = 0;
         vkq_work_hook = gb_work;
