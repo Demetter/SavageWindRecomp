@@ -462,6 +462,18 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
     fprintf(stderr, "\n*** %s accessing %#llx\n    host pc %llx (%s+%llx)\n    host lr %llx (%s)\n", what,
             (unsigned long long)fa, (unsigned long long)pc, ps ? ps : "?", (unsigned long long)po,
             (unsigned long long)lr, ls ? ls : "?");
+    {   // the faulting thread's guest registers, if it is a game thread: x30 is the return address of its last call, so
+        // a fault in recompiled code (no line tables) can be traced to the guest field it read
+        extern Cpu *kernel_current_cpu(void);
+        Cpu *c = kernel_current_cpu();
+        if (c) {
+            fprintf(stderr, "    guest pc %llx sp %llx\n", (unsigned long long)c->pc, (unsigned long long)c->sp);
+            for (int i = 0; i < 31; i += 4)
+                fprintf(stderr, "    x%-2d %016llx x%-2d %016llx x%-2d %016llx x%-2d %016llx\n", i, (unsigned long long)c->x[i],
+                        i + 1, (unsigned long long)c->x[i + 1 < 31 ? i + 1 : 30], i + 2, (unsigned long long)c->x[i + 2 < 31 ? i + 2 : 30],
+                        i + 3, (unsigned long long)c->x[i + 3 < 31 ? i + 3 : 30]);
+        }
+    }
     rt_fatal_trace();
 }
 
