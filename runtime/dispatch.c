@@ -474,6 +474,9 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
                 fprintf(stderr, "\n");
             }
         }
+        extern const char *rt_fault_note(void);  // (runtime/hle/jobs.c: research switches' note of what this thread does)
+        const char *note = rt_fault_note();
+        if (note) fprintf(stderr, "    %s\n", note);
     }
     rt_fatal_trace();
 }

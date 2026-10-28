@@ -868,6 +868,64 @@ enum { LS_INFO, LS_DRAW, LS_INSERT, LS_BEGIN, LS_END, LS_CTX, LS_CTX_FINI, LS_DL
 typedef struct { const uint64_t *fns; uint64_t r, layer, dlg0, dlg1; uint32_t key0, n, steps[64], turn; } LsTask;
 static pthread_mutex_t g_ls_one = PTHREAD_MUTEX_INITIALIZER;  // (SAVAGEWIND_LAYER_STEPS=2: one step at a time)
 static int g_ls_mode;
+// (research) SAVAGEWIND_LAYER_STEP_TIME=1: each layer step's drawing time (the step-draw call), by layer and step, with
+// its draw methods ([step+8]); every 2 s the 24 with the most time a second ("[layer-steps]")
+typedef struct { uint64_t layer; uint32_t step, methods; uint64_t n, ns, max; } LsTime;
+enum { LS_TIMES = 256 };
+static LsTime g_ls_t[LS_TIMES];
+static int g_ls_time = -1;
+static uint64_t g_ls_t0;
+static pthread_mutex_t g_ls_t_lock = PTHREAD_MUTEX_INITIALIZER;  // (layers' Draw jobs run on several workers at once)
+static void ls_time_note(uint64_t layer, uint32_t step, uint64_t ns) {
+    pthread_mutex_lock(&g_ls_t_lock);
+    uint32_t h = (uint32_t)((layer >> 4) * 31 + step) & (LS_TIMES - 1);
+    for (uint32_t k = 0; k < LS_TIMES; k++, h = (h + 1) & (LS_TIMES - 1)) {
+        LsTime *e = &g_ls_t[h];
+        if (e->layer && (e->layer != layer || e->step != step)) continue;
+        if (!e->layer) {
+            uint64_t steps = LD64(layer + 0xc0);  // (f_7000ef0264: the steps, 0x820 bytes each; +8 its draw methods)
+            *e = (LsTime){layer, step, steps ? LD32(steps + step * 0x820ull + 8) : 0, 0, 0, 0};
+        }
+        e->n++, e->ns += ns;
+        if (ns > e->max) e->max = ns;
+        break;
+    }
+    pthread_mutex_unlock(&g_ls_t_lock);
+}
+static void ls_time_report(void) {
+    pthread_mutex_lock(&g_ls_t_lock);
+    uint64_t now = plat_now_ns();
+    if (!g_ls_t0) g_ls_t0 = now;
+    if (now - g_ls_t0 < 2000000000ull) { pthread_mutex_unlock(&g_ls_t_lock); return; }
+    double s = (now - g_ls_t0) / 1e9;
+    bool shown[LS_TIMES] = {0};
+    LOG("[layer-steps] the steps with the most time (layer, step, draw methods: a second, mean, longest)\n");
+    for (int r = 0; r < 24; r++) {
+        int best = -1;
+        for (int k = 0; k < LS_TIMES; k++)
+            if (g_ls_t[k].n && !shown[k] && (best < 0 || g_ls_t[k].ns > g_ls_t[best].ns)) best = k;
+        if (best < 0) break;
+        shown[best] = true;
+        const LsTime *e = &g_ls_t[best];
+        LOG("[layer-steps]   %llx step %2u (%3u methods): %6.0f /s, %6.1f ms/s, mean %6.1f us, longest %6.1f us\n",
+            (unsigned long long)e->layer, e->step, e->methods, e->n / s, e->ns / 1e6 / s, e->ns / 1e3 / e->n, e->max / 1e3);
+    }
+    memset(g_ls_t, 0, sizeof g_ls_t);
+    g_ls_t0 = now;
+    pthread_mutex_unlock(&g_ls_t_lock);
+}
+// (research) the layer step this thread is drawing, for the crash report (rt_fault_note, runtime/dispatch.c)
+static __thread char t_ls_note[96];
+const char *rt_fault_note(void) { return t_ls_note[0] ? t_ls_note : NULL; }
+// the sead core id the game's per-core getters use on this thread (f_7000ed6364: the ksys TLS value - 1, else the core
+// number; 1000 + the core number when the TLS value is 0)
+extern uint32_t kernel_current_core(void);
+static uint32_t ls_core(Cpu *c) {
+    uint32_t slot = LD32(LD64(0x7001d66320ull));
+    uint64_t thread = *(uint64_t *)(uintptr_t)(c->tpidrro + 0x1f8);
+    uint64_t v = *(uint64_t *)(uintptr_t)(thread + 0x80 + 8ull * slot);
+    return v ? (uint32_t)(v - 1) : 1000 + kernel_current_core();
+}
 static void ls_step(Cpu *c, void *arg, uint32_t k) {
     LsTask *t = arg;
     if (g_ls_mode == 2) pthread_mutex_lock(&g_ls_one);
@@ -889,7 +947,12 @@ static void ls_step(Cpu *c, void *arg, uint32_t k) {
     guest_call(c, fns[LS_BEGIN]);
     uint32_t key = (uint32_t)c->x[0];
     c->x[0] = t->layer, c->x[1] = info;
+    uint64_t t0 = g_ls_time > 0 ? plat_now_ns() : 0;
+    snprintf(t_ls_note, sizeof t_ls_note, "layer step: layer %llx step %u (chain of %u, mode %d), sead core %u",
+             (unsigned long long)t->layer, i, t->n, g_ls_mode, ls_core(c));
     guest_call(c, fns[LS_DRAW]);
+    t_ls_note[0] = 0;
+    if (t0) ls_time_note(t->layer, i, plat_now_ns() - t0);
     if (key != UINT32_MAX) {
         c->x[0] = arena, c->x[1] = ctx, c->x[2] = key;
         guest_call(c, fns[LS_END]);
@@ -903,9 +966,38 @@ static void ls_step(Cpu *c, void *arg, uint32_t k) {
     if (g_ls_mode == 2) pthread_mutex_unlock(&g_ls_one);
     if (g_ls_mode == 4) __atomic_store_n(&t->turn, k + 1, __ATOMIC_RELEASE), plat_wake_u32_all(&t->turn);
 }
+// (research, SAVAGEWIND_LAYER_STEPS=6) A layer's steps in two ordered chains at once: the steps named by
+// SAVAGEWIND_LAYER_STEP_FORK=<i>,... (default 4: the world layer's heaviest, 374 of its ~650 us at Kakariko) and the
+// others, each chain in order, the job's thread and an idle job thread taking one each (rt_jobs_fork_join; with none
+// idle, the job's thread runs both) - each step its own display list, which the submit sorts by key.
+// SAVAGEWIND_LAYER_STEP_AB=1: mode 6 in even game frames, mode 3 (every step in order here) in odd ones (in-run A/B).
+static uint64_t g_ls_fork = 1ull << 4;
+static void ls_chain(Cpu *c, void *arg, uint32_t k) {
+    LsTask *t = &((LsTask *)arg)[k];
+    static int nlog;
+    if (nlog < 16 && __atomic_fetch_add(&nlog, 1, __ATOMIC_RELAXED) < 16)
+        LOG("[layer-steps] layer %llx chain %u (steps %u..., %u of them) on sead core %u\n", (unsigned long long)t->layer,
+            k, t->n ? t->steps[0] : 0, t->n, ls_core(c));
+    for (uint32_t j = 0; j < t->n; j++) ls_step(c, t, j);
+}
 int rt_layer_steps(Cpu *c, const uint64_t *fns) {
-    static int enabled = -1;
-    if (enabled < 0) enabled = getenv("SAVAGEWIND_LAYER_STEPS") ? atoi(getenv("SAVAGEWIND_LAYER_STEPS")) : 0, g_ls_mode = enabled;
+    static int enabled = -1, ab;
+    if (enabled < 0) {
+        enabled = getenv("SAVAGEWIND_LAYER_STEPS") ? atoi(getenv("SAVAGEWIND_LAYER_STEPS")) : 0, g_ls_mode = enabled;
+        ab = getenv("SAVAGEWIND_LAYER_STEP_AB") != NULL;
+        const char *f = getenv("SAVAGEWIND_LAYER_STEP_FORK");
+        if (f) {
+            g_ls_fork = 0;
+            for (char *e; *f; f = *e == ',' ? e + 1 : e) {
+                long i = strtol(f, &e, 10);
+                if (e == f) break;
+                if (i >= 0 && i < 64) g_ls_fork |= 1ull << i;
+            }
+        }
+        if (g_ls_time < 0) g_ls_time = getenv("SAVAGEWIND_LAYER_STEP_TIME") != NULL;
+        if (enabled == 6) LOG("[layer-steps] mode 6: steps %llx on a helper thread%s\n", (unsigned long long)g_ls_fork,
+                              ab ? ", odd game frames in order (A/B)" : "");
+    }
     uint32_t count = (uint32_t)c->x[25], flags = (uint32_t)c->x[21];
     if (!enabled || !(c->x[20] & 1) || count < 2 || count > 64 || !on()) return 0;
     LsTask t = {fns, c->x[22], c->x[23], c->x[19], LD64(LD64(fns[LS_DLG_GOT]) + 8), LD32(c->sp + 0xc), 0, {0}, 0};
@@ -930,8 +1022,25 @@ int rt_layer_steps(Cpu *c, const uint64_t *fns) {
             for (uint32_t k = 0; k < r.n; k++) ls_step(c, &r, k);
         return 1;
     }
-    if (g_ls_mode == 3) {  // (testing: every step on this thread, in order, each with a context of its own)
+    extern uint64_t g_game_frames;
+    if ((g_ls_mode == 6 || g_ls_mode == 7) && !(ab && (g_game_frames & 1))) {
+        LsTask two[2] = {t, t};  // (0: the named steps, 1: the rest; this thread and an idle job thread take one each)
+        two[0].n = two[1].n = 0;
+        uint32_t k0 = 0;
+        if (g_ls_mode == 7)  // (the steps before the first named one: first, in order, here)
+            for (; k0 < t.n && !(g_ls_fork >> t.steps[k0] & 1); k0++) ls_step(c, &t, k0);
+        for (uint32_t k = k0; k < t.n; k++) {
+            LsTask *d = &two[(g_ls_fork >> t.steps[k] & 1) ? 0 : 1];
+            d->steps[d->n++] = t.steps[k];
+        }
+        if (!(two[0].n && two[1].n && rt_jobs_fork_join(c, ls_chain, two, 2)))
+            for (uint32_t k = k0; k < t.n; k++) ls_step(c, &t, k);  // (nothing to split, or no task set free: in order)
+        if (g_ls_time > 0) ls_time_report();
+        return 1;
+    }
+    if (g_ls_mode == 3 || g_ls_mode == 6 || g_ls_mode == 7) {  // (testing: every step on this thread, in order, each with a context of its own)
         for (uint32_t k = 0; k < t.n; k++) ls_step(c, &t, k);
+        if (g_ls_time > 0) ls_time_report();
         return 1;
     }
     if (t.n > 1 && rt_jobs_fork_join(c, ls_step, &t, t.n)) return 1;
