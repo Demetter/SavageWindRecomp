@@ -409,6 +409,11 @@ void input_handle_event(const SDL_Event *e) {
             recompute_keyboard();
         }
         break;
+    case SDL_EVENT_MOUSE_WHEEL: {  // (the game has no use for it) the noclip camera's speed: runtime/hle/noclip.c
+        extern void noclip_wheel(float notches);
+        if (!menu_input_captured()) noclip_wheel(e->wheel.y);
+        break;
+    }
     case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_FOCUS_GAINED:
         win_focused = e->type == SDL_EVENT_WINDOW_FOCUS_GAINED;
         break;

@@ -2,15 +2,16 @@
 // (=2: on from the moment Link is in the world).
 // While it is on, Link flies where you steer him, through walls and the ground: your move keys (W/A/S/D by default)
 // or a controller's left stick move him relative to the camera, Space / right trigger up, Ctrl / left trigger down,
-// Shift / left stick click faster. The camera stays the game's (mouse or right stick); the game's own movement input
-// (left stick, buttons) is held back while flying so Link doesn't run or jump on the spot.
+// the mouse wheel sets the speed (15 m/s at first, x1.25 a notch), Shift / left stick click 4x it. The camera stays
+// the game's (mouse or right stick); the game's own movement input (left stick, buttons) is held back while flying so
+// Link doesn't run or jump on the spot.
 //
 // Each game update (rt_vfr_update, the main thread at the start of the frame, before the physics step) the game's own
 // physics API places him: his main rigid body (actor +0x578 ActorPhysics, +0x80 the body; its motion +8, or +0x2a0
 // with flag 0x10000 at +0x120; the motion's accessor +0xb8 - the layout f_7001531040 and f_70012aa00c read) gets
 // MotionAccessor::setPosition (vtable +0x18, f_70012e1ed0: Havok's setPositionAndRotation, linked motions too) and
-// setLinearVelocity(0) (+0x48), so gravity never builds up. Streaming, the world and the camera follow as for any
-// move. Turning it off drops him where he is (a long fall still hurts).
+// setLinearVelocity (+0x48) to the velocity he flies at, so gravity never builds up. Streaming, the world and the
+// camera follow as for any move. Turning it off drops him where he is (a long fall still hurts).
 //
 // Camera-relative directions come from the scene camera the renderer sees (runtime/nvn/vulkan/exec.c
 // vk_scene_camera: the game's camera constants; words 0-11 are the view matrix, rows right / up / back).
@@ -36,6 +37,14 @@ extern void input_noclip_axes(float *right, float *forward, float *up, int *fast
 
 static float pos[3];
 static uint64_t last_ns;
+static float g_speed = 15.0f;  // m/s, the mouse wheel's: x1.25 a notch, 2 .. 1000
+
+void noclip_wheel(float notches) {  // (input.c, the mouse wheel) faster up, slower down - while flying
+    if (!g_noclip_active || notches == 0) return;
+    g_speed *= powf(1.25f, notches);
+    g_speed = g_speed < 2 ? 2 : g_speed > 1000 ? 1000 : g_speed;
+    LOG("[noclip] speed %.0f m/s\n", g_speed);
+}
 
 bool noclip_enabled(void) {
     if (g_noclip_enabled < 0) {
@@ -43,8 +52,8 @@ bool noclip_enabled(void) {
         g_noclip_enabled = e ? atoi(e) : 0;
         if (g_noclip_enabled) {
             g_noclip_camera = 1;
-            LOG("[noclip] F6 turns noclip on and off: move keys / left stick fly, Space / RT up, Ctrl / LT down, Shift / "
-                "L3 faster\n");
+            LOG("[noclip] F6 turns noclip on and off: move keys / left stick fly, Space / RT up, Ctrl / LT down, mouse "
+                "wheel speed, Shift / L3 4x\n");
         }
     }
     return g_noclip_enabled;
@@ -116,28 +125,34 @@ void rt_noclip_update(void) {
     float ax, ay, az;
     int fast;
     input_noclip_axes(&ax, &ay, &az, &fast);
-    float speed = (fast ? 60.0f : 15.0f) * dt;  // m/s: a run is ~5, a gallop ~13
-    for (int i = 0; i < 3; i += 2) pos[i] += (right[i] * ax + fwd[i] * ay) * speed;
-    pos[1] += az * speed;
-    // the game's own calls, on this thread's guest context; every register and the stack come back as they were
+    float speed = g_speed * (fast ? 4.0f : 1.0f);  // m/s (a run is ~5, a gallop ~13); the wheel sets g_speed
+    float vel[3] = {(right[0] * ax + fwd[0] * ay) * speed, az * speed, (right[2] * ax + fwd[2] * ay) * speed};
+    for (int i = 0; i < 3; i++) pos[i] += vel[i] * dt;
+    // the game's own calls, on this thread's guest context; every register and the stack come back as they were.
+    // He is put where he flies to AND given the velocity he flies at: the physics step carries him on smoothly, and
+    // the camera, which follows his motion, sees a body moving as it does instead of one standing still and jumping
+    // (it trailed behind and Link wandered over the screen)
     Cpu *c = kernel_current_cpu();
     if (!c) return;
     static Cpu saved;
     saved = *c;
     uint64_t sp = (c->sp - 0x400) & ~15ull, vec = sp + 0x200;  // (scratch below the guest's frame; calls go below)
     uint64_t vt = VF(uint64_t, acc, 0);
-    float zero[3] = {0, 0, 0};
     memcpy((void *)(uintptr_t)vec, pos, sizeof pos);
     c->sp = sp, c->x[0] = acc, c->x[1] = vec, c->x[2] = 1;  // MotionAccessor::setPosition(pos, propagate)
     guest_call(c, VF(uint64_t, vt, 0x18));
-    memcpy((void *)(uintptr_t)vec, zero, sizeof zero);
-    c->sp = sp, c->x[0] = acc, c->x[1] = vec;  // MotionAccessor::setLinearVelocity(0, epsilon 0)
+    static int zero_vel = -1;  // (SAVAGEWIND_NOCLIP_ZEROVEL=1: velocity 0, as the first version - to compare)
+    if (zero_vel < 0) zero_vel = getenv("SAVAGEWIND_NOCLIP_ZEROVEL") != NULL;
+    if (zero_vel) memset(vel, 0, sizeof vel);
+    memcpy((void *)(uintptr_t)vec, vel, sizeof vel);
+    c->sp = sp, c->x[0] = acc, c->x[1] = vec;  // MotionAccessor::setLinearVelocity(vel, epsilon 0)
     memset(&c->v[0], 0, sizeof c->v[0]);
     guest_call(c, VF(uint64_t, vt, 0x48));
     *c = saved;
     static uint64_t told;
     if (now - told > 2000000000ull) {
         told = now;
-        LOG("[noclip] at %.1f %.1f %.1f (camera forward %.2f %.2f)\n", pos[0], pos[1], pos[2], fwd[0], fwd[2]);
+        LOG("[noclip] at %.1f %.1f %.1f, %.0f m/s (camera forward %.2f %.2f)\n", pos[0], pos[1], pos[2], g_speed, fwd[0],
+            fwd[2]);
     }
 }
