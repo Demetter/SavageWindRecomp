@@ -10010,10 +10010,11 @@ static void par_start(void) {
     // cores): 8 cores, N = 7: 2 workers 4.21 ms a frame, 3 3.84, 4 3.93; N = 6: 3.98 / 3.72 / 3.82; 6 cores (affinity),
     // N = 5: 1 worker 5.63, 2 3.85, 3 4.03; 4 cores, N = 3: 5.52 / 5.25 / 5.61. (Before the game's jobs ran on N cores,
     // 2 was best at 8 cores: each worker more slowed the game's own threads.) Physical cores, not logical processors:
-    // a worker on a busy core's second thread slows that core. SAVAGEWIND_VK_PAR=<n>: n (0: off).
+    // a worker on a busy core's second thread slows that core. The game's core count leaves these and the render and
+    // recording threads their cores (runtime/hle/cores.c). SAVAGEWIND_VK_PAR=<n>: n (0: off).
     const char *e = getenv("SAVAGEWIND_VK_PAR");
-    int cores = plat_physical_cores() < perf_usable_processors() ? plat_physical_cores() : perf_usable_processors();
-    par_workers = e ? atoi(e) : cores < 4 ? 1 : cores / 2 - 1 > 2 ? cores / 2 - 1 : 2;
+    extern int rt_render_workers_default(void);
+    par_workers = e ? atoi(e) : rt_render_workers_default();
     if (par_workers < 0) par_workers = 0;
     if (par_workers > PAR_MAX) par_workers = PAR_MAX;
     e = getenv("SAVAGEWIND_VK_PAR_CHUNK");

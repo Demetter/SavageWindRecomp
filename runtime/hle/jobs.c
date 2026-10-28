@@ -22,6 +22,7 @@
 #include "../kernel.h"
 #include "../platform.h"
 #include "../rt.h"
+#include "../perf_survey.h"
 #include "../nvn/nvn.h"  // (NvnFnStat: the layer Draw jobs' NVN calls by function)
 
 #if defined(__x86_64__)
@@ -56,6 +57,7 @@ typedef struct {
 static Pool g_pools[8];
 static pthread_mutex_t g_pools_m = PTHREAD_MUTEX_INITIALIZER;
 static int g_on = -1, g_check, g_spin;
+static int g_spin_alt = -1;  // (PERFX_JSPIN: the spin in the on blocks, SAVAGEWIND_JOBS_SPIN_ALT, default 50)
 static uint64_t g_rounds, g_groups, g_bad;
 
 RT_ON_RESET(jobs_reboot_reset) { memset(g_pools, 0, sizeof g_pools); }  // (reboot: pools and threads were the guest's)
@@ -259,6 +261,8 @@ static bool on(void) {
             g_tr_mask = strlen(tr) >= 16 ? ~0ull : (1ull << (4 * strlen(tr))) - 1;
         }
         g_spin = s ? atoi(s) : 1000;
+        if (perfx_trial(PERFX_JSPIN) || (getenv("SAVAGEWIND_PERFX") && (strtoul(getenv("SAVAGEWIND_PERFX"), NULL, 0) & PERFX_JSPIN)))
+            g_spin_alt = getenv("SAVAGEWIND_JOBS_SPIN_ALT") ? atoi(getenv("SAVAGEWIND_JOBS_SPIN_ALT")) : 50;
         g_on = !e || atoi(e) != 0;
         LOG("[jobs] %s\n", g_on ? "native scheduler (SAVAGEWIND_JOBS_NATIVE=0: the game's own)" : "the game's own scheduler");
     }
@@ -325,7 +329,9 @@ static void fan_out(Pool *p, uint32_t s) {  // (a worker woken for seq s) the ot
 // Waits until *w != v: spins first, then the OS's address wait, in slices so a reboot doesn't wait it out. A thread
 // that holds an emulated core (the main thread) lets it go while it blocks.
 static void wait_change(const uint32_t *w, uint32_t v, bool core_held) {
-    for (int i = 0; i < g_spin; i++) {
+    int spin = g_spin;
+    if (g_spin_alt >= 0 && (perfx_now() & PERFX_JSPIN)) spin = g_spin_alt;
+    for (int i = 0; i < spin; i++) {
         if (__atomic_load_n(w, __ATOMIC_ACQUIRE) != v) return;
         PAUSE();
     }
@@ -669,6 +675,7 @@ uint32_t rt_view_rec_cut(uint32_t stored) {
     static int ab = -1;
     if (ab < 0) ab = getenv("SAVAGEWIND_VIEW_REC_AB") && atoi(getenv("SAVAGEWIND_VIEW_REC_AB"));
     extern uint64_t g_game_frames;
+    if (perfx_trial(PERFX_VRPARTS) && !(perfx_now() & PERFX_VRPARTS)) return 3;  // (in-launch: 3 parts in the off blocks)
     return ab && (g_game_frames & 1) ? 3 : stored;
 }
 
