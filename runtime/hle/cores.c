@@ -14,11 +14,14 @@
 
 #include "../platform.h"
 
-// Translation workers when SAVAGEWIND_VK_PAR doesn't say: half the cores less one, at least 2 (1 below 4 cores).
-// (runtime/nvn/vulkan/exec.c par_start has the measurements.)
+// Translation workers when SAVAGEWIND_VK_PAR doesn't say: half the cores less one, at least 2 (1 below 4 cores), at most
+// 4. Not a size limit but the render thread's pace: it plans a frame's draws in ~2.6 ms and the workers translate them
+// in ~5 ms of work, so ~2 keep up and 1-2 more clear the list's last chunks (3 -> 4 workers: render lists 3.30 ->
+// 3.21 ms, its wait for the last chunks 0.78 -> 0.64; Kakariko 720p, 28 Oct). More would idle on cores the game can use:
+// at 16 cores the game gets 10, not 7. (runtime/nvn/vulkan/exec.c par_start has the measurements.)
 int rt_render_workers_default(void) {
-    int cores = plat_physical_cores();
-    return cores < 4 ? 1 : cores / 2 - 1 > 2 ? cores / 2 - 1 : 2;
+    int cores = plat_physical_cores(), w = cores / 2 - 1;
+    return cores < 4 ? 1 : w < 2 ? 2 : w > 4 ? 4 : w;
 }
 
 int rt_game_cores(void) {

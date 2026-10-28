@@ -468,10 +468,11 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
         Cpu *c = kernel_current_cpu();
         if (c) {
             fprintf(stderr, "    guest pc %llx sp %llx\n", (unsigned long long)c->pc, (unsigned long long)c->sp);
-            for (int i = 0; i < 31; i += 4)
-                fprintf(stderr, "    x%-2d %016llx x%-2d %016llx x%-2d %016llx x%-2d %016llx\n", i, (unsigned long long)c->x[i],
-                        i + 1, (unsigned long long)c->x[i + 1 < 31 ? i + 1 : 30], i + 2, (unsigned long long)c->x[i + 2 < 31 ? i + 2 : 30],
-                        i + 3, (unsigned long long)c->x[i + 3 < 31 ? i + 3 : 30]);
+            for (int i = 0; i < 31; i += 4) {
+                fprintf(stderr, "   ");
+                for (int k = i; k < i + 4 && k < 31; k++) fprintf(stderr, " x%-2d %016llx", k, (unsigned long long)c->x[k]);
+                fprintf(stderr, "\n");
+            }
         }
     }
     rt_fatal_trace();
