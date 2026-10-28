@@ -2486,7 +2486,8 @@ static void pass_size(int *w, int *h) {
     *h = (int)lroundf(*h * pass_sy);
 }
 
-static VkRect2D scissor_rect(void) {
+// pane_off: the draw is a HUD pane wholly off a 16:9 screen (hud_clip, its own draw's only: a clear never is one)
+static VkRect2D scissor_rect(bool pane_off) {
     int w, h;
     pass_size(&w, &h);
     if (!w) return (VkRect2D){{0, 0}, {pass_w, pass_h}};
@@ -2512,7 +2513,7 @@ static VkRect2D scissor_rect(void) {
         if (y1 > 1e9) y1 = 1e9;
         x = (int)x0; y = (int)y0; sw = (int)(x1 - x0); sh = (int)(y1 - y0);
     }
-    if (hud_clip && pass_out) sw = sh = 0;  // (a pane wholly off a 16:9 screen: see hud_patch)
+    if (pane_off && pass_out) sw = sh = 0;  // (a pane wholly off a 16:9 screen: see hud_patch)
     if (x < 0) { sw += x; x = 0; }
     if (y < 0) { sh += y; y = 0; }
     if (w > (int)pass_w) w = (int)pass_w;
@@ -2525,8 +2526,8 @@ static VkRect2D scissor_rect(void) {
     return (VkRect2D){{x, y}, {(uint32_t)sw, (uint32_t)sh}};
 }
 
-static void apply_scissor(void) {
-    VkRect2D r = scissor_rect();
+static void apply_scissor(void) {  // (a draw's)
+    VkRect2D r = scissor_rect(hud_clip);
     dyn_check();
     if (!memcmp(&dc.sc, &r, sizeof r)) return;
     vkCmdSetScissor(vk_cmd(), 0, 1, &r);
@@ -2646,7 +2647,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     if (index >= 0) gb_wr |= (uint16_t)(1u << index);
     if (depth || stencil) gb_wr |= 0x100;
-    VkRect2D rect = scissor_rect();
+    VkRect2D rect = scissor_rect(false);
+    if (hud_clip && pass_out) {  // (the last draw this thread built was an off-screen pane: once, its scissor dropped this)
+        static int told;
+        if (!told++)
+            LOG("[hud] a clear of the final image after an off-screen pane's draw (%ux%u): cleared (its scissor is the "
+                "draw's only)\n", rect.extent.width, rect.extent.height);
+    }
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
@@ -4065,10 +4072,26 @@ static void debug_save_depth(TexBackend *b, const char *path) {
 // the copies with the feedback loop pixel for pixel.
 static NvnTexture *fbrun_tex[4];
 static int nfbrun;
+// SAVAGEWIND_VK_DUMP_SIZE=<w>x<h>@<frame> (frame as SAVAGEWIND_SHOT_AT counts): the same for every color target of that
+// size drawn into in that frame (its first presented frame)
+static int dump_w, dump_h = -1;
+static long dump_at;
+static uint64_t dump_present;
+extern _Atomic uint64_t g_script_frame;
+static bool dump_size_on(void) {
+    if (dump_h < 0) {
+        dump_h = 0;
+        const char *e = getenv("SAVAGEWIND_VK_DUMP_SIZE");
+        if (e && sscanf(e, "%dx%d@%ld", &dump_w, &dump_h, &dump_at) != 3) dump_h = 0;
+    }
+    if (!dump_h || atomic_load_explicit(&g_script_frame, memory_order_relaxed) != (uint64_t)dump_at) return false;
+    if (!dump_present) dump_present = renderer_present_count();
+    return renderer_present_count() == dump_present;
+}
 static bool fbdump_on(void) {
     static long at = -2;
     if (at == -2) at = getenv("SAVAGEWIND_FEEDBACK_DUMP") ? atol(getenv("SAVAGEWIND_FEEDBACK_DUMP")) : -1;
-    return at >= 0 && renderer_present_count() == (uint64_t)at;
+    return (at >= 0 && renderer_present_count() == (uint64_t)at) || dump_size_on();
 }
 static void fbdump_note(NvnTexture *t) {
     if (!fbdump_on()) return;
@@ -5070,7 +5093,7 @@ static __thread uint32_t t_direct_ubo_mask[2];
 typedef struct {
     uint8_t *bytes;
     uint32_t capacity, mask[2], offset[2][17], size[2][17];
-    uint64_t frame;
+    uint64_t frame, addr[2][17];  // (addr: when known, the range the draw binds)
 } UniformCopyAudit;
 static UniformCopyAudit *uniform_audits;
 static uint32_t uniform_audit_stride = 1021;
@@ -5080,7 +5103,12 @@ static _Atomic uint64_t uniform_audit_checks;
 static void uniform_copy_check(int stage, int k, uint64_t addr, VkSpan span, uint64_t size) {
     const UniformCopyAudit *a = t_uniform_audit;
     if (!a || stage < 0 || stage > 1 || k < 3 || k >= 17 || !(a->mask[stage] & (1u << k))) return;
-    if (size != a->size[stage][k]) FATAL("uniform audit size changed for stage %d c%d", stage, k);
+    if (size != a->size[stage][k] || (a->addr[stage][k] && addr != a->addr[stage][k])) {
+        AUDIT_FAIL("uniform audit range changed frame %llu stage %d c%d: expected %llx +%u, got %llx +%llu",
+                   (unsigned long long)a->frame, stage, k, (unsigned long long)a->addr[stage][k], a->size[stage][k],
+                   (unsigned long long)addr, (unsigned long long)size);
+        return;
+    }
     const uint8_t *want = a->bytes + a->offset[stage][k], *got = span.ptr;
     if (memcmp(want, got, size)) {
         uint64_t first = 0;
@@ -5322,6 +5350,25 @@ static uint64_t par_probe_fs(void) {
     return fs;
 }
 static __thread bool t_probe;
+// (the probe's draw: its indices and vertex streams as the guest memory holds them now - planned on the render thread
+// in list order, recorded on a worker later)
+static void probe_geom(const char *who, const CmdRec *r, bool indexed) {
+    char b[1024];
+    int o = 0;
+    if (indexed && r->x[1]) {
+        uint64_t isz = r->x[1] == 1 ? 2 : 4, n = r->x[2] * isz;
+        o += snprintf(b + o, sizeof b - o, " index %llx+%llu %016llx", (unsigned long long)r->x[3], (unsigned long long)n,
+                      (unsigned long long)vk_hash_bytes((const void *)(uintptr_t)r->x[3], n));
+    }
+    for (int s = 0; s < 16 && o < (int)sizeof b - 64; s++) {
+        Range v = st.vbuf[s];
+        if (!v.addr || !v.size) continue;
+        uint64_t n = v.size < 65536 ? v.size : 65536;
+        o += snprintf(b + o, sizeof b - o, " v%d %llx+%llu %016llx", s, (unsigned long long)v.addr, (unsigned long long)v.size,
+                      (unsigned long long)vk_hash_bytes((const void *)(uintptr_t)v.addr, n));
+    }
+    LOG("[probe] %s frame %llu geom%s\n", who, (unsigned long long)renderer_present_count(), b);
+}
 static VkDescriptorBufferInfo cbuf_info_(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz);
 static bool cm_bind(uint64_t lo, uint64_t size, VkDescriptorBufferInfo *out);  // (constants from the heap's copy)
 // (the probe's constant buffers: what was bound, by the hash of its bytes; and stage 0 c3's words, bound and in memory)
@@ -8406,6 +8453,9 @@ static void draw_job_uniform_snapshot(DrawJob *j) {
     // every draw here severely stalls the worker. A prime stride also avoids
     // repeatedly selecting the same slot in the 512-job ring. Stride1 is exhaustive.
     if (atomic_load_explicit(&dj_put, memory_order_relaxed) % uniform_audit_stride) return;
+    static long from = -1;  // SAVAGEWIND_VK_UBO_AUDIT_FROM=<frame, as SAVAGEWIND_SHOT_AT counts>: only from then on
+    if (from < 0) from = getenv("SAVAGEWIND_VK_UBO_AUDIT_FROM") ? atol(getenv("SAVAGEWIND_VK_UBO_AUDIT_FROM")) : 0;
+    if (atomic_load_explicit(&g_script_frame, memory_order_relaxed) < (uint64_t)from) return;
     a->frame = renderer_present_count();
     uint32_t used = 0;
     for (int stage = 0; stage < 2; stage++) {
@@ -9061,6 +9111,9 @@ static bool draw_front(CmdRec *r, bool indexed, DrawFront *f) {
     }
     t_vel_prev = vmoved ? mvo_prev_ubo : NULL;  // (the sets built on this thread; a job carries its own: draw_job_run)
     if (st.rt.depth && !depth_read_only()) pass_ds_written = true, gb_wr |= 0x100;
+    if (st.rt.ncolor && st.rt.color[0] && (int)st.rt.color[0]->width == dump_w && (int)st.rt.color[0]->height == dump_h &&
+        dump_size_on())
+        fbdump_note(st.rt.color[0]);  // (SAVAGEWIND_VK_DUMP_SIZE)
     for (int i = 0; i < st.rt.ncolor && i < 8; i++)
         if (st.rt.color[i] && draw_writes_color(pr, i)) {
             pass_color_written |= (uint8_t)(1u << i);
@@ -9096,6 +9149,12 @@ static bool draw_back(CmdRec *r, bool indexed, DrawFront *f) {
     if (t_probe) LOG("[probe] %s frame %llu draw pr %p mode %u indexed %d count %llu pass %ux%u s %.3f %.3f out %d vel %d fb %d nfb %d\n",
                      t_xw >= 0 ? "worker" : "render", (unsigned long long)renderer_present_count(), (void *)pr, mode, indexed,
                      (unsigned long long)r->x[2], pass_w, pass_h, pass_sx, pass_sy, pass_out, vel.on, draw_feedback, nfeedback);
+    if (t_probe) probe_geom(t_xw >= 0 ? "worker" : "render", r, indexed);
+    // (debugging) SAVAGEWIND_VK_PAR_PROBE_RET=1: the probe's draws on the render thread stop here (the buffer taken,
+    // nothing recorded); =2: just before the draw call (everything bound)
+    static int probe_ret = -1;
+    if (probe_ret < 0) probe_ret = getenv("SAVAGEWIND_VK_PAR_PROBE_RET") ? atoi(getenv("SAVAGEWIND_VK_PAR_PROBE_RET")) : 0;
+    if (t_probe && t_xw < 0 && probe_ret == 1) return false;
 
     uint64_t prof_tk_ = profd ? SDL_GetTicksNS() : 0;
     if (profd) prof_pre += prof_tk_ - prof_tp_;
@@ -9286,6 +9345,7 @@ have_pipe:
         }
     }
 
+    if (t_probe && t_xw < 0 && probe_ret == 3) return false;
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
@@ -9323,6 +9383,7 @@ have_pipe:
         vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
     }
     PROFD_ADD(prof_sets);
+    if (t_probe && t_xw < 0 && probe_ret == 6) return false;
     static __thread VkDescriptorImageInfo fii_data[64];  // (static: draw_'s frame stays under a page, no stack probe a draw)
     const VkDescriptorImageInfo *fii = material ? material->ii[1] : fii_data;
     uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
@@ -9418,7 +9479,7 @@ have_pipe:
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         set_viewport(vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf);
         if (g_debug_frame) {
-            VkRect2D sr = scissor_rect();
+            VkRect2D sr = scissor_rect(hud_clip);
             LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f | depth range %.7f %.7f\n",
                 vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
@@ -9428,9 +9489,10 @@ have_pipe:
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     if (t_probe) {
-        LOG("[probe] %s vp %g %g %g %g rs0 %g %g %g %g sc %d %d %u %u blend %d mask %08x\n", t_xw >= 0 ? "worker" : "render",
+        LOG("[probe] %s vp %g %g %g %g rs0 %g %g %g %g sc %d %d %u %u blend %d mask %08x line %g (state %g)\n",
+            t_xw >= 0 ? "worker" : "render",
             dc.vp.x, dc.vp.y, dc.vp.width, dc.vp.height, rs0[0], rs0[1], rs0[2], rs0[3], dc.sc.offset.x, dc.sc.offset.y,
-            dc.sc.extent.width, dc.sc.extent.height, st.color_state[0] & 1, st.channel_mask);
+            dc.sc.extent.width, dc.sc.extent.height, st.color_state[0] & 1, st.channel_mask, dc.line_w, st.line_width);
         for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
             NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
             LOG("[probe] %s ftex %d #%llu %ux%u view %p smp %p layout %d sc %g %g wh %u %u\n", t_xw >= 0 ? "worker" : "render", i,
@@ -9509,6 +9571,7 @@ have_pipe:
         if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
         goto sets_bound;
     }
+    if (t_probe && t_xw < 0 && probe_ret == 7) return false;
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
     // (this draw's only. aa_fix stayed set after the FXAA draw, and the next draw built here - its vertex set made before
     // the reset above - got its vertex constants divided by the scene's scale: the message window's capture of the
@@ -9531,6 +9594,7 @@ have_pipe:
         memcpy(dc.dyn, dyn, (size_t)ndyn * 4);
     }
 sets_bound:;
+    if (t_probe && t_xw < 0 && probe_ret == 4) return false;
 
     uint64_t prof_t2_ = profd ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
@@ -9595,6 +9659,7 @@ sets_bound:;
         dc.ibuf = ib.buf; dc.ioff = ib.off; dc.itype = itype_vk;
     }
 
+    if (t_probe && t_xw < 0 && probe_ret == 5) return false;
     // ---- vertex streams: the range this draw can read, copied once per submission
     for (int s = 0; s < 17; s++) {
         if (!(pipe_memo.k.s.used_streams & (1u << s))) continue;
@@ -9606,6 +9671,9 @@ sets_bound:;
             VkBuffer dbuf;
             VkDeviceSize doff;
             if (v.addr && v.size && guest_fetch(v.addr, v.size, &dbuf, &doff)) {
+                if (t_probe)
+                    LOG("[probe] %s stream %d %llx+%llu %s\n", t_xw >= 0 ? "worker" : "render", s, (unsigned long long)v.addr,
+                        (unsigned long long)v.size, dbuf == vram_buf ? "list-start copy" : "heap in place");
                 static int vgchk = -1;  // (debugging) SAVAGEWIND_VK_VG_CHECK=1: draws whose fetches reach past their stream's range
                 if (vgchk < 0) vgchk = getenv("SAVAGEWIND_VK_VG_CHECK") != NULL;
                 uint32_t dv = pipe_memo.k.s.divisor[s];
@@ -9645,6 +9713,10 @@ sets_bound:;
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) sp = zero_span(0);
             else sp = guest_copy(v.addr, need ? need : 16);
+            if (t_probe)
+                LOG("[probe] %s stream %d %llx+%llu copied %llu bytes %016llx\n", t_xw >= 0 ? "worker" : "render", s,
+                    (unsigned long long)v.addr, (unsigned long long)v.size, (unsigned long long)(need ? need : 16),
+                    (unsigned long long)(sp.ptr ? vk_hash_bytes(sp.ptr, need ? need : 16) : 0));
         }
         VkDeviceSize off = sp.off;
         if (dc.vbuf[s] != sp.buf || dc.voff[s] != off) {
@@ -9658,6 +9730,7 @@ sets_bound:;
 
     if (draw_batch_probe_on > 0) draw_batch_probe(pr, pp, cb, use_index, base_vertex, job, fii);
     if (profd) prof_vtx += SDL_GetTicksNS() - prof_t2_;
+    if (t_probe && t_xw < 0 && probe_ret == 2) return false;
     // ---- draw (inside an occlusion query while SAMPLES_PASSED counts)
     int oq = -1;
     if (t_xw < 0 && oq_counting && oq_nrun < OQ_RUN && oq_on()) {  // (the render thread's: it keeps such draws, par_draw_ok)
@@ -9792,6 +9865,7 @@ typedef struct {  // what a worker's draw takes from its front half
     bool fb_any[4];
     NvnTexture *fb_tex[4];
     VkImageView fb_view[4];
+    UniformCopyAudit *ua;  // (SAVAGEWIND_VK_PAR_UBO_AUDIT) the draw's constants as at its place in the list
 } ParPlan;
 typedef struct {
     _Atomic int state;  // 0 free, 1 queued, 2 recorded
@@ -10001,16 +10075,25 @@ static void prim_cut(ParChunk *c) {
 }
 
 static uint64_t stat_par_close[PAR_NCLOSE];
+static long par_log_at = -2, par_log_last;  // (SAVAGEWIND_VK_PAR_LOG)
+_Atomic uint64_t g_script_frame;  // (device.c: the frame SAVAGEWIND_INPUT and SAVAGEWIND_SHOT_AT count)
+static int par_log_draws = -1;
 static void par_close_(int why) {
     ParChunk *c = par_cur;
     if (!c) return;
-    {   // (debugging) SAVAGEWIND_VK_PAR_LOG=<presented frame>: that frame's chunks - target, draws, first fragment shader
-        static long at = -2;
-        if (at == -2) at = getenv("SAVAGEWIND_VK_PAR_LOG") ? atol(getenv("SAVAGEWIND_VK_PAR_LOG")) : -1;
-        if (at >= 0 && renderer_present_count() == (uint64_t)at) {
+    {   // (debugging) SAVAGEWIND_VK_PAR_LOG=<frame>[-<last>] (as SAVAGEWIND_SHOT_AT counts): those frames' chunks - target, draws, first
+        // fragment shader
+        if (par_log_at == -2) {
+            const char *e = getenv("SAVAGEWIND_VK_PAR_LOG");
+            char *end = NULL;
+            par_log_at = e ? strtol(e, &end, 10) : -1;
+            par_log_last = end && *end == '-' ? atol(end + 1) : par_log_at;
+        }
+        uint64_t frame = atomic_load_explicit(&g_script_frame, memory_order_relaxed);
+        if (par_log_at >= 0 && frame >= (uint64_t)par_log_at && frame <= (uint64_t)par_log_last) {
             NvnTexture *t0 = c->xs.rt.ncolor && c->xs.rt.color[0] ? c->xs.rt.color[0] : c->xs.rt.depth;
-            LOG("[par-chunk] %d draws why %d target #%llu %ux%u fmt %#x group %u ncolor %u depth %d fs %016llx blend %d\n",
-                c->ndraws, why, (unsigned long long)(t0 ? t0->debug_id : 0), t0 ? t0->width : 0, t0 ? t0->height : 0,
+            LOG("[par-chunk] frame %llu %d draws why %d target #%llu %ux%u fmt %#x group %u ncolor %u depth %d fs %016llx blend %d\n",
+                (unsigned long long)frame, c->ndraws, why, (unsigned long long)(t0 ? t0->debug_id : 0), t0 ? t0->width : 0, t0 ? t0->height : 0,
                 t0 ? t0->format : 0, t0 ? vk_texture_scale_group(t0) : 0, c->ncolor, c->depth != VK_FORMAT_UNDEFINED,
                 (unsigned long long)(c->nplans ? c->plans[0].fs_hash : 0), c->xs.color_state[0] & 1);
         }
@@ -10074,13 +10157,29 @@ static bool par_draw_ok(DrawFront *f) {
     {   // (debugging) SAVAGEWIND_VK_PAR_KEEP=<mask>: draws kept on the render thread - 1 all (the parallel list's own
         // machinery only), 2 blended ones, 4 those not into the scene's or shadows' targets, 8 quads / fans / polygons
         static int keep = -1;
-        if (keep < 0) keep = getenv("SAVAGEWIND_VK_PAR_KEEP") ? atoi(getenv("SAVAGEWIND_VK_PAR_KEEP")) : 0;
+        static long keep_from, keep_to = -1;  // SAVAGEWIND_VK_PAR_KEEP_FRAMES=<first>-<last> (as SHOT_AT counts): only then
+        if (keep < 0) {
+            keep = getenv("SAVAGEWIND_VK_PAR_KEEP") ? atoi(getenv("SAVAGEWIND_VK_PAR_KEEP")) : 0;
+            const char *e = getenv("SAVAGEWIND_VK_PAR_KEEP_FRAMES");
+            if (e) {
+                char *end;
+                keep_from = strtol(e, &end, 10);
+                keep_to = *end == '-' ? atol(end + 1) : keep_from;
+            }
+        }
+        uint64_t kf = atomic_load_explicit(&g_script_frame, memory_order_relaxed);
+        bool keep_now = keep_to < 0 || (kf >= (uint64_t)keep_from && kf <= (uint64_t)keep_to);
         NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
         uint8_t g = t0 ? vk_texture_scale_group(t0) : RS_NONE;
-        if (keep && ((keep & 1) || ((keep & 2) && (st.color_state[0] & 1)) || ((keep & 4) && g != RS_SCENE && g != RS_SHADOW) ||
-                     ((keep & 8) && !f->native)))
+        if (keep && keep_now && ((keep & 1) || ((keep & 2) && (st.color_state[0] & 1)) || ((keep & 4) && g != RS_SCENE && g != RS_SHADOW) ||
+                     ((keep & 8) && !f->native))) {
+            if (par_log_draws > 0 && par_log_at >= 0 && kf >= (uint64_t)par_log_at && kf <= (uint64_t)par_log_last)
+                LOG("[par-keep] frame %llu target #%llu group %u fs %016llx blend %d\n", (unsigned long long)kf,
+                    (unsigned long long)(t0 ? t0->debug_id : 0), g, (unsigned long long)g_cur_fs_hash, st.color_state[0] & 1);
             return false;
-        // SAVAGEWIND_VK_PAR_KEEP_FS=<hash>,...: draws with these fragment shaders (hashes as in [par-chunk])
+        }
+        // SAVAGEWIND_VK_PAR_KEEP_FS=<hash>,...: draws with these fragment shaders (hashes as in [par-chunk]); with
+        // SAVAGEWIND_VK_PAR_KEEP=16 only their blended ones
         static uint64_t keep_fs[32];
         static int nkeep_fs = -1;
         if (nkeep_fs < 0) {
@@ -10091,7 +10190,8 @@ static bool par_draw_ok(DrawFront *f) {
                 e = *end == ',' ? end + 1 : NULL;
             }
         }
-        for (int i = 0; i < nkeep_fs; i++) if (g_cur_fs_hash == keep_fs[i]) return false;
+        if (keep_now && (!(keep & 16) || (st.color_state[0] & 1)))
+            for (int i = 0; i < nkeep_fs; i++) if (g_cur_fs_hash == keep_fs[i]) return false;
     }
     if (pr->vi->writes_gmem || pr->fi->writes_gmem || pr->vi->ntex > 64 || pr->fi->ntex > 64) return false;
     if (oq_counting && oq_nrun < OQ_RUN && oq_on()) return false;
@@ -10108,6 +10208,50 @@ static bool par_draw_ok(DrawFront *f) {
     return true;
 }
 
+// (diagnostics) SAVAGEWIND_VK_PAR_UBO_AUDIT=1: a worker's draw into an unscaled target (RS_NONE) gets its vertex and
+// fragment constant buffers as they are at the draw's place in the list (taken here, on the render thread), and the
+// worker compares the range and bytes it binds with them (uniform_copy_check; with SAVAGEWIND_PROBE=1 mismatches are
+// logged, else fatal); =2: every worker draw
+static int par_ua_on = -1;
+static UniformCopyAudit par_ua_ring[32768];
+static uint32_t par_ua_next;
+static UniformCopyAudit *par_ua_snapshot(const Prog *pr) {
+    if (par_ua_on < 0) {
+        par_ua_on = getenv("SAVAGEWIND_VK_PAR_UBO_AUDIT") ? atoi(getenv("SAVAGEWIND_VK_PAR_UBO_AUDIT")) : 0;
+        if (par_ua_on) LOG("[ubo-audit] parallel translation: worker draws' constants checked against the render thread's (%s)\n",
+                           par_ua_on == 2 ? "every draw" : "draws into unscaled targets");
+    }
+    if (!par_ua_on) return NULL;
+    NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
+    if (par_ua_on == 1 && (!t0 || vk_texture_scale_group(t0) != RS_NONE)) return NULL;
+    UniformCopyAudit *a = &par_ua_ring[par_ua_next++ % 32768];
+    a->mask[0] = a->mask[1] = 0;
+    a->frame = renderer_present_count();
+    uint32_t used = 0;
+    for (int stage = 0; stage < 2; stage++) {
+        const ShaderInfo *si = stage ? pr->fi : pr->vi;
+        for (uint32_t mask = pr->host_ubo_mask[stage]; mask; mask &= mask - 1) {
+            int k = __builtin_ctz(mask);
+            Range rg = st.ubuf[stage][k - 3];
+            if (!rg.addr) continue;
+            uint32_t size = (uint32_t)bound_cbuf_size(si, k, rg);
+            a->mask[stage] |= 1u << k, a->offset[stage][k] = used, a->size[stage][k] = size, a->addr[stage][k] = rg.addr;
+            used += size;
+        }
+    }
+    if (used > a->capacity) {
+        uint8_t *bytes = realloc(a->bytes, used);
+        if (!bytes) FATAL("uniform audit allocation failed");
+        a->bytes = bytes, a->capacity = used;
+    }
+    for (int stage = 0; stage < 2; stage++)
+        for (uint32_t mask = a->mask[stage]; mask; mask &= mask - 1) {
+            int k = __builtin_ctz(mask);
+            memcpy(a->bytes + a->offset[stage][k], (const void *)(uintptr_t)a->addr[stage][k], a->size[stage][k]);
+        }
+    return a;
+}
+
 static void par_draw(CmdRec *r, bool indexed, DrawFront *f) {  // (draw_) a draw's rest into the chunk being planned
     ParChunk *c = par_cur ? par_cur : par_open();
     if (par_probe_fs() && g_cur_fs_hash == par_probe_fs()) {
@@ -10115,13 +10259,14 @@ static void par_draw(CmdRec *r, bool indexed, DrawFront *f) {  // (draw_) a draw
         LOG("[probe] plan frame %llu c3 addr %llx hash256 %016llx uubpos %u\n", (unsigned long long)renderer_present_count(),
             (unsigned long long)u.addr, (unsigned long long)(u.addr ? vk_hash_bytes((const void *)(uintptr_t)u.addr, 256) : 0),
             atomic_load(&uub_nlog));
+        probe_geom("plan", r, indexed);
     }
     PAR_GROW(c->plans, c->nplans, c->cplans, 1);
     ParPlan *p = &c->plans[c->nplans];
     *p = (ParPlan){.pr = f->pr, .fs_hash = g_cur_fs_hash, .uub_pos = atomic_load(&uub_nlog), .mode = f->mode, .vel_prev = -1,
                    .topo = f->topo, .cls = f->cls, .indexed = indexed, .wvel = f->wvel, .vmoved = f->vmoved,
                    .vkey_flip = f->vkey_flip, .native = f->native, .draw_feedback = draw_feedback, .nfeedback = (int8_t)nfeedback,
-                   .fb_barrier = fb_barrier};
+                   .fb_barrier = fb_barrier, .ua = par_ua_snapshot(f->pr)};
     fb_barrier = false;  // (the worker records it)
     for (int i = 0; i < nfeedback; i++)
         p->fb_tex[i] = feedback_tex[i], p->fb_view[i] = feedback_view[i], p->fb_any[i] = feedback_any_type[i];
@@ -10129,6 +10274,16 @@ static void par_draw(CmdRec *r, bool indexed, DrawFront *f) {  // (draw_) a draw
         PAR_GROW(c->vel_prev, c->nvel, c->cvel, 1);
         memcpy(c->vel_prev[c->nvel], mvo_prev_ubo, sizeof c->vel_prev[0]);
         p->vel_prev = c->nvel++;
+    }
+    if (par_log_draws < 0) par_log_draws = getenv("SAVAGEWIND_VK_PAR_LOG_DRAWS") != NULL;
+    if (par_log_draws) {  // (debugging) SAVAGEWIND_VK_PAR_LOG_DRAWS=1 with SAVAGEWIND_VK_PAR_LOG: every draw of those chunks
+        NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
+        uint64_t frame = atomic_load_explicit(&g_script_frame, memory_order_relaxed);
+        if (par_log_at >= 0 && frame >= (uint64_t)par_log_at && frame <= (uint64_t)par_log_last)
+            LOG("[par-draw] frame %llu chunk %p #%d target #%llu fs %016llx prog %p blend %d indexed %d topo %d feedback %d/%d/%d\n",
+                (unsigned long long)frame, (void *)c, c->ndraws, (unsigned long long)(t0 ? t0->debug_id : 0),
+                (unsigned long long)g_cur_fs_hash, (void *)f->pr,
+                st.color_state[0] & 1, indexed, (int)f->topo, (int)draw_feedback, nfeedback, (int)p->fb_barrier);
     }
     par_item(c, r, c->nplans++);
     stat_par_draws++;
@@ -10172,7 +10327,9 @@ static void par_run(ParChunk *c, VkCommandBuffer cb) {
         t_uub_pos = p->uub_pos;
         DrawFront f = {.pr = p->pr, .wvel = p->wvel, .vmoved = p->vmoved, .vkey_flip = p->vkey_flip, .native = p->native,
                        .topo = p->topo, .cls = p->cls, .mode = p->mode};
+        t_uniform_audit = p->ua;
         if (!draw_back(r, p->indexed, &f)) ppc_add(PPC_BACK_FAIL, 1);
+        t_uniform_audit = NULL;
     }
     t_vel_prev = NULL, nfeedback = 0;
     if (c->prim) vkCmdEndRendering(cb);

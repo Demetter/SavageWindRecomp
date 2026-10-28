@@ -1438,6 +1438,8 @@ survey_account:;
     extern void input_frame(uint64_t frame);
     extern uint64_t framepace_script_frame(uint64_t presented);
     uint64_t script_frame = framepace_script_frame(total_frames);  // (SAVAGEWIND_SCRIPT_CLOCK: 30ths of a second)
+    extern _Atomic uint64_t g_script_frame;
+    atomic_store_explicit(&g_script_frame, script_frame, memory_order_relaxed);  // (debug switches counting as scripts do)
     input_frame(script_frame);
     static long slow_ms = -1;
     if (slow_ms < 0) slow_ms = getenv("SAVAGEWIND_SLOW_FRAME_MS") ? atol(getenv("SAVAGEWIND_SLOW_FRAME_MS")) : 0;
