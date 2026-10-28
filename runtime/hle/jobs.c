@@ -159,6 +159,40 @@ static void jobtime_note(uint64_t g, uint32_t idx, uint64_t ns, uint64_t ticks, 
             }
         }
     }
+    extern uint64_t g_game_frames;
+    if (vt == 0x7001d105c8ull && ns > 80000 && g_game_frames > 3000) {  // (1.9.0: a gsys model-queue job, f_7000f92cb0,
+        static int told;                                               // that took long: what it ran; steady state)
+        uint64_t o = LD64(job + 0x18);
+        uint32_t mode = LD32(job + 0x20), stripe = LD32(job + 0x24), a = LD32(job + 0x28), b = LD32(job + 0x2c);
+        bool ok = o >= GUEST_LO && o < GUEST_HI;
+        // (mode 0: model entries [o+0xe8][a..b) of [o+0xe0], each its units [e+0x38]; mode 1: the queue [o+0x110][a..b)
+        // of [o+0x108], each a chain of nodes linked at +0x10, run in order by f_7001051914)
+        uint64_t arr = ok ? LD64(o + (mode ? 0x110 : 0xe8)) : 0;
+        uint32_t cnt = ok ? LD32(o + (mode ? 0x108 : 0xe0)) : 0;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 40) {
+            char buf[640]; int k = 0;
+            for (uint32_t i = a; arr && i < b && i < cnt && k < 560; i++) {
+                if (stripe != UINT32_MAX && i % 3 != stripe) continue;
+                uint64_t e = LD64(arr + 8ull * i);
+                uint32_t len = 0;
+                if (mode) for (uint64_t n = e; n >= GUEST_LO && n < GUEST_HI && len < 100000; n = LD64(n + 0x10)) len++;
+                else len = e >= GUEST_LO && e < GUEST_HI ? LD32(e + 0x38) : 0;
+                uint64_t ob = e >= GUEST_LO && e < GUEST_HI ? LD64(e) : 0;  // (the node's object and its class)
+                k += snprintf(buf + k, sizeof buf - k, " [%u] %llx:%u obj %llx vt %llx", i, (unsigned long long)e, len,
+                              (unsigned long long)ob, ob >= GUEST_LO && ob < GUEST_HI ? (unsigned long long)LD64(ob) : 0ull);
+            }
+            uint32_t tot = 0, longest = 0;  // (mode 1: every chain of the queue, for the balance)
+            for (uint32_t i = 0; mode && arr && i < cnt && i < 4096; i++) {
+                uint32_t len = 0;
+                for (uint64_t n = LD64(arr + 8ull * i); n >= GUEST_LO && n < GUEST_HI && len < 100000; n = LD64(n + 0x10)) len++;
+                tot += len;
+                if (len > longest) longest = len;
+            }
+            LOG("[jobs-time] model-queue job %llx: %.0f us, obj %llx mode %u stripe %d range %u..%u of %u (nodes %u, longest "
+                "chain %u):%s\n", (unsigned long long)job, ns / 1e3, (unsigned long long)o, mode, (int)stripe, a, b, cnt,
+                tot, longest, buf);
+        }
+    }
     uint64_t h = (vt * 0x9E3779B97F4A7C15ull) ^ (w18 * 0xC2B2AE3D27D4EB4Full) ^ w20;
     pthread_mutex_lock(&g_jt_m);
     for (uint32_t s = (uint32_t)(h >> 50) & (JT_N - 1), k = 0; k < JT_N; k++, s = (s + 1) & (JT_N - 1)) {
@@ -340,7 +374,8 @@ static void wait_change(const uint32_t *w, uint32_t v, bool core_held) {
     if (core_held) kernel_host_work_end();
 }
 
-static void help(Cpu *c);  // (fork-join, below)
+static void help(Cpu *c, Pool *p);  // (fork-join, below)
+static __thread Pool *t_run_pool;  // the pool whose group this thread runs now (a fork's helpers come from it)
 
 // A worker with no game work: the frame's translation chunks while there are any (one job system for the game's
 // jobs and the renderer's, SAVAGEWIND_VK_PAR_HELP), else asleep on the pool's word until the next round or a poke.
@@ -373,6 +408,8 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
                       bool core_held) {
     ST64(w + W_GROUP, g);
     ST64(w + W_OWNER, LD64(g + G_OWNER));
+    Pool *run_pool0 = t_run_pool;
+    t_run_pool = p;
     uint32_t grab = LD32(g + G_GRAB + 4 * (i < 3 ? i : 0));  // (the game's own read past three: entry 0; all 8 as made)
     bool rtr = g_rev && round_traced();
     uint64_t t0 = g_stats || g_tr_mask || rtr ? plat_now_ns() : 0;
@@ -386,6 +423,7 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     uint64_t sp = c->sp;
     c->sp -= 0x10;
     for (;;) {
+        help(c, p);  // (work a job forked comes before this group's next job: rt_jobs_fork_owner; first: it uses x0-x30)
         c->x[0] = g, c->x[1] = grab, c->x[2] = c->sp, c->x[3] = w;
         uint32_t jt_idx = g_jt ? LD32(g + G_NEXT) : 0;  // (SAVAGEWIND_JOBS_JOBTIME: the job this call claims, as a rule)
         if (g_jt) t_nvn_tag = jobtime_is_draw(g, jt_idx);
@@ -435,7 +473,7 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
         uint64_t b0 = g_stats ? plat_now_ns() : 0;
         for (uint32_t v = __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE);
              !(call1(c, vfn(g, V_IS_DONE), g) & 1) && !g_rt_unwind; v = __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE)) {
-            help(c);
+            help(c, p);
             if (v == __atomic_load_n(P32(g + G_DONE), __ATOMIC_ACQUIRE)) wait_change(P32(g + G_DONE), v, core_held);
         }
         if (g_stats) SADD(g_st_barrier, plat_now_ns() - b0);
@@ -457,6 +495,7 @@ static void run_group(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t
     }
     ST32(w + W_STATE, 10);
     ST32(w + W_STATE, 2);
+    t_run_pool = run_pool0;
 }
 
 // ---- fork-join: work the runtime hands to the job threads while a job waits for it (rt_jobs_fork_join)
@@ -473,6 +512,7 @@ typedef struct {
     void (*fn)(Cpu *c, void *arg, uint32_t i);
     void *arg;
     int used;                  // reserved by an owner
+    Pool *pool;                // (rt_jobs_fork_owner) only threads of this pool help: distinct sead core ids
 } __attribute__((aligned(64))) TaskSet;
 #define MAX_TASKSETS 16
 static TaskSet g_ts[MAX_TASKSETS];
@@ -484,11 +524,12 @@ static void ts_run(Cpu *c, TaskSet *t) {  // (counted in) claims and runs t's ta
         if (__atomic_fetch_add(&t->done, 1, __ATOMIC_SEQ_CST) + 1 == t->n) plat_wake_u32_all(&t->done);
     }
 }
-static void help(Cpu *c) {  // an idle job thread: any published tasks
+static void help(Cpu *c, Pool *p) {  // a job thread of pool p between jobs or waiting: any published tasks
     if (!__atomic_load_n(&g_ts_live, __ATOMIC_ACQUIRE)) return;
     for (int k = 0; k < MAX_TASKSETS; k++) {
         TaskSet *t = &g_ts[k];
         if (!__atomic_load_n(&t->active, __ATOMIC_ACQUIRE)) continue;
+        if (t->pool && t->pool != p) continue;
         __atomic_fetch_add(&t->helpers, 1, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(&t->active, __ATOMIC_SEQ_CST) && __atomic_load_n(&t->next, __ATOMIC_SEQ_CST) < t->n) ts_run(c, t);
         __atomic_fetch_sub(&t->helpers, 1, __ATOMIC_SEQ_CST);
@@ -511,7 +552,7 @@ int rt_jobs_fork_join(Cpu *c, void (*fn)(Cpu *, void *, uint32_t), void *arg, ui
         if (__atomic_compare_exchange_n(&g_ts[k].used, &z, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) t = &g_ts[k];
     }
     if (!t) return 0;
-    t->fn = fn, t->arg = arg, t->n = n;
+    t->fn = fn, t->arg = arg, t->n = n, t->pool = NULL;
     __atomic_store_n(&t->next, 0, __ATOMIC_SEQ_CST), __atomic_store_n(&t->done, 0, __ATOMIC_SEQ_CST);
     __atomic_fetch_add(&g_ts_live, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&t->active, 1, __ATOMIC_RELEASE);
@@ -523,6 +564,34 @@ int rt_jobs_fork_join(Cpu *c, void (*fn)(Cpu *, void *, uint32_t), void *arg, ui
     __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST);
     __atomic_fetch_sub(&g_ts_live, 1, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&t->helpers, __ATOMIC_SEQ_CST)) PAUSE();  // (a helper between its check and its count: out at once)
+    __atomic_store_n(&t->used, 0, __ATOMIC_RELEASE);
+    return 1;
+}
+
+// Like rt_jobs_fork_join, but the forking thread does its own share first (own(c, arg)) while the threads of its pool
+// take tasks fn(c, arg, i); then it runs the tasks nobody took and waits for those in flight. Helpers come only from
+// the forking thread's pool (a pool's threads have distinct sead core ids, which per-core state needs). 0: no slot
+// free (the caller does it all).
+int rt_jobs_fork_owner(Cpu *c, void (*fn)(Cpu *, void *, uint32_t), void *arg, uint32_t n, void (*own)(Cpu *, void *)) {
+    TaskSet *t = NULL;
+    for (int k = 0; k < MAX_TASKSETS && !t; k++) {
+        int z = 0;
+        if (__atomic_compare_exchange_n(&g_ts[k].used, &z, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) t = &g_ts[k];
+    }
+    if (!t) return 0;
+    t->fn = fn, t->arg = arg, t->n = n, t->pool = t_run_pool;
+    __atomic_store_n(&t->next, 0, __ATOMIC_SEQ_CST), __atomic_store_n(&t->done, 0, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&g_ts_live, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&t->active, 1, __ATOMIC_RELEASE);
+    wake_helpers();
+    own(c, arg);
+    __atomic_fetch_add(&t->helpers, 1, __ATOMIC_SEQ_CST);
+    ts_run(c, t);
+    __atomic_fetch_sub(&t->helpers, 1, __ATOMIC_SEQ_CST);
+    for (uint32_t d; (d = __atomic_load_n(&t->done, __ATOMIC_ACQUIRE)) < n && !g_rt_unwind;) wait_change(&t->done, d, false);
+    __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST);
+    __atomic_fetch_sub(&g_ts_live, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&t->helpers, __ATOMIC_SEQ_CST)) PAUSE();
     __atomic_store_n(&t->used, 0, __ATOMIC_RELEASE);
     return 1;
 }
@@ -568,7 +637,7 @@ static void worker_loop(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32
         }
         uint32_t s = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
         if (s != gen_seen) gen_seen = s, fan_out(p, s);  // (new work: the workers still asleep up too)
-        help(c);  // (tasks a job forked: rt_jobs_fork_join)
+        help(c, p);  // (tasks a job forked: rt_jobs_fork_join, rt_jobs_fork_owner)
         if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) {
             __atomic_add_fetch(&p->busy, 1, __ATOMIC_SEQ_CST);
             if (__atomic_load_n(&p->open, __ATOMIC_SEQ_CST)) {  // (run-and-wait closes, then waits for busy = 0)
@@ -749,14 +818,39 @@ uint32_t rt_view_rec_cut(uint32_t stored) {
 enum { VRI_CONSUME, VRI_PART, VRI_CTX, VRI_CTX_FINI, VRI_ITEM_END, VRI_LOCK, VRI_UNLOCK, VRI_RECORD, VRI_BEGIN, VRI_END, VRI_REC };
 #define VRI_MIN 8
 uint64_t g_cmd_arena;  // (runtime/hle/percore.c rt_arena_setup) the command arena the parts are recorded from
-typedef struct { const uint64_t *fns; uint64_t list, pass, view, x4, dctx; uint32_t total, parts; } VriTask;
+typedef struct {
+    const uint64_t *fns;
+    uint64_t list, pass, view, x4, dctx;
+    uint32_t total, parts, mode;
+    Cpu *caller;
+    _Atomic uint64_t ends;     // the parts not taken: [head (low word), tail (high word)); the owner pops the head
+    _Atomic uint32_t stolen;   // parts helpers took (from the tail)
+} VriTask;
+static _Atomic uint64_t g_vri_stat[3];  // (statistics) parts recorded by the list's own thread, by helpers; lists run serially
+// The layer's render context a part's draws read through per-core state: the step mode (percore.009: the singleton
+// *0x7001e35ee0's per-core u32, set f_7000eedeb0 / get f_7000eedf18 on the calling thread's core) that f_7000ef0264 sets
+// on the layer's thread before each step's draw methods and ~17 draw functions read (f_7000eedf74: which of three
+// 0x1e0-byte slots). A part recorded on another core takes the layer's value for its duration, as a native engine
+// hands its recording threads the pass's context; the core's own value comes back after.
+#define VRI_STEP_MODE_OBJ 0x7001e35ee0ull
+#define VRI_STEP_MODE_SET 0x7000eedeb0ull
+#define VRI_STEP_MODE_GET 0x7000eedf18ull
 static __thread int t_vri;     // (in the consumer entered again: its search failing again records the game's way)
 static uint64_t g_vri_lists[16];
-static void vri_part(Cpu *c, void *arg, uint32_t i) {
+static void vri_part(Cpu *c, void *arg, uint32_t i) {  // (a helper) part i into a command buffer of its own
     VriTask *t = arg;
+    atomic_fetch_add(&g_vri_stat[1], 1);
     uint32_t per = t->total / t->parts, start = i * per, count = i + 1 == t->parts ? t->total - start : per;
     uint64_t sp = c->sp;
     c->sp = (sp - 0x200) & ~15ull;
+    uint64_t sm = LD64(VRI_STEP_MODE_OBJ), own = 0;
+    if (sm && t->mode != UINT32_MAX) {  // (the layer's step mode on this core while the part records)
+        c->x[0] = sm;
+        guest_call(c, VRI_STEP_MODE_GET);
+        own = (uint32_t)c->x[0];
+        c->x[0] = sm, c->x[1] = t->mode;
+        guest_call(c, VRI_STEP_MODE_SET);
+    }
     uint64_t ctx = c->sp, range = ctx + 0x1d0;
     ST32(range, start), ST32(range + 4, count);
     c->x[0] = ctx;
@@ -788,20 +882,63 @@ static void vri_part(Cpu *c, void *arg, uint32_t i) {
     guest_call(c, t->fns[VRI_ITEM_END]);
     c->x[0] = ctx;
     guest_call(c, t->fns[VRI_CTX_FINI]);
+    if (sm && t->mode != UINT32_MAX) c->x[0] = sm, c->x[1] = own, guest_call(c, VRI_STEP_MODE_SET);
     c->sp = sp;
 }
+// (the list's own thread) part i recorded where the game records the whole list: into the layer's open command
+// buffer, with the consumer's own arguments and the part's range
+static void vri_inline_part(Cpu *c, VriTask *t, uint32_t i) {
+    atomic_fetch_add(&g_vri_stat[0], 1);
+    uint32_t per = t->total / t->parts, start = i * per, count = i + 1 == t->parts ? t->total - start : per;
+    uint64_t sp = c->sp;
+    c->sp = (sp - 0x20) & ~15ull;
+    ST32(c->sp, start), ST32(c->sp + 4, count);
+    c->x[0] = t->list, c->x[1] = t->dctx, c->x[2] = t->pass, c->x[3] = t->view, c->x[4] = c->sp, c->x[5] = 0, c->x[6] = t->x4;
+    guest_call(c, t->fns[VRI_REC]);
+    c->sp = sp;
+}
+static void vri_own(Cpu *c, void *arg) {  // the head, in order, until nothing is left
+    VriTask *t = arg;
+    for (;;) {
+        uint64_t e = atomic_load(&t->ends);
+        uint32_t h = (uint32_t)e, tl = (uint32_t)(e >> 32);
+        if (h >= tl) return;
+        if (atomic_compare_exchange_weak(&t->ends, &e, e + 1)) vri_inline_part(c, t, h);
+    }
+}
+static void vri_steal(Cpu *c, void *arg, uint32_t slot) {  // (a helper) the tail, until nothing is left
+    (void)slot;
+    VriTask *t = arg;
+    if (c == t->caller) return;  // (its own thread never begins a second command buffer on its core's record)
+    for (;;) {
+        uint64_t e = atomic_load(&t->ends);
+        uint32_t h = (uint32_t)e, tl = (uint32_t)(e >> 32);
+        if (h >= tl) return;
+        if (atomic_compare_exchange_weak(&t->ends, &e, e - (1ull << 32))) vri_part(c, t, tl - 1), atomic_fetch_add(&t->stolen, 1);
+    }
+}
 int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
-    // (off unless SAVAGEWIND_VIEW_REC_INLINE=1: at Kakariko characters and foliage come out unlit - the material lists
-    // the lighting reads - with a new draw context, with the layer's context settings copied in as below too, and with
-    // the consumer's x6. Not the context then; open: what else the inline recording depends on - being recorded into the
-    // layer's own command buffer at that point. The views' part mode was worse: the pass defaults over the layer's
-    // per-tile state)
+    // (off unless SAVAGEWIND_VIEW_REC_INLINE=1; =2 in even game frames only, an A/B.) The list's own thread records parts
+    // from the front straight into its open command buffer, as the game records the whole list; job threads of its pool
+    // take parts from the back (between their own jobs: run_group's help), each into a command buffer of its own with
+    // the layer's step mode, and the consumer calls those after the front. With no helper the list is recorded as the
+    // game does it. The first version (every part in its own command buffer, the list's thread too) lost: parts
+    // came out unlit (the step mode, now handed over) and one frame dark (the list's thread began a second command
+    // buffer on its core's arena record while the layer's was open), helpers came late (only between groups), and the
+    // fixed cost of each part on the list's thread made the layer job longer (ev485, ev487). 28 Oct, Kakariko 720p
+    // in-run blocks: N=3 +1.2%, N=4/W=2 +0.1% (noise; helpers take ~15% of the parts there, the workers are busy);
+    // Plateau A/B pixel-clean, JOBS_CHECK clean. Kept off until a machine with idle cores shows a gain.
     static int enabled = -1;
-    if (enabled < 0) enabled = getenv("SAVAGEWIND_VIEW_REC_INLINE") && atoi(getenv("SAVAGEWIND_VIEW_REC_INLINE"));
+    if (enabled < 0) enabled = getenv("SAVAGEWIND_VIEW_REC_INLINE") ? atoi(getenv("SAVAGEWIND_VIEW_REC_INLINE")) : 0;
     if (!enabled) return 0;
+    extern uint64_t g_game_frames;
+    if (enabled == 2 && (g_game_frames & 1)) return 0;  // (=2: the game's inline recording in odd game frames, an A/B)
     uint64_t list = c->x[23], dctx = c->x[19], pass = c->x[22], view = c->x[21], x4 = c->x[20];
-    uint32_t total = LD32(list + 0x3c), parts = rt_view_rec_parts();
-    if (total / VRI_MIN < parts) parts = total / VRI_MIN;
+    static int min_draws = -1;  // (a part's draws at least: its fixed cost - draw state, command buffer - stays small)
+    if (min_draws < 0) min_draws = getenv("SAVAGEWIND_VRI_MIN") && atoi(getenv("SAVAGEWIND_VRI_MIN")) > 0 ? atoi(getenv("SAVAGEWIND_VRI_MIN")) : 24;
+    uint32_t total = LD32(list + 0x3c), parts = 2 * rt_view_rec_parts();
+    if (parts > 32) parts = 32;  // (a list record holds 32 command buffers)
+    if (total / (uint32_t)min_draws < parts) parts = total / (uint32_t)min_draws;
     if (t_vri || parts < 2 || !on() || !g_cmd_arena) return 0;
     {   // (SAVAGEWIND_PERFX=16384 with _AB: the game's inline recording in the "off" blocks, an A/B in one launch)
         extern uint32_t g_perfx_mask;
@@ -827,10 +964,21 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     for (int k = 0; k < 16; k++)  // (another thread took the same list in the meantime)
         if (k != slot && __atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) { __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST); return 0; }
     uint32_t n0 = LD32(list + 0x50);
-    VriTask t = {fns, list, pass, view, x4, dctx, total, parts};
-    if (!rt_jobs_fork_join(c, vri_part, &t, parts))
-        for (uint32_t i = 0; i < parts; i++) vri_part(c, &t, i);
-    t_vri = 1;
+    VriTask t = {fns, list, pass, view, x4, dctx, total, parts, UINT32_MAX, c, (uint64_t)parts << 32, 0};
+    if (LD64(VRI_STEP_MODE_OBJ) && !getenv("SAVAGEWIND_VRI_NO_CONTEXT")) {  // (the layer's step mode, for the parts)
+        c->x[0] = LD64(VRI_STEP_MODE_OBJ);
+        guest_call(c, VRI_STEP_MODE_GET);
+        t.mode = (uint32_t)c->x[0];
+    }
+    if (!rt_jobs_fork_owner(c, vri_steal, &t, parts, vri_own)) {
+        atomic_fetch_add(&g_vri_stat[2], 1);
+        vri_own(c, &t);
+    }
+    if (!atomic_load(&t.stolen)) {  // (all of it recorded in place, as the game does: no record to call)
+        __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST);
+        return 1;
+    }
+    t_vri = 1;  // (the consumer again: it finds the helpers' parts in the list's record and calls them after the prefix)
     c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
     guest_call(c, fns[VRI_CONSUME]);
     t_vri = 0;
@@ -844,6 +992,11 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 4)
         LOG("[jobs] view recording: list %llx (%u draws) recorded in %u parts on every core\n", (unsigned long long)list,
             total, parts);
+    static _Atomic uint64_t lists;
+    if ((atomic_fetch_add(&lists, 1) & 4095) == 4095)
+        LOG("[jobs] view recording: inline lists in parts %llu: parts by the list's thread %llu, by helpers %llu; lists "
+            "with no fork %llu\n", (unsigned long long)atomic_load(&lists), (unsigned long long)atomic_load(&g_vri_stat[0]),
+            (unsigned long long)atomic_load(&g_vri_stat[1]), (unsigned long long)atomic_load(&g_vri_stat[2]));
     return 1;
 }
 
@@ -854,9 +1007,11 @@ int rt_layer_step_dl(void) {
     return e && atoi(e);
 }
 
-// (research, off: SAVAGEWIND_LAYER_STEPS=1 with SAVAGEWIND_LAYER_STEP_DL=1) Not right yet: a step's draw methods use per-core
-// entries the layer's setup fills only for the core its job runs on (f_70010642a8: [sp+0x60] + core x 0xa00, the
-// pointer from f_7000ed6364 at +0x4f8 null on another core: a crash at Kakariko); the step display lists alone are fine.
+// (research, off: SAVAGEWIND_LAYER_STEPS=1 with SAVAGEWIND_LAYER_STEP_DL=1) Wrong by construction for steps at once
+// (28 Oct audit): a layer's steps share the views' temporary render buffers in order - step 4 allocates them
+// (f_70010642a8: the 0xa00 index is the resolution level, not a core), steps 5 / 7 read them, 7 and 9 release them -
+// so only the steps in order (mode 3, the step timer's) are right; the parallel work is inside step 4 (its inline
+// lists: rt_view_rec_inline). The step display lists alone are fine.
 // A layer's render steps with a display list each (f_7000ef4a5c, tools/patches.py _layer_steps; registers as at its
 // loop head: x22 the renderer, x24 the job's draw context, x23 the layer, w21 the flags, w20 a list per step, w25 the
 // steps, x19 the begin's first word, [sp + 0xc] the steps' first key). The steps to draw are found as the loop finds
@@ -1180,7 +1335,7 @@ int rt_jobs_run_wait(Cpu *c, const uint64_t *fns) {
                 break;
         }
         if ((j == n && k == n) || g_rt_unwind) break;
-        help(c);
+        help(c, p);
         if (k == __atomic_load_n(P32(pool + POOL_LIST_N), __ATOMIC_ACQUIRE) && e == __atomic_load_n(&p->evt, __ATOMIC_ACQUIRE))
             wait_change(&p->evt, e, true);
     }
