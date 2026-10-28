@@ -227,10 +227,14 @@ static bool in_pass;
 // not in secondary buffers. The shadow maps' passes: depth-only passes executed from secondary buffers took the GPU
 // 30-130% longer (NVIDIA; the 8192x8192 cascades, the same draws) and so did the passes sampling them afterwards: +0.27
 // ms a frame at Kakariko, +0.13 at the Plateau, where 1 to 3 secondaries per cascade made no difference (per-pass GPU
-// time, SAVAGEWIND_VK_PASS_GPU). And passes into unscaled targets (RS_NONE): recorded by the workers, the inventory's
-// model of Link came out as scattered shards (27 Oct; the same draws on the render thread are right).
-// SAVAGEWIND_VK_PAR_INLINE=<mask of scale groups, 1 << RS_*> (default PAR_INLINE_DEFAULT)
-#define PAR_INLINE_DEFAULT (1 << RS_SHADOW | 1 << RS_NONE)
+// time, SAVAGEWIND_VK_PASS_GPU). Passes into unscaled targets (RS_NONE: the HUD's and the menus' small passes) go to the
+// workers: 28 Oct, Kakariko in-run A/B (PERFX_PARNONE, a dialogue open): +0.12 ms a frame at N=6 (render thread bound),
+// -0.03 ms at N=3 (the game's main thread bound: the hand-off of chunks of 1-8 draws costs more than they take). They
+// were kept here from 27 to 28 Oct for the inventory's model of Link in shards, whose cause was the render thread's: an
+// off-screen HUD pane's draw left hud_clip set, and the next clear of the final image (Link's depth) got an empty
+// scissor unless a draw the render thread built came between. scissor_rect takes it from the draw now.
+// SAVAGEWIND_VK_PAR_INLINE=<mask of scale groups, 1 << RS_*> (default PAR_INLINE_DEFAULT); PERFX_PARNONE A/Bs RS_NONE
+#define PAR_INLINE_DEFAULT (1 << RS_SHADOW)
 static bool pass_inline;
 // (parallel translation) Primary passes: the shadow maps' passes recorded whole by the workers, each part of a pass in a
 // primary command buffer of the worker's own between segments of the submission's buffer - the render thread then
@@ -2402,7 +2406,8 @@ static void begin_pass(bool cube_layers) {
     if (par_inline_mask < 0) par_inline_mask = getenv("SAVAGEWIND_VK_PAR_INLINE") ? atoi(getenv("SAVAGEWIND_VK_PAR_INLINE")) : PAR_INLINE_DEFAULT;
     {
         NvnTexture *t0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
-        pass_inline = par_list && par_inline_mask && t0 && (par_inline_mask >> vk_texture_scale_group(t0) & 1);
+        int inl = par_inline_mask | (perfx_trial(PERFX_PARNONE) && perfx(PERFX_PARNONE) ? 1 << RS_NONE : 0);
+        pass_inline = par_list && inl && t0 && (inl >> vk_texture_scale_group(t0) & 1);
         if (inl_probe > 0 && pass_inline) inl_passes++;
         if (prim_mode < 0) prim_mode = getenv("SAVAGEWIND_VK_PAR_PRIMARY") ? atoi(getenv("SAVAGEWIND_VK_PAR_PRIMARY")) : 1;
         pass_prim = (prim_mode == 2 ? !(renderer_present_count() & 1) : prim_mode != 0) &&  // (2: even frames, an in-run A/B)
