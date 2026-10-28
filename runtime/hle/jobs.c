@@ -574,9 +574,29 @@ int rt_jobs_push(Cpu *c, const uint64_t *fns) {
     if (!on() || LD8(pool + POOL_SERIAL)) return 0;
     Pool *p = pool_of(pool);
     if (!p) return 0;
+    // sead's "every core" mask, built for the Switch's six (an unrolled 1 << 0..5, f_7000f935c8 and others: gsys's
+    // model jobs, 90 a frame): no core past five existed, so 0x3f meant all of them - here all of the pool's workers.
+    // (PERFX_MASK6: the console's six in the off blocks)
+    if (mask == 0x3f && !(perfx_trial(PERFX_MASK6) && !(perfx_now() & PERFX_MASK6))) {
+        uint32_t count = LD32(pool + POOL_COUNT);
+        mask = count >= 32 ? ~0u : (1u << count) - 1;
+    }
+    uint64_t push_lr = c->x[30];
     c->x[0] = g, c->x[1] = mask, c->x[2] = type;
     guest_call(c, fns[F_SETUP]);
     call1(c, vfn(g, V_RESET), g);
+    {   // (research) SAVAGEWIND_JOBS_PUSH_LOG=<n>: the first n pushes - call site, the first job's class, mask, jobs
+        static int left = -1;
+        if (left < 0) left = getenv("SAVAGEWIND_JOBS_PUSH_LOG") ? atoi(getenv("SAVAGEWIND_JOBS_PUSH_LOG")) : 0;
+        extern uint64_t g_game_frames;  // (from game frame 3000: the steady state, not the load)
+        if (left > 0 && g_game_frames >= 3000 && __atomic_sub_fetch(&left, 1, __ATOMIC_RELAXED) >= 0) {
+            uint32_t cap = LD32(g + 0x80), nj = LD32(g + G_JOBS);
+            uint64_t arr = LD64(g + 0x88), job = cap && arr >= GUEST_LO && arr < GUEST_HI ? LD64(arr) : 0;
+            uint64_t vt = job >= GUEST_LO && job < GUEST_HI ? LD64(job) : 0;
+            LOG("[jobs-push] lr %llx group %llx class %llx +0x18 %u mask %#x type %u jobs %u\n", (unsigned long long)push_lr,
+                (unsigned long long)g, (unsigned long long)vt, vt ? LD32(job + 0x18) : 0, mask, type, nj);
+        }
+    }
     uint32_t count = LD32(pool + POOL_COUNT);
     if (mask & (count >= 32 ? ~0u : (1u << count) - 1)) ST64(g + G_OWNER, owner);  // (the game: in each ring push)
     uint32_t n = LD32(pool + POOL_LIST_N), cap = LD32(pool + POOL_LIST_CAP);

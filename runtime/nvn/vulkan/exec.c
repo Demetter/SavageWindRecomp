@@ -5716,7 +5716,60 @@ static void cm_take_new(void) {
 
 // The constant pages of this list's copy, from the CPU: their bytes now, in transient memory, then copied into the heap's
 // copy in this submission's upload buffer, after the reads of earlier submissions and the geometry copies above.
+// (research) SAVAGEWIND_VK_CONST_PROBE=1: how often each constant page is written - of the last 8 lists - and how the
+// pages written in nearly every list lie (runs of consecutive pages), every 600 lists: what copying the hot ones
+// unwatched would take
+static void cm_probe(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_CONST_PROBE") != NULL;
+    if (!on || !cb_bits) return;
+    static uint8_t *hist;
+    static uint64_t *wb;
+    static size_t hcap, wcap, written_sum;
+    static unsigned lists;
+    size_t words = (vg_npages + 63) / 64;
+    if (hcap < vg_npages) {
+        uint8_t *h = realloc(hist, vg_npages);
+        if (!h) return;
+        memset(h + hcap, 0, vg_npages - hcap), hist = h, hcap = vg_npages;
+    }
+    if (wcap < words) {
+        uint64_t *w = realloc(wb, words * 8);
+        if (!w) return;
+        wb = w, wcap = words;
+    }
+    memset(wb, 0, words * 8);
+    for (size_t i = 0; i < cm_npages; i++) wb[cm_pages[i] >> 6] |= 1ull << (cm_pages[i] & 63);
+    written_sum += cm_npages;
+    for (size_t w = 0; w < words; w++)
+        for (uint64_t m = __atomic_load_n(&cb_bits[w], __ATOMIC_RELAXED); m; m &= m - 1) {
+            size_t p = (w << 6) + (size_t)__builtin_ctzll(m);
+            if (p < vg_npages) hist[p] = (uint8_t)(hist[p] << 1 | (wb[w] >> (p & 63) & 1));
+        }
+    if (++lists % 600) return;
+    size_t known = 0, hot = 0, warm = 0, runs = 0, last = SIZE_MAX, span_lo = SIZE_MAX, span_hi = 0;
+    for (size_t w = 0; w < words; w++)
+        for (uint64_t m = __atomic_load_n(&cb_bits[w], __ATOMIC_RELAXED); m; m &= m - 1) {
+            size_t p = (w << 6) + (size_t)__builtin_ctzll(m);
+            if (p >= vg_npages) continue;
+            known++;
+            int n = __builtin_popcount(hist[p]);
+            if (n >= 7) {
+                hot++;
+                if (last == SIZE_MAX || p != last + 1) runs++;
+                last = p;
+                if (p < span_lo) span_lo = p;
+                if (p > span_hi) span_hi = p;
+            } else if (n) warm++;
+        }
+    LOG("[const-probe] %zu constant pages known: %zu written in 7-8 of the last 8 lists (%zu runs, %.1f MB from first to "
+        "last), %zu in 1-6; %.1f constant pages written a list\n", known, hot, runs,
+        hot ? (double)(span_hi - span_lo + 1) * 4096.0 / 1048576.0 : 0.0, warm, (double)written_sum / 600.0);
+    written_sum = 0;
+}
+
 static void cm_record(void) {
+    cm_probe();
     if (!cm_npages) return;
     VkSpan s = vk_transient((uint64_t)cm_npages << 12, 256);
     VkBufferCopy rg[512];
