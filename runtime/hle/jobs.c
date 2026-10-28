@@ -532,7 +532,16 @@ static void run_end(uint64_t w) {
 static void worker_loop(Cpu *c, const uint64_t *fns, Pool *p, uint64_t w, uint32_t i) {
     kernel_thread_off_cores();
     uint32_t gen = UINT32_MAX, k = 0, gen_seen = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
+    // (testing) SAVAGEWIND_JOBS_LOWPRIO_FROM=<i>: workers from index i at below-normal priority - background workers
+    // that take jobs when a core is idle (PERFX_JLOWPRIO: only in the on blocks)
+    static int low_from = -2;
+    if (low_from == -2) low_from = getenv("SAVAGEWIND_JOBS_LOWPRIO_FROM") ? atoi(getenv("SAVAGEWIND_JOBS_LOWPRIO_FROM")) : -1;
+    int prio_now = 0;
     while (!g_rt_unwind) {
+        if (low_from >= 0 && (int)i >= low_from) {
+            int want = !perfx_trial(PERFX_JLOWPRIO) || (perfx_now() & PERFX_JLOWPRIO) ? -1 : 0;
+            if (want != prio_now) prio_now = want, plat_thread_priority(want);
+        }
         uint32_t s = __atomic_load_n(&p->seq, __ATOMIC_ACQUIRE);
         if (s != gen_seen) gen_seen = s, fan_out(p, s);  // (new work: the workers still asleep up too)
         help(c);  // (tasks a job forked: rt_jobs_fork_join)
