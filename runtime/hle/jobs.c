@@ -920,6 +920,16 @@ static void vri_steal(Cpu *c, void *arg, uint32_t slot) {  // (a helper) the tai
 // (statistics) the inline lists' time on the list's own thread: all of it, the fork (its own parts and the wait for the
 // helpers'), the consumer called again for the helpers' parts; every 2 s "[jobs] view recording time"
 static _Atomic uint64_t g_vri_tm[6];  // lists, draws, ns, fork ns, consumer ns, lists with stolen parts
+static _Atomic uint64_t g_vri_rej[4][2];  // lists recorded the game's way and their draws: small, off, not the arena's, busy
+static _Atomic uint64_t g_vri_gm[5];  // (=3..5) lists recorded the game's way, timed: lists, draws, ns, NVN ticks, NVN calls
+static void vri_game_note(uint32_t draws, uint64_t ns, uint64_t ticks, uint64_t calls) {
+    atomic_fetch_add(&g_vri_gm[0], 1), atomic_fetch_add(&g_vri_gm[1], draws), atomic_fetch_add(&g_vri_gm[2], ns);
+    atomic_fetch_add(&g_vri_gm[3], ticks), atomic_fetch_add(&g_vri_gm[4], calls);
+}
+static void vri_reject(int why, uint32_t draws) {
+    if (why < 0) return;
+    atomic_fetch_add(&g_vri_rej[why][0], 1), atomic_fetch_add(&g_vri_rej[why][1], draws);
+}
 static void vri_time_note(uint32_t draws, uint64_t ns, uint64_t fork_ns, uint64_t cons_ns, bool stolen) {
     atomic_fetch_add(&g_vri_tm[0], 1), atomic_fetch_add(&g_vri_tm[1], draws), atomic_fetch_add(&g_vri_tm[2], ns);
     atomic_fetch_add(&g_vri_tm[3], fork_ns), atomic_fetch_add(&g_vri_tm[4], cons_ns), atomic_fetch_add(&g_vri_tm[5], stolen);
@@ -928,6 +938,18 @@ static void vri_time_note(uint32_t draws, uint64_t ns, uint64_t fork_ns, uint64_
     if (now - l < 2000000000ull || !atomic_compare_exchange_strong(&last, &l, now)) return;
     uint64_t v[6];
     for (int i = 0; i < 6; i++) v[i] = atomic_exchange(&g_vri_tm[i], 0);
+    uint64_t rj[4][2];
+    for (int i = 0; i < 4; i++) rj[i][0] = atomic_exchange(&g_vri_rej[i][0], 0), rj[i][1] = atomic_exchange(&g_vri_rej[i][1], 0);
+    LOG("[jobs] view recording lists the game's way: too small %llu (%llu draws), off %llu, not the arena's %llu (%llu "
+        "draws), busy %llu (%llu draws)\n", (unsigned long long)rj[0][0], (unsigned long long)rj[0][1],
+        (unsigned long long)rj[1][0], (unsigned long long)rj[2][0], (unsigned long long)rj[2][1], (unsigned long long)rj[3][0],
+        (unsigned long long)rj[3][1]);
+    uint64_t g[5];
+    for (int i = 0; i < 5; i++) g[i] = atomic_exchange(&g_vri_gm[i], 0);
+    if (g[0])
+        LOG("[jobs] view recording time the game's way: %llu lists, %.0f draws each, %.1f us each (NVN calls %.0f, %.1f us in "
+            "them with SAVAGEWIND_JOBS_JOBTIME)\n", (unsigned long long)g[0], (double)g[1] / g[0], g[2] / 1e3 / g[0],
+            (double)g[4] / g[0], g[3] * g_tick_ns / 1e3 / g[0]);
     if (!v[0]) return;
     LOG("[jobs] view recording time: %llu lists, %.0f draws each, %.1f us each on the list's thread (fork %.1f, consumer "
         "again %.1f), %.0f%% with helpers' parts\n", (unsigned long long)v[0], (double)v[1] / v[0], v[2] / 1e3 / v[0],
@@ -950,21 +972,22 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
     extern uint64_t g_game_frames;
     if (enabled == 2 && (g_game_frames & 1)) return 0;  // (=2: the game's inline recording in odd game frames, an A/B)
     uint64_t list = c->x[23], dctx = c->x[19], pass = c->x[22], view = c->x[21], x4 = c->x[20];
-    if (enabled == 3 && !t_vri) {  // (=3, timing only: the game's own recording of the list, timed as the parts below)
-        uint64_t t0 = plat_now_ns();
-        t_vri = 1;
-        c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
-        guest_call(c, fns[VRI_CONSUME]);
-        t_vri = 0;
-        vri_time_note(LD32(list + 0x3c), plat_now_ns() - t0, 0, 0, false);
-        return 1;
-    }
     uint64_t vt0 = plat_now_ns();
     static int min_draws = -1;  // (a part's draws at least: its fixed cost - draw state, command buffer - stays small)
     if (min_draws < 0) min_draws = getenv("SAVAGEWIND_VRI_MIN") && atoi(getenv("SAVAGEWIND_VRI_MIN")) > 0 ? atoi(getenv("SAVAGEWIND_VRI_MIN")) : 24;
     uint32_t total = LD32(list + 0x3c), parts = 2 * rt_view_rec_parts();
     if (parts > 32) parts = 32;  // (a list record holds 32 command buffers)
     if (total / (uint32_t)min_draws < parts) parts = total / (uint32_t)min_draws;
+    if (!t_vri) vri_reject(parts < 2 ? 0 : !on() || !g_cmd_arena ? 1 : -1, total);
+    if (enabled == 5 && !t_vri && parts < 2) {  // (=5: as 1, and the lists too small for parts timed the game's way)
+        uint64_t k0 = t_nvn_ticks, n0 = t_nvn_calls;
+        t_vri = 1;
+        c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
+        guest_call(c, fns[VRI_CONSUME]);
+        t_vri = 0;
+        vri_game_note(total, plat_now_ns() - vt0, t_nvn_ticks - k0, t_nvn_calls - n0);
+        return 1;
+    }
     if (t_vri || parts < 2 || !on() || !g_cmd_arena) return 0;
     {   // (SAVAGEWIND_PERFX=16384 with _AB: the game's inline recording in the "off" blocks, an A/B in one launch)
         extern uint32_t g_perfx_mask;
@@ -977,16 +1000,30 @@ int rt_view_rec_inline(Cpu *c, const uint64_t *fns) {
             static int told;
             if (!told++) LOG("[jobs] view recording: a draw context's command buffer %llx not from the arena: lists recorded "
                              "inline\n", (unsigned long long)cb);
+            vri_reject(2, total);
             return 0;
+        }
+    }
+    {   // (=3: the game's own recording of the lists the parts would take, timed the same way; =4: every other such list,
+        // an A/B of the same lists in one launch - "[jobs] view recording time ... the game's way")
+        static _Atomic uint32_t alt;
+        if (enabled == 3 || (enabled == 4 && (atomic_fetch_add(&alt, 1) & 1))) {
+            uint64_t k0 = t_nvn_ticks, n0 = t_nvn_calls;
+            t_vri = 1;
+            c->x[0] = list, c->x[1] = dctx, c->x[2] = pass, c->x[3] = view, c->x[4] = x4;
+            guest_call(c, fns[VRI_CONSUME]);
+            t_vri = 0;
+            vri_game_note(total, plat_now_ns() - vt0, t_nvn_ticks - k0, t_nvn_calls - n0);
+            return 1;
         }
     }
     int slot = -1;
     for (int k = 0; k < 16 && slot < 0; k++) {
         uint64_t z = 0;
-        if (__atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) return 0;
+        if (__atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) { vri_reject(3, total); return 0; }
         if (__atomic_compare_exchange_n(&g_vri_lists[k], &z, list, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) slot = k;
     }
-    if (slot < 0) return 0;
+    if (slot < 0) { vri_reject(3, total); return 0; }
     for (int k = 0; k < 16; k++)  // (another thread took the same list in the meantime)
         if (k != slot && __atomic_load_n(&g_vri_lists[k], __ATOMIC_SEQ_CST) == list) { __atomic_store_n(&g_vri_lists[slot], 0, __ATOMIC_SEQ_CST); return 0; }
     uint32_t n0 = LD32(list + 0x50);
