@@ -10003,16 +10003,17 @@ static void *par_worker(void *arg) {
 }
 
 static void par_start(void) {
-    // The processors the game may run on that the threads busy every frame leave free (the game's main thread and its
-    // two job workers, this one, the recording thread, one for the rest), up to 2. Measured in one launch each
-    // (SAVAGEWIND_VK_PAR_CURVE, Ryzen 7 7800X3D, 8 cores / 16 threads): the Great Plateau 2 workers -0.51 ms a frame
-    // against serial translation, 4 -0.32, 6 -0.25, 11 -0.18; Kakariko +0.03 / +0.17 / +0.22 / +0.27. A frame's
-    // translation is ~5 ms of work that 2 workers keep up with; each worker more made the game's own threads slower
-    // (their CPU cycles for the same frame: +2% with 2 workers, +6.6% with 4) and the render thread's planning too.
-    // SAVAGEWIND_VK_PAR=<n>: n (0: off).
+    // Half the cores less one, at least 2 (1 below 4 cores). The game's frame is a pipeline: the render thread
+    // translates frame N while the game records N+1, and the translation's last chunks are what the game waits for
+    // (kb ev445), so enough workers to clear that backlog, not more than the cores the game's threads leave. Measured
+    // in one launch each at Kakariko, 720p (SAVAGEWIND_VK_PAR_CURVE, Ryzen 7 7800X3D, 28 Oct, the game's jobs on N
+    // cores): 8 cores, N = 7: 2 workers 4.21 ms a frame, 3 3.84, 4 3.93; N = 6: 3.98 / 3.72 / 3.82; 6 cores (affinity),
+    // N = 5: 1 worker 5.63, 2 3.85, 3 4.03; 4 cores, N = 3: 5.52 / 5.25 / 5.61. (Before the game's jobs ran on N cores,
+    // 2 was best at 8 cores: each worker more slowed the game's own threads.) Physical cores, not logical processors:
+    // a worker on a busy core's second thread slows that core. SAVAGEWIND_VK_PAR=<n>: n (0: off).
     const char *e = getenv("SAVAGEWIND_VK_PAR");
-    int spare = perf_usable_processors() - 6;
-    par_workers = e ? atoi(e) : spare < 1 ? 1 : spare > 2 ? 2 : spare;
+    int cores = plat_physical_cores() < perf_usable_processors() ? plat_physical_cores() : perf_usable_processors();
+    par_workers = e ? atoi(e) : cores < 4 ? 1 : cores / 2 - 1 > 2 ? cores / 2 - 1 : 2;
     if (par_workers < 0) par_workers = 0;
     if (par_workers > PAR_MAX) par_workers = PAR_MAX;
     e = getenv("SAVAGEWIND_VK_PAR_CHUNK");
