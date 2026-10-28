@@ -114,7 +114,9 @@ static void *recorder(void *arg) {
             }
             if (atomic_load(&waiting)) { pthread_mutex_lock(&m); pthread_cond_broadcast(&cv_idle); pthread_mutex_unlock(&m); }
             bool got = false;
-            for (int i = 0; i < 4000 && !got; i++) {  // (a short spin: the next command is usually microseconds away)
+            // (a short spin: the next command is usually microseconds away; PERFX_RECSPIN: 200 pauses in the on blocks)
+            int spin = perfx_trial(PERFX_RECSPIN) && perfx(PERFX_RECSPIN) ? 200 : 4000;
+            for (int i = 0; i < spin && !got; i++) {
                 _mm_pause();
                 got = atomic_load_explicit(&wpos, memory_order_acquire) != r;
             }
